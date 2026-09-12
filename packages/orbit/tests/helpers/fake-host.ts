@@ -1,4 +1,6 @@
+import type { EvidenceToolFact } from '../../src/evidence.ts'
 import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult, RoleToolFilter } from '../../src/host.ts'
+import type { TurnSettlement } from '../../src/settlement.ts'
 import type { OrbitTelemetry } from '../../src/types.ts'
 
 export interface RoleScript {
@@ -10,6 +12,8 @@ export interface RoleScript {
   pending?: boolean
   changedFiles?: string[]
   testSummary?: string[]
+  toolEvidence?: EvidenceToolFact[]
+  settlement?: TurnSettlement
 }
 
 export interface StartedRole {
@@ -80,6 +84,8 @@ export class FakeHost implements OrbitHost {
             ...(script.reason ? { reason: script.reason } : {}),
             ...(script.changedFiles ? { changedFiles: script.changedFiles } : {}),
             ...(script.testSummary ? { testSummary: script.testSummary } : {}),
+            ...(script.toolEvidence ? { toolEvidence: script.toolEvidence } : {}),
+            ...(script.settlement ? { settlement: script.settlement } : {}),
           }),
       cancel: async (reason: string) => {
         this.cancelled.push({ childId, reason })

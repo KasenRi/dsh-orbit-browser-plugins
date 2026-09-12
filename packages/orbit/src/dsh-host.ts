@@ -4,6 +4,7 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { collectTurnToolFacts } from './evidence.ts'
 import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import { classifyTurnSettlement } from './settlement.ts'
@@ -238,14 +239,21 @@ export class DshOrbitHost implements OrbitHost {
     const classified = classifyTurnSettlement(events)
     const output = this.readFinalOutput(agent)
     const telemetry = await this.snapshotAgent(agent)
+    // Evidence is read from the settled turn's own events; a resumed executor
+    // therefore reports only the turn that just finished, never an earlier one.
+    const toolEvidence = collectTurnToolFacts(events)
+    const evidence = {
+      settlement: classified.settlement,
+      ...(toolEvidence.length > 0 ? { toolEvidence } : {}),
+    }
 
     if (this.interruptedChildren.has(childId)) {
-      return { childId, output, interrupted: true, reason: 'EXECUTOR_INTERRUPTED', telemetry }
+      return { childId, output, interrupted: true, reason: 'EXECUTOR_INTERRUPTED', telemetry, ...evidence }
     }
 
     switch (classified.settlement) {
       case 'completed':
-        return { childId, output, interrupted: false, telemetry }
+        return { childId, output, interrupted: false, telemetry, ...evidence }
       case 'aborted':
         return {
           childId,
@@ -253,6 +261,7 @@ export class DshOrbitHost implements OrbitHost {
           interrupted: true,
           reason: `EXECUTOR_ABORTED${classified.cancelCause ? `:${classified.cancelCause}` : ''}`,
           telemetry,
+          ...evidence,
         }
       case 'error':
         return {
@@ -261,13 +270,14 @@ export class DshOrbitHost implements OrbitHost {
           interrupted: true,
           reason: `EXECUTOR_ERROR: ${redactText(classified.errorMessage ?? 'unknown failure')}`,
           telemetry,
+          ...evidence,
         }
       case 'blocked':
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_BLOCKED', telemetry }
+        return { childId, output, interrupted: true, reason: 'EXECUTOR_BLOCKED', telemetry, ...evidence }
       case 'max-tokens':
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_MAX_TOKENS', telemetry }
+        return { childId, output, interrupted: true, reason: 'EXECUTOR_MAX_TOKENS', telemetry, ...evidence }
       default:
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_NO_TURN', telemetry }
+        return { childId, output, interrupted: true, reason: 'EXECUTOR_NO_TURN', telemetry, ...evidence }
     }
   }
 

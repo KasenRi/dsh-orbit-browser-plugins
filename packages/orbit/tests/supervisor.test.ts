@@ -429,6 +429,35 @@ test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays re
   cleanup()
 })
 
+test('Commander receives the settled step evidence bundle', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      {
+        output: 'did a',
+        childId: 'e1',
+        settlement: 'completed',
+        toolEvidence: [
+          { name: 'edit', status: 'ok', detail: 'src/a.ts' },
+          { name: 'bash', status: 'ok', command: 'npm test', detail: 'npm test' },
+        ],
+      },
+    ])
+  await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
+  const stepPrompt =
+    host.scriptsFor('commander').find((entry) => entry.label === 'commander-step_evaluate')?.request.prompt ?? ''
+  assert.match(stepPrompt, /"settlement":"completed"/)
+  assert.match(stepPrompt, /"command":"npm test"/)
+  assert.match(stepPrompt, /Executor claim:/)
+  cleanup()
+})
+
 test('a completed Commander without a structured capture fails loud', async () => {
   const { dir, cleanup } = project()
   const store = new OrbitStateStore(dir)

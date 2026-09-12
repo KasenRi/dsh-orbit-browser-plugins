@@ -1,4 +1,6 @@
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
+import type { EvidenceToolFact } from './evidence.ts'
+import type { TurnSettlement } from './settlement.ts'
 import type { OrbitRole, OrbitRoute, OrbitTelemetry } from './types.ts'
 
 export interface RoleToolFilter {
@@ -34,6 +36,10 @@ export interface RoleRunResult {
   telemetry?: OrbitTelemetry
   changedFiles?: string[]
   testSummary?: string[]
+  /** Current-turn tool facts extracted from the child's real session events. */
+  toolEvidence?: EvidenceToolFact[]
+  /** Durable settlement of the child's final turn when the host can read one. */
+  settlement?: TurnSettlement
   usage?: { turns?: number; tools?: number }
 }
 

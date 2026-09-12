@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
+import { buildEvidenceBundle, formatEvidenceBundle, type OrbitEvidenceBundle } from './evidence.ts'
 import {
   assertCommanderDecision,
   assertStrategyDecision,
@@ -184,6 +185,8 @@ export class OrbitSupervisor {
   private readonly store: OrbitStateStore
   private readonly host: OrbitHost
   private readonly config: OrbitSupervisorConfig
+  /** Evidence for the step that just settled; never persisted into state.json. */
+  private stepEvidence?: { stepId: string; bundle: OrbitEvidenceBundle }
 
   constructor(store: OrbitStateStore, host: OrbitHost, config: OrbitSupervisorConfig) {
     this.store = store
@@ -411,7 +414,8 @@ export class OrbitSupervisor {
     signal?: AbortSignal,
   ): Promise<CommanderOutcome> {
     const mode: EvaluationMode = final ? 'FINAL_EVALUATE' : 'STEP_EVALUATE'
-    const evidence = state.commander?.summary ?? state.last_error ?? 'no evidence recorded'
+    const evidence =
+      this.evidenceFor(state, step) ?? state.commander?.summary ?? state.last_error ?? 'no evidence recorded'
     const prompt = final
       ? COMMANDER_FINAL_PROMPT(state.goal, state.plan, evidence, state)
       : COMMANDER_STEP_PROMPT(state.goal, step as OrbitPlanStep, evidence, state)
@@ -431,6 +435,17 @@ export class OrbitSupervisor {
       // Invalid/temporary output is recoverable; it must not become NEEDS_USER.
       return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
     }
+  }
+
+  /**
+   * Format the settled step's evidence bundle. Only the step that just finished
+   * qualifies; after a cold resume the bundle is gone and the caller falls back
+   * to the durable state summary.
+   */
+  private evidenceFor(state: OrbitState, step: OrbitPlanStep | undefined): string | undefined {
+    const stepId = step?.id ?? state.current_step?.id
+    if (!this.stepEvidence || this.stepEvidence.stepId !== stepId) return undefined
+    return formatEvidenceBundle(this.stepEvidence.bundle)
   }
 
   /**
@@ -641,6 +656,16 @@ export class OrbitSupervisor {
     state.commander = {
       last_decision: state.commander?.last_decision,
       summary: truncateSafe(result.output, 2000),
+    }
+    this.stepEvidence = {
+      stepId: step.id,
+      bundle: buildEvidenceBundle({
+        settlement: result.settlement,
+        executorOutput: result.output,
+        changedFiles: state.changed_files,
+        tools: result.toolEvidence,
+        telemetry: result.telemetry,
+      }),
     }
     state.phase = 'EVALUATE'
     state.status = 'running'
