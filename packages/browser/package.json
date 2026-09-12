@@ -1,0 +1,19 @@
+{
+  "name": "@local/dsh-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cordis plugin exposing controlled agent-browser automation to DeepSeek Harness (BrowserAutomationService + agent_browser tool).",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+  }
+}

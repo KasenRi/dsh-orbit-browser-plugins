@@ -1,0 +1,35 @@
+{
+  "name": "dsh-pi-parity",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Native DeepSeek Harness (Cordis) plugins reproducing the CX Lite orchestration and agent-browser automation capabilities of the local Pi environment.",
+  "workspaces": [
+    "packages/cx",
+    "packages/browser"
+  ],
+  "scripts": {
+    "build": "tsc -p packages/browser/tsconfig.build.json && tsc -p packages/cx/tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test packages/browser/tests/*.test.ts packages/cx/tests/*.test.ts",
+    "test:browser": "node --test packages/browser/tests/*.test.ts",
+    "test:cx": "node --test packages/cx/tests/*.test.ts",
+    "test:smoke": "node --test packages/browser/tests/integration/*.test.ts packages/cx/tests/integration/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-agent": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-scope": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-session": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-subagent": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.2",
+    "@deepseek-ai/schemastery": "3.18.2",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  }
+}
