@@ -83,9 +83,13 @@ class ScriptedAdapter extends LlmAdapter {
       await hangUntilAborted(options.signal)
     }
 
+    // Decision roles answer through the real DSH structured-output tool; only
+    // the Executor settles with plain text.
     let reply = 'ok'
+    let structured = false
     if (prompt.includes('Produce the smallest set of 2-5 logical engineering steps')) {
       reply = this.script.plan ?? '{"summary":"e2e","steps":[{"id":"P1","goal":"do the thing"}]}'
+      structured = true
     } else if (prompt.includes('You are the Orbit Executor')) {
       this.executorCalls += 1
       if (this.script.hangFirstExecutor && this.executorCalls === 1) {
@@ -94,18 +98,35 @@ class ScriptedAdapter extends LlmAdapter {
       reply = 'executor done'
     } else if (prompt.includes('STEP_EVALUATE')) {
       reply = this.script.stepEvaluate ?? '{"decision":"PASS_CURRENT_STEP"}'
+      structured = true
     } else if (prompt.includes('FINAL_EVALUATE')) {
       reply = this.script.finalEvaluate ?? '{"decision":"SUCCESS"}'
+      structured = true
     } else if (prompt.includes('STRATEGY_CHALLENGE')) {
       reply = this.script.strategyChallenge ?? '{"question":"is this tunnel vision?"}'
+      structured = true
     } else if (prompt.includes('STRATEGY_RECONSIDER')) {
       reply = this.script.strategyReconsider ?? '{"decision":"KEEP_APPROACH"}'
+      structured = true
     } else if (prompt.includes('RUNTIME_DIAGNOSE')) {
       reply = this.script.runtimeDiagnose ?? '{"decision":"RESTART_STEP"}'
+      structured = true
     } else if (prompt.includes('COMMANDER_TIMEOUT_REVIEW')) {
       reply = this.script.timeoutReview ?? '{"decision":"EXTEND"}'
+      structured = true
     } else if (prompt.includes('GUARD_ESCALATION')) {
       reply = this.script.guardEscalation ?? '{"decision":"RETRY_DIFFERENTLY"}'
+      structured = true
+    }
+
+    if (structured) {
+      const callId = ToolCallId(`structured-${this.seen.length}`)
+      yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+      yield { type: 'tool-call-delta', index: 0, id: callId, name: 'structured_output', argumentsDelta: reply }
+      yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'structured_output', arguments: reply } }
+      yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      return
     }
 
     yield { type: 'block-start', index: 0, blockType: 'text' }

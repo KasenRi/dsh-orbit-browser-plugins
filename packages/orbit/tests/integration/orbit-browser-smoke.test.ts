@@ -57,10 +57,16 @@ class CapabilityHost implements OrbitHost {
     if (request.role === 'commander') {
       const output = this.commanderQueue.shift()
       if (!output) throw new Error('CapabilityHost: commander queue exhausted')
-      return { childId: `cmd-${this.events.length}`, result: Promise.resolve<RoleRunResult>({ output, interrupted: false }) }
+      return {
+        childId: `cmd-${this.events.length}`,
+        result: Promise.resolve<RoleRunResult>({ output, structured: JSON.parse(output) as unknown, interrupted: false }),
+      }
     }
     if (request.role === 'watchdog') {
-      return { childId: `wd-${this.events.length}`, result: Promise.resolve<RoleRunResult>({ output: '{"question":"q"}', interrupted: false }) }
+      return {
+        childId: `wd-${this.events.length}`,
+        result: Promise.resolve<RoleRunResult>({ output: '{"question":"q"}', structured: { question: 'q' }, interrupted: false }),
+      }
     }
 
     const browserStep =
