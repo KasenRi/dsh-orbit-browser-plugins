@@ -1,0 +1,9 @@
+# @kasenri/dsh-orbit bundle layer.
+#
+# Adds the Orbit engineering orchestration plugin (OrbitService + orbit_controller
+# tool; `cx_controller` remains a legacy alias) on top of the active bundle stack.
+# Model routes use the plugin defaults and can be overridden in the profile's own
+# cordis.patch.yml.
+- insert:
+    - id: dsh-orbit
+      name: '@kasenri/dsh-orbit'

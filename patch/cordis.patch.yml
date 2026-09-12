@@ -1,22 +1,21 @@
-# dsh-pi-parity deployment layer for a dsh profile.
+# Local deployment layer for a dsh profile.
 #
-# Adds the two local Cordis plugins over the active bundle stack:
-#   @local/dsh-browser  -> BrowserAutomationService + agent_browser tool
-#   @local/dsh-cx       -> CX Lite Service + cx_controller tool + recoverable guards
+# Adds the two workspace plugins over the active bundle stack:
+#   @local/dsh-browser -> BrowserAutomationService + agent_browser tool
+#   @local/dsh-orbit   -> OrbitService + orbit_controller tool + recoverable guards
 #
-# Apply after the shared bundles. CX owns orchestration; the browser plugin owns
-# browser capability. The two only meet through the `agent_browser` capability
-# contract, never through imports.
+# Apply after the shared bundles. Orbit owns orchestration; the browser plugin
+# owns browser capability. The two only meet through the `agent_browser`
+# capability contract, never through imports.
+#
+# Machine-specific values (for example a Chromium executablePath) belong in the
+# profile's own cordis.patch.yml, not here.
 - insert:
     - id: local-browser
       name: '@local/dsh-browser'
-      config:
-        # agent-browser falls back to the AppArmor-confined snap chromium on this
-        # host, which hangs under the daemon. Point it at an unconfined Chromium.
-        executablePath: /root/.cache/ms-playwright/chromium-1228/chrome-linux/chrome
 
-    - id: local-cx
-      name: '@local/dsh-cx'
+    - id: local-orbit
+      name: '@local/dsh-orbit'
       config:
         browserTools:
           - agent_browser

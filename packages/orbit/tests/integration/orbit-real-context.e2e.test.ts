@@ -15,8 +15,8 @@ import AgentPlugin from '@deepseek-ai/dsh-agent'
 import AgentLoopPlugin from '@deepseek-ai/dsh-agent-loop'
 import SubagentPlugin from '@deepseek-ai/dsh-subagent'
 import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
-import * as CxPlugin from '../../src/index.ts'
-import { DshCxHost } from '../../src/dsh-host.ts'
+import * as OrbitPlugin from '../../src/index.ts'
+import { DshOrbitHost } from '../../src/dsh-host.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
 import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
@@ -86,7 +86,7 @@ class ScriptedAdapter extends LlmAdapter {
     let reply = 'ok'
     if (prompt.includes('Produce the smallest set of 2-5 logical engineering steps')) {
       reply = this.script.plan ?? '{"summary":"e2e","steps":[{"id":"P1","goal":"do the thing"}]}'
-    } else if (prompt.includes('You are the CX Executor')) {
+    } else if (prompt.includes('You are the Orbit Executor')) {
       this.executorCalls += 1
       if (this.script.hangFirstExecutor && this.executorCalls === 1) {
         await hangUntilAborted(options.signal)
@@ -129,7 +129,7 @@ function stubTool(name: string) {
   })
 }
 
-const CX_CONFIG = {
+const ORBIT_CONFIG = {
   routes: { commander: ROUTE, executor: ROUTE, watchdog: ROUTE },
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read', 'glob', 'grep'],
@@ -141,7 +141,7 @@ const CX_CONFIG = {
 
 async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number } = {}): Promise<Context> {
   const root = new Context()
-  const storage = mkdtempSync(join(tmpdir(), 'dsh-cx-e2e-store-'))
+  const storage = mkdtempSync(join(tmpdir(), 'dsh-orbit-e2e-store-'))
   const plugins: Array<[unknown, unknown]> = [
     [LlmPlugin, {}],
     [SessionPlugin, {}],
@@ -157,8 +157,8 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
   for (const [plugin, config] of plugins) await root.plugin(plugin as never, config as never)
   root.llm.registerAdapter(['fake'], adapter)
   for (const name of ['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser']) root.tools.register(stubTool(name))
-  await root.plugin(CxPlugin as never, {
-    ...CX_CONFIG,
+  await root.plugin(OrbitPlugin as never, {
+    ...ORBIT_CONFIG,
     ...(options.executorTimeoutMs ? { executorTimeoutMs: options.executorTimeoutMs } : {}),
   } as never)
   return root
@@ -173,7 +173,7 @@ async function makeParent(root: Context, cwd: string, id: string) {
 }
 
 function tempProject(): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-e2e-project-'))
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-e2e-project-'))
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
@@ -197,14 +197,14 @@ function hangUntilAborted(signal: AbortSignal | undefined): Promise<never> {
   })
 }
 
-test('real host E2E: full CX plan/execute/evaluate/success, parent not a competitor', { timeout: 120_000 }, async () => {
+test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a competitor', { timeout: 120_000 }, async () => {
   const adapter = new ScriptedAdapter()
   const root = await boot(adapter)
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-1')
   try {
     const result = await root.agents.withInitiator(parent.agent, () =>
-      root.cx.run({ goal: 'real host e2e', approved_loop_count: 2 }, project.dir, new AbortController().signal),
+      root.orbit.run({ goal: 'real host e2e', approved_loop_count: 2 }, project.dir, new AbortController().signal),
     )
     assert.equal(result.ok, true, result.message)
     assert.equal(result.phase, 'SUCCESS')
@@ -225,12 +225,12 @@ test('real host lifecycle: executor normal completion is interrupted=false', { t
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-2')
   try {
-    const host = new DshCxHost(root)
+    const host = new DshOrbitHost(root)
     await root.agents.withInitiator(parent.agent, async () => {
       const handle = await host.startRole({
         role: 'executor',
         label: 'e2e-normal-exec',
-        prompt: 'You are the CX Executor. plain work',
+        prompt: 'You are the Orbit Executor. plain work',
         route: ROUTE,
         toolFilter: { allow: ['read'] },
       })
@@ -253,7 +253,7 @@ test('real host lifecycle: 840s hard timeout cancels a one-shot Commander and le
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-3')
   try {
-    const host = new DshCxHost(root)
+    const host = new DshOrbitHost(root)
     await root.agents.withInitiator(parent.agent, async () => {
       const handle = await host.startRole({
         role: 'commander',
@@ -287,7 +287,7 @@ test('real host runtime watchdog: executor timeout -> RUNTIME_DIAGNOSE -> RESTAR
   const parent = await makeParent(root, project.dir, 'e2e-parent-4')
   try {
     const result = await root.agents.withInitiator(parent.agent, () =>
-      root.cx.run({ goal: 'timeout recovery e2e', approved_loop_count: 2 }, project.dir, new AbortController().signal),
+      root.orbit.run({ goal: 'timeout recovery e2e', approved_loop_count: 2 }, project.dir, new AbortController().signal),
     )
     assert.equal(result.ok, true, result.message)
     assert.equal(result.phase, 'SUCCESS')
@@ -306,7 +306,7 @@ test('real host capability scoping: agent_browser is unavailable to a restricted
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-5')
   try {
-    const host = new DshCxHost(root)
+    const host = new DshOrbitHost(root)
     await root.agents.withInitiator(parent.agent, async () => {
       const restricted = await host.startRole({
         role: 'executor',

@@ -1,11 +1,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { createCxPreExecuteHandler } from './pipeline-guard.ts'
-import { CxService, type CxPluginConfig } from './service.ts'
-import { createCxTool } from './tool.ts'
-import type { CxRoute } from './types.ts'
+import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
+import { OrbitService, type OrbitPluginConfig } from './service.ts'
+import { createOrbitTool } from './tool.ts'
+import type { OrbitRoute } from './types.ts'
 
-export const name = 'dsh-cx'
+export const name = 'dsh-orbit'
 export const inject = ['tools', 'agents', 'subagents']
 
 const Route = z.object({
@@ -38,9 +38,9 @@ export const Config = z.object({
   registerGuards: z.boolean().default(true),
 })
 
-export interface CxConfigShape {
+export interface OrbitConfigShape {
   projectDir?: string
-  routes: { commander: CxRoute; executor: CxRoute; watchdog: CxRoute }
+  routes: { commander: OrbitRoute; executor: OrbitRoute; watchdog: OrbitRoute }
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
@@ -54,8 +54,8 @@ interface GoalsLike {
   get(agent: unknown): { phase?: string } | undefined
 }
 
-export function apply(ctx: Context, config: CxConfigShape): void {
-  const serviceConfig: CxPluginConfig = {
+export function apply(ctx: Context, config: OrbitConfigShape): void {
+  const serviceConfig: OrbitPluginConfig = {
     routes: config.routes,
     browserTools: config.browserTools,
     commanderReadOnlyTools: config.commanderReadOnlyTools,
@@ -64,13 +64,19 @@ export function apply(ctx: Context, config: CxConfigShape): void {
     executorTimeoutMs: config.executorTimeoutMs,
     ...(config.projectDir ? { projectDir: config.projectDir } : {}),
   }
-  const service = new CxService(ctx, serviceConfig)
-  ctx.effect(() => () => undefined, 'dsh-cx.service')
+  const service = new OrbitService(ctx, serviceConfig)
+  ctx.effect(() => () => undefined, 'dsh-orbit.service')
 
-  if (config.registerTool) ctx.tools.register(createCxTool(ctx))
+  // Legacy alias: the same OrbitService instance is reachable as `ctx.cx`.
+  ctx.provide('cx', service)
+
+  if (config.registerTool) {
+    ctx.tools.register(createOrbitTool(ctx))
+    ctx.tools.register(createOrbitTool(ctx, { legacy: true }))
+  }
 
   if (config.registerGuards) {
-    const handler = createCxPreExecuteHandler(service, {
+    const handler = createOrbitPreExecuteHandler(service, {
       competingDriver: (agent) => {
         const reflect = (ctx as unknown as { reflect?: { get(name: string, strict?: boolean): unknown } }).reflect
         const goals = reflect?.get('goals') as GoalsLike | undefined

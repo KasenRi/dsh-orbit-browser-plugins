@@ -1,5 +1,5 @@
-import type { CxHost, RoleHandle, RoleRunRequest, RoleRunResult, RoleToolFilter } from '../../src/host.ts'
-import type { CxTelemetry } from '../../src/types.ts'
+import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult, RoleToolFilter } from '../../src/host.ts'
+import type { OrbitTelemetry } from '../../src/types.ts'
 
 export interface RoleScript {
   output?: string
@@ -19,14 +19,14 @@ export interface StartedRole {
   toolFilter?: RoleToolFilter
 }
 
-/** Virtual-clock, scripted CxHost for deterministic supervisor tests. */
-export class FakeHost implements CxHost {
+/** Virtual-clock, scripted OrbitHost for deterministic supervisor tests. */
+export class FakeHost implements OrbitHost {
   clock = 0
   readonly sleepCalls: number[] = []
   readonly interruptCalls: Array<{ childId?: string; reason: string }> = []
   readonly cancelled: Array<{ childId?: string; reason: string }> = []
   readonly disposed: Array<string | undefined> = []
-  readonly snapshots: Array<{ childId?: string; telemetry: CxTelemetry }> = []
+  readonly snapshots: Array<{ childId?: string; telemetry: OrbitTelemetry }> = []
   readonly started: StartedRole[] = []
   readonly tools = new Set<string>(['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser'])
   drivers: string[] = []
@@ -50,7 +50,7 @@ export class FakeHost implements CxHost {
     // Yield first so an already-settled work promise wins the race; only then
     // record/advance virtual time. Aborted timers never count.
     await new Promise<void>((resolve) => setImmediate(resolve))
-    if (signal?.aborted) throw new Error('CX_ABORTED')
+    if (signal?.aborted) throw new Error('ORBIT_ABORTED')
     this.sleepCalls.push(ms)
     this.clock += ms
   }
@@ -87,7 +87,7 @@ export class FakeHost implements CxHost {
         this.disposed.push(childId)
       },
       runtimeSnapshot: async () => {
-        const telemetry: CxTelemetry = {
+        const telemetry: OrbitTelemetry = {
           status: 'running',
           current_tool: `tool-of-${childId}`,
           turn_count: 1,

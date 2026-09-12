@@ -1,8 +1,8 @@
-/** Durable CX Lite state and decision vocabulary. */
+/** Durable Orbit state and decision vocabulary. */
 
-export const CX_SCHEMA_VERSION = 2 as const
+export const ORBIT_SCHEMA_VERSION = 2 as const
 
-export type CxPhase =
+export type OrbitPhase =
   | 'PLAN'
   | 'EXECUTE'
   | 'EVALUATE'
@@ -11,21 +11,21 @@ export type CxPhase =
   | 'BUDGET_EXHAUSTED'
   | 'STOPPED'
 
-export type CxStatus = 'running' | 'success' | 'stopped' | 'needs_user' | 'budget_exhausted'
+export type OrbitStatus = 'running' | 'success' | 'stopped' | 'needs_user' | 'budget_exhausted'
 
-export type CxDriverOwnership = 'ACTIVE' | 'PAUSED' | 'AWAITING_USER' | 'CLOSED'
+export type OrbitDriverOwnership = 'ACTIVE' | 'PAUSED' | 'AWAITING_USER' | 'CLOSED'
 
-export type CxRole = 'commander' | 'executor' | 'watchdog'
+export type OrbitRole = 'commander' | 'executor' | 'watchdog'
 
-export type CxCapability = 'browser' | 'web-api-recon'
+export type OrbitCapability = 'browser' | 'web-api-recon'
 
-export type CxStepStatus = 'pending' | 'running' | 'passed' | 'needs_correction' | 'skipped'
+export type OrbitStepStatus = 'pending' | 'running' | 'passed' | 'needs_correction' | 'skipped'
 
-export interface CxPlanStep {
+export interface OrbitPlanStep {
   id: string
   goal: string
-  capabilities?: CxCapability[]
-  status: CxStepStatus
+  capabilities?: OrbitCapability[]
+  status: OrbitStepStatus
 }
 
 export type GuardCode =
@@ -37,37 +37,37 @@ export type GuardCode =
 
 export type GuardDisposition = 'block_continue' | 'block_needs_user'
 
-export interface CxRoute {
+export interface OrbitRoute {
   provider: string
   model: string
   reasoningEffort?: string
   maxTokens?: number
 }
 
-export interface CxRoutes {
-  commander: CxRoute
-  executor: CxRoute
-  watchdog: CxRoute
+export interface OrbitRoutes {
+  commander: OrbitRoute
+  executor: OrbitRoute
+  watchdog: OrbitRoute
 }
 
-export interface CxState extends Record<string, unknown> {
-  schema_version: typeof CX_SCHEMA_VERSION
+export interface OrbitState extends Record<string, unknown> {
+  schema_version: typeof ORBIT_SCHEMA_VERSION
   active_run_id: string
   run_id: string
-  phase: CxPhase
-  status: CxStatus
-  driver_ownership: CxDriverOwnership
+  phase: OrbitPhase
+  status: OrbitStatus
+  driver_ownership: OrbitDriverOwnership
   state_revision: number
   updated_at: string
   goal: string
   goal_hash: string
   preset: string
-  routes: CxRoutes
+  routes: OrbitRoutes
   loop: { used: number; max: number }
   approved_loop_count: number
   remaining_budget: number
   loop_count: number
-  plan: { summary: string; steps: CxPlanStep[] }
+  plan: { summary: string; steps: OrbitPlanStep[] }
   current_step?: { id: string; attempt: number }
   child?: { id?: string; status: 'running' | 'completed' | 'interrupted' | 'unknown' }
   commander?: { last_decision?: string; summary?: string; remaining_gap?: string }
@@ -127,7 +127,7 @@ export interface GuardWatchdogDecision {
   instruction?: string
 }
 
-export interface CxTelemetry {
+export interface OrbitTelemetry {
   status?: 'idle' | 'running' | 'unknown'
   current_tool?: string
   tool_count?: number
@@ -137,12 +137,12 @@ export interface CxTelemetry {
   recent_output?: string
 }
 
-export interface CxActionResult {
+export interface OrbitActionResult {
   ok: boolean
   action: string
   run_id?: string
-  phase?: CxPhase
-  status?: CxStatus
+  phase?: OrbitPhase
+  status?: OrbitStatus
   message?: string
   data?: Record<string, unknown>
 }
@@ -169,8 +169,8 @@ export const GUARD_FIRST_INSTRUCTION =
 export const GUARD_REPEAT_INSTRUCTION =
   'The same blocked operation was attempted again. Stop repeating it and choose a different safe approach.'
 export const GUARD_RETRY_INSTRUCTION =
-  'The previous approach repeatedly hit CX safety guards. Use a different safe approach. Do not retry the blocked operation.'
+  'The previous approach repeatedly hit Orbit safety guards. Use a different safe approach. Do not retry the blocked operation.'
 export const GUARD_NEEDS_USER_INSTRUCTION =
-  'This restricted action appears necessary for the user goal. CX has paused for user guidance.'
+  'This restricted action appears necessary for the user goal. Orbit has paused for user guidance.'
 
-export const DEFAULT_CAPABILITIES: readonly CxCapability[] = ['browser', 'web-api-recon']
+export const DEFAULT_CAPABILITIES: readonly OrbitCapability[] = ['browser', 'web-api-recon']

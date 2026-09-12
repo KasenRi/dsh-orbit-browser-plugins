@@ -1,25 +1,27 @@
 {
-  "name": "@kasenri/dsh-cx",
-  "version": "0.1.0",
+  "name": "@kasenri/dsh-orbit",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Community DeepSeek Harness plugin: deterministic engineering orchestration with Commander, Executor and Smart Watchdog (CxService + cx_controller tool).",
+  "description": "Deterministic engineering orchestration for DeepSeek Harness with Commander, Executor, Smart Watchdog, bounded recovery and durable execution state.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KasenRi/dsh-cx-browser-plugins.git",
-    "directory": "packages/cx"
+    "url": "git+https://github.com/KasenRi/dsh-orbit-browser-plugins.git",
+    "directory": "packages/orbit"
   },
-  "homepage": "https://github.com/KasenRi/dsh-cx-browser-plugins/tree/main/packages/cx#readme",
+  "homepage": "https://github.com/KasenRi/dsh-orbit-browser-plugins/tree/main/packages/orbit#readme",
   "bugs": {
-    "url": "https://github.com/KasenRi/dsh-cx-browser-plugins/issues"
+    "url": "https://github.com/KasenRi/dsh-orbit-browser-plugins/issues"
   },
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
-    "cordis",
-    "agent",
-    "workflow",
-    "orchestration"
+    "orbit",
+    "engineering-orchestration",
+    "agent-orchestration",
+    "autonomous-engineering",
+    "bounded-loop",
+    "workflow"
   ],
   "publishConfig": {
     "access": "public"

@@ -1,11 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createCxPreExecuteHandler, type PreExecuteDecision } from '../src/pipeline-guard.ts'
-import type { CxService } from '../src/service.ts'
+import { createOrbitPreExecuteHandler, type PreExecuteDecision } from '../src/pipeline-guard.ts'
+import type { OrbitService } from '../src/service.ts'
 import type { GuardBlockOutcome } from '../src/supervisor.ts'
 import type { GuardCode } from '../src/types.ts'
 
-function stubService(active: boolean, onBlock: (code: GuardCode) => void): CxService {
+function stubService(active: boolean, onBlock: (code: GuardCode) => void): OrbitService {
   return {
     hasActiveRun: () => active,
     githubAllowed: () => false,
@@ -13,12 +13,12 @@ function stubService(active: boolean, onBlock: (code: GuardCode) => void): CxSer
       onBlock(code)
       return { disposition: 'block_continue', code, count: 1, watchdog_calls: 0, instruction: 'use a safer approach' }
     },
-  } as unknown as CxService
+  } as unknown as OrbitService
 }
 
 test('recoverable guard blocks one call and lets a safe call proceed', async () => {
   const blocked: GuardCode[] = []
-  const handler = createCxPreExecuteHandler(stubService(true, (code) => blocked.push(code)))
+  const handler = createOrbitPreExecuteHandler(stubService(true, (code) => blocked.push(code)))
   const allow: PreExecuteDecision = { kind: 'allow' }
 
   const denied = await handler({ name: 'bash', arguments: { command: 'printenv' } }, async () => allow)
@@ -33,26 +33,26 @@ test('recoverable guard blocks one call and lets a safe call proceed', async () 
   assert.deepEqual(safe, { kind: 'allow' })
 
   // .cx writes are blocked for write tools as well.
-  const cxWrite = await handler({ name: 'write', arguments: { path: '.cx/state.json' }, agent: { session: { header: { cwd: '/proj' } } } }, async () => allow)
-  assert.equal(cxWrite.kind, 'deny')
+  const stateWrite = await handler({ name: 'write', arguments: { path: '.cx/state.json' }, agent: { session: { header: { cwd: '/proj' } } } }, async () => allow)
+  assert.equal(stateWrite.kind, 'deny')
 
   assert.deepEqual(blocked, ['secret_operation', 'durable_state_write'])
 })
 
-test('guard is inert when no CX run owns the project', async () => {
+test('guard is inert when no Orbit run owns the project', async () => {
   let recorded = 0
-  const handler = createCxPreExecuteHandler(stubService(false, () => (recorded += 1)))
+  const handler = createOrbitPreExecuteHandler(stubService(false, () => (recorded += 1)))
   const decision = await handler({ name: 'bash', arguments: { command: 'printenv' } }, async () => ({ kind: 'allow' }))
   assert.deepEqual(decision, { kind: 'allow' })
   assert.equal(recorded, 0)
 })
 
-test('CX blocks other top-level mutation drivers while it owns the workspace', async () => {
-  const handler = createCxPreExecuteHandler(stubService(true, () => undefined))
+test('Orbit blocks other top-level mutation drivers while it owns the workspace', async () => {
+  const handler = createOrbitPreExecuteHandler(stubService(true, () => undefined))
   for (const name of ['create_goal', 'ralph', 'workflow']) {
     const decision = await handler({ name, arguments: {} }, async () => ({ kind: 'allow' }))
     assert.equal(decision.kind, 'deny')
-    if (decision.kind === 'deny') assert.match(decision.reason, /CX_MUTATION_DRIVER_CONFLICT/)
+    if (decision.kind === 'deny') assert.match(decision.reason, /ORBIT_MUTATION_DRIVER_CONFLICT/)
   }
   // Read-only delegation stays available.
   assert.deepEqual(await handler({ name: 'subagent', arguments: {} }, async () => ({ kind: 'allow' })), { kind: 'allow' })
@@ -61,7 +61,7 @@ test('CX blocks other top-level mutation drivers while it owns the workspace', a
 
 test('cx_controller run is denied while another mutation driver is active', async () => {
   let driverChecks = 0
-  const handler = createCxPreExecuteHandler(stubService(false, () => undefined), {
+  const handler = createOrbitPreExecuteHandler(stubService(false, () => undefined), {
     competingDriver: () => {
       driverChecks += 1
       return 'goal'

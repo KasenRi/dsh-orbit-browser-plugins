@@ -1,10 +1,13 @@
 import { guardBashCommand, guardReason, guardToolPath } from './guard.ts'
-import type { CxService } from './service.ts'
+import type { OrbitService } from './service.ts'
 
 const WRITE_PATH_TOOLS = new Set(['write', 'edit', 'str_replace_editor'])
 
-/** Top-level autonomous mutation drivers that must not run beside an active CX run. */
+/** Top-level autonomous mutation drivers that must not run beside an active Orbit run. */
 export const MUTATION_DRIVER_TOOLS = new Set(['create_goal', 'ralph', 'workflow'])
+
+/** Canonical and legacy controller tool names. */
+export const ORBIT_CONTROLLER_TOOLS = new Set(['orbit_controller', 'cx_controller'])
 
 export interface GuardExecLike {
   name: string
@@ -14,20 +17,20 @@ export interface GuardExecLike {
 
 export type PreExecuteDecision = { kind: 'allow' } | { kind: 'deny'; reason: string }
 
-export interface CxPreExecuteOptions {
+export interface OrbitPreExecuteOptions {
   /** Returns the name of a competing top-level mutation driver for this agent, if any. */
   competingDriver?: (agent: GuardExecLike['agent']) => string | undefined
 }
 
 /**
- * The CX recoverable tool guard plus mutation-driver mutual exclusion.
+ * The Orbit recoverable tool guard plus mutation-driver mutual exclusion.
  *
  * Recovery contract: a denial blocks only this one tool call; the agent turn and
- * the CX phase continue. Mutation exclusion, by contrast, is an ownership fence:
- * CX and another top-level autonomous driver must never run in the same project.
+ * the Orbit phase continue. Mutation exclusion, by contrast, is an ownership fence:
+ * Orbit and another top-level autonomous driver must never run in the same project.
  */
-export function createCxPreExecuteHandler(service: CxService, options: CxPreExecuteOptions = {}) {
-  return async function cxPreExecute(
+export function createOrbitPreExecuteHandler(service: OrbitService, options: OrbitPreExecuteOptions = {}) {
+  return async function orbitPreExecute(
     exec: GuardExecLike,
     next: () => Promise<PreExecuteDecision>,
   ): Promise<PreExecuteDecision> {
@@ -35,25 +38,25 @@ export function createCxPreExecuteHandler(service: CxService, options: CxPreExec
     const active = service.hasActiveRun(cwd)
     const args = (exec.arguments ?? {}) as Record<string, unknown>
 
-    // CX owns the workspace: refuse to start another top-level mutation driver.
+    // Orbit owns the workspace: refuse to start another top-level mutation driver.
     if (active && MUTATION_DRIVER_TOOLS.has(exec.name)) {
       return {
         kind: 'deny',
         reason:
-          `CX_MUTATION_DRIVER_CONFLICT: an active CX run owns this workspace, so ${exec.name} must not start. ` +
-          'Resume or stop the CX run first, or continue through cx_controller.',
+          `ORBIT_MUTATION_DRIVER_CONFLICT: an active Orbit run owns this workspace, so ${exec.name} must not start. ` +
+          'Resume or stop the Orbit run first, or continue through orbit_controller.',
       }
     }
 
-    // Another driver already owns the workspace: refuse to start CX.
-    if (!active && exec.name === 'cx_controller') {
+    // Another driver already owns the workspace: refuse to start Orbit.
+    if (!active && ORBIT_CONTROLLER_TOOLS.has(exec.name)) {
       const action = typeof args['action'] === 'string' ? args['action'] : ''
       if (action === 'run' || action === 'start') {
         const competing = options.competingDriver?.(exec.agent)
         if (competing) {
           return {
             kind: 'deny',
-            reason: `CX_MUTATION_DRIVER_CONFLICT: ${competing} already owns mutation in this workspace; stop it before starting CX.`,
+            reason: `ORBIT_MUTATION_DRIVER_CONFLICT: ${competing} already owns mutation in this workspace; stop it before starting Orbit.`,
           }
         }
       }

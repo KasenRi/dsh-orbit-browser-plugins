@@ -6,14 +6,14 @@ import { join } from 'node:path'
 import { BrowserRunner } from '../../../browser/src/runner.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
 import { findChromium } from '../../../../tests/helpers/chromium.ts'
-import { CxStateStore } from '../../src/state-store.ts'
-import { CxSupervisor, type CxSupervisorConfig } from '../../src/supervisor.ts'
-import type { CxHost, RoleHandle, RoleRunRequest, RoleRunResult } from '../../src/host.ts'
+import { OrbitStateStore } from '../../src/state-store.ts'
+import { OrbitSupervisor, type OrbitSupervisorConfig } from '../../src/supervisor.ts'
+import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from '../../src/host.ts'
 
 const chromium = findChromium()
 const agentBrowser = resolveExecutable('agent-browser', process.env.PATH)
 
-const config: CxSupervisorConfig = {
+const config: OrbitSupervisorConfig = {
   defaultRoutes: {
     commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
     executor: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
@@ -29,7 +29,7 @@ const FIXTURE =
   'data:text/html,<html><head><title>SmokeTitle</title></head><body><h1>Hello</h1><button id="b">Go</button></body></html>'
 
 /** Host that really drives the browser capability for browser-capability steps. */
-class CapabilityHost implements CxHost {
+class CapabilityHost implements OrbitHost {
   readonly events: string[] = []
   readonly toolFilters: Array<{ role: string; allow?: readonly string[]; deny?: readonly string[] }> = []
   private readonly commanderQueue: string[]
@@ -74,7 +74,7 @@ class CapabilityHost implements CxHost {
     }
 
     this.events.push('browser-available')
-    const context = { sessionId: `cx-smoke-${process.pid}-${Date.now()}`, cwd: '/tmp' }
+    const context = { sessionId: `orbit-smoke-${process.pid}-${Date.now()}`, cwd: '/tmp' }
     try {
       const open = await this.runner.run({ args: ['open', FIXTURE] }, context)
       assert.equal(open.resultCategory, 'success', open.detail)
@@ -108,9 +108,9 @@ class CapabilityHost implements CxHost {
   }
 }
 
-test('CX browser integration smoke: P1 no browser, P2 browser, commander/watchdog no browser', { timeout: 180_000 }, async () => {
+test('Orbit browser integration smoke: P1 no browser, P2 browser, commander/watchdog no browser', { timeout: 180_000 }, async () => {
   assert.ok(agentBrowser && chromium, 'agent-browser and a working chromium are required')
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-browser-'))
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-browser-'))
   const runner = new BrowserRunner(
     {
       command: 'agent-browser',
@@ -133,7 +133,7 @@ test('CX browser integration smoke: P1 no browser, P2 browser, commander/watchdo
     ],
     ['code step done'],
   )
-  const result = await new CxSupervisor(new CxStateStore(dir), host, config).bootstrap({ goal: 'ship', approved_loop_count: 5 })
+  const result = await new OrbitSupervisor(new OrbitStateStore(dir), host, config).bootstrap({ goal: 'ship', approved_loop_count: 5 })
 
   assert.equal(result.phase, 'SUCCESS')
   assert.deepEqual(host.events, ['browser-unavailable', 'browser-available'])

@@ -1,12 +1,12 @@
 /**
- * Real DeepSeek CX smoke.
+ * Real DeepSeek Orbit smoke.
  *
- * Runs the full CX chain on a real Cordis Context with the official
+ * Runs the full Orbit chain on a real Cordis Context with the official
  * `deepseek-official` route (real credentials from `~/.dsh/.credentials.yaml`),
  * real Commander/Executor children, real tools, and the real state machine.
  * Intentionally tiny: one file, one verification command.
  *
- * Usage: node packages/cx/tests/e2e/deepseek-smoke.ts
+ * Usage: node packages/orbit/tests/e2e/deepseek-smoke.ts
  */
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -26,7 +26,7 @@ import SubagentPlugin from '@deepseek-ai/dsh-subagent'
 import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import CredentialsLocal from '@deepseek-ai/dsh-credentials-local'
 import * as DeepseekPlugin from '@deepseek-ai/dsh-llm-deepseek'
-import * as CxPlugin from '../../src/index.ts'
+import * as OrbitPlugin from '../../src/index.ts'
 
 const execFileAsync = promisify(execFile)
 const ROUTE = { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' }
@@ -77,8 +77,8 @@ const bashTool = textTool('bash', 'Run a shell command in the working directory.
 
 async function main(): Promise<void> {
   const root = new Context()
-  const storage = mkdtempSync(join(tmpdir(), 'dsh-cx-deepseek-store-'))
-  const projectDir = mkdtempSync(join(tmpdir(), 'dsh-cx-deepseek-project-'))
+  const storage = mkdtempSync(join(tmpdir(), 'dsh-orbit-deepseek-store-'))
+  const projectDir = mkdtempSync(join(tmpdir(), 'dsh-orbit-deepseek-project-'))
   writeFileSync(join(projectDir, 'hello.txt'), 'OLD\n', 'utf8')
 
   for (const [plugin, config] of [
@@ -102,7 +102,7 @@ async function main(): Promise<void> {
   root.tools.register(writeTool)
   root.tools.register(bashTool)
 
-  await root.plugin(CxPlugin as never, {
+  await root.plugin(OrbitPlugin as never, {
     routes: { commander: ROUTE, executor: ROUTE, watchdog: ROUTE },
     browserTools: ['agent_browser'],
     commanderReadOnlyTools: ['read'],
@@ -119,7 +119,7 @@ async function main(): Promise<void> {
   })
 
   const result = await root.agents.withInitiator(parent.agent, () =>
-    root.cx.run(
+    root.orbit.run(
       {
         goal: '把 hello.txt 的内容改为 HELLO_WORLD，并用 bash 运行 cat hello.txt 验证输出包含 HELLO_WORLD',
         approved_loop_count: 3,

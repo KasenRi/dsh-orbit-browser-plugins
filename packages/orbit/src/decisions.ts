@@ -1,8 +1,8 @@
 import {
   MAX_PLAN_STEPS,
   MIN_PLAN_STEPS,
-  type CxCapability,
-  type CxPlanStep,
+  type OrbitCapability,
+  type OrbitPlanStep,
   type CommanderDecision,
   type CommanderDecisionKind,
   type StrategyDecision,
@@ -25,12 +25,12 @@ export function parseJsonObject<T>(text: string, label: string): T {
 
 const STEP_CAPABILITIES = new Set<string>(['browser', 'web-api-recon'])
 
-export function normalizeCapabilities(value: unknown): CxCapability[] | undefined {
+export function normalizeCapabilities(value: unknown): OrbitCapability[] | undefined {
   if (!Array.isArray(value)) return undefined
-  const result: CxCapability[] = []
+  const result: OrbitCapability[] = []
   for (const item of value) {
     if (typeof item !== 'string' || !STEP_CAPABILITIES.has(item)) continue
-    if (!result.includes(item as CxCapability)) result.push(item as CxCapability)
+    if (!result.includes(item as OrbitCapability)) result.push(item as OrbitCapability)
   }
   if (result.length === 0) return undefined
   if (result.includes('web-api-recon') && !result.includes('browser')) result.unshift('browser')
@@ -42,11 +42,11 @@ export interface CommanderPlan {
   steps?: unknown
 }
 
-export function normalizePlan(plan: CommanderPlan): { summary: string; steps: CxPlanStep[] } {
+export function normalizePlan(plan: CommanderPlan): { summary: string; steps: OrbitPlanStep[] } {
   if (!Array.isArray(plan.steps) || plan.steps.length < MIN_PLAN_STEPS || plan.steps.length > MAX_PLAN_STEPS) {
     throw new Error(`COMMANDER_PLAN_OUTPUT_INVALID: steps must contain ${MIN_PLAN_STEPS}-${MAX_PLAN_STEPS} entries`)
   }
-  const steps: CxPlanStep[] = plan.steps.map((item, index) => {
+  const steps: OrbitPlanStep[] = plan.steps.map((item, index) => {
     const record = (item ?? {}) as Record<string, unknown>
     const rawId = typeof record.id === 'string' ? record.id : ''
     const id = /^P\d+$/u.test(rawId) ? rawId : `P${index}`

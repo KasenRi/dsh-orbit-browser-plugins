@@ -1,4 +1,4 @@
-/** Secret redaction shared by CX state, logs, and watchdog prompts. */
+/** Secret redaction shared by Orbit state, logs, and watchdog prompts. */
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
   /(authorization\s*:\s*(?:bearer\s+)?)[^\s,;]+/gi,

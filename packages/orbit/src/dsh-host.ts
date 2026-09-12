@@ -4,10 +4,10 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { CxHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
+import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import { classifyTurnSettlement } from './settlement.ts'
-import type { CxTelemetry } from './types.ts'
+import type { OrbitTelemetry } from './types.ts'
 
 interface SubagentRunLike {
   id: string
@@ -31,7 +31,7 @@ interface GoalsLike {
   get(agent: unknown): { phase?: string; activation?: string } | undefined
 }
 
-export interface DshCxHostOptions {
+export interface DshOrbitHostOptions {
   now?: () => number
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
@@ -46,7 +46,7 @@ function contentToText(blocks: readonly ContentBlock[] | undefined): string {
 }
 
 /**
- * Wire the CX supervisor to DeepSeek Harness native Agent/Subagent services.
+ * Wire the Orbit supervisor to DeepSeek Harness native Agent/Subagent services.
  *
  * Roles keep the Pi-validated split:
  * - Commander/Watchdog: one-shot children, cancelled through the launch signal
@@ -54,7 +54,7 @@ function contentToText(blocks: readonly ContentBlock[] | undefined): string {
  * - Executor: continuable child so a runtime restart can interrupt it and a
  *   resume can reuse the same child.
  */
-export class DshCxHost implements CxHost {
+export class DshOrbitHost implements OrbitHost {
   private readonly ctx: Context
   private readonly ownedChildren = new Set<string>()
   private readonly interruptedChildren = new Set<string>()
@@ -62,7 +62,7 @@ export class DshCxHost implements CxHost {
   private readonly nowFn: () => number
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>
 
-  constructor(ctx: Context, options: DshCxHostOptions = {}) {
+  constructor(ctx: Context, options: DshOrbitHostOptions = {}) {
     this.ctx = ctx
     this.nowFn = options.now ?? (() => Date.now())
     this.sleepFn = options.sleep ?? defaultSleep
@@ -295,7 +295,7 @@ export class DshCxHost implements CxHost {
   }
 
   /** Bounded telemetry for the exact agent behind a handle. */
-  private async snapshotAgent(agent: AgentLike | undefined): Promise<CxTelemetry> {
+  private async snapshotAgent(agent: AgentLike | undefined): Promise<OrbitTelemetry> {
     if (!agent) return { status: 'unknown' }
     const events = agent.session?.snapshotEvents?.() ?? []
     const openCalls = new Map<string, string>()
@@ -355,17 +355,17 @@ export class DshCxHost implements CxHost {
 
   /**
    * Mutation ownership is about top-level autonomous drivers, not about every
-   * running agent. The calling parent, CX's own children, and ordinary
+   * running agent. The calling parent, Orbit's own children, and ordinary
    * conversational/read-only agents are never competitors. Goal is the one
    * DSH-native driver with a readable active state; ralph/workflow are blocked
-   * at tool start by the CX mutation guard.
+   * at tool start by the Orbit mutation guard.
    */
   async otherMutationDrivers(cwd: string): Promise<string[]> {
     void cwd
     const drivers: string[] = []
     const initiator = this.ctx.agents.currentInitiator()
     // `ctx.reflect.get` is the official service lookup that does not require an
-    // inject declaration, so CX stays loadable in profiles without dsh-goal.
+    // inject declaration, so Orbit stays loadable in profiles without dsh-goal.
     const reflect = (this.ctx as unknown as { reflect?: { get(name: string, strict?: boolean): unknown } }).reflect
     const goals = reflect?.get('goals') as GoalsLike | undefined
     if (goals && initiator) {
@@ -401,7 +401,7 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
     const timer = setTimeout(resolve, ms)
     const onAbort = (): void => {
       clearTimeout(timer)
-      reject(new Error('CX_ABORTED'))
+      reject(new Error('ORBIT_ABORTED'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })

@@ -1,36 +1,40 @@
 {
-  "name": "dsh-cx-browser-plugins",
-  "version": "0.1.0",
+  "name": "dsh-orbit-browser-plugins",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Community DeepSeek Harness plugins: CX engineering orchestration (@kasenri/dsh-cx) and controlled browser automation (@kasenri/dsh-browser).",
+  "description": "Community DeepSeek Harness plugins: Orbit deterministic engineering orchestration and controlled browser automation.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KasenRi/dsh-cx-browser-plugins.git"
+    "url": "git+https://github.com/KasenRi/dsh-orbit-browser-plugins.git"
   },
-  "homepage": "https://github.com/KasenRi/dsh-cx-browser-plugins#readme",
+  "homepage": "https://github.com/KasenRi/dsh-orbit-browser-plugins#readme",
   "bugs": {
-    "url": "https://github.com/KasenRi/dsh-cx-browser-plugins/issues"
+    "url": "https://github.com/KasenRi/dsh-orbit-browser-plugins/issues"
   },
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
-    "cordis"
+    "orbit",
+    "engineering-orchestration",
+    "agent-orchestration",
+    "browser-automation"
   ],
   "workspaces": [
-    "packages/cx",
+    "packages/orbit",
     "packages/browser"
   ],
   "scripts": {
-    "build": "tsc -p packages/browser/tsconfig.build.json && tsc -p packages/cx/tsconfig.build.json",
+    "build": "tsc -p packages/browser/tsconfig.build.json && tsc -p packages/orbit/tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test packages/browser/tests/*.test.ts packages/cx/tests/*.test.ts",
+    "test": "node --test packages/browser/tests/*.test.ts packages/orbit/tests/*.test.ts",
     "test:browser": "node --test packages/browser/tests/*.test.ts",
-    "test:cx": "node --test packages/cx/tests/*.test.ts",
-    "test:e2e": "node --test packages/cx/tests/integration/cx-real-context.e2e.test.ts",
-    "test:smoke": "node --test packages/browser/tests/integration/*.test.ts packages/cx/tests/integration/*.test.ts",
-    "smoke:deepseek": "node packages/cx/tests/e2e/deepseek-smoke.ts"
+    "test:orbit": "node --test packages/orbit/tests/*.test.ts",
+    "test:cx": "npm run test:orbit",
+    "test:e2e": "node --test packages/orbit/tests/integration/orbit-real-context.e2e.test.ts",
+    "test:smoke": "node --test packages/browser/tests/integration/*.test.ts packages/orbit/tests/integration/*.test.ts",
+    "smoke:deepseek": "node packages/orbit/tests/e2e/deepseek-smoke.ts"
   },
   "engines": {
     "node": ">=22.19.0"

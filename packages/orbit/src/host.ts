@@ -1,4 +1,4 @@
-import type { CxRole, CxRoute, CxTelemetry } from './types.ts'
+import type { OrbitRole, OrbitRoute, OrbitTelemetry } from './types.ts'
 
 export interface RoleToolFilter {
   allow?: readonly string[]
@@ -6,10 +6,10 @@ export interface RoleToolFilter {
 }
 
 export interface RoleRunRequest {
-  role: CxRole
+  role: OrbitRole
   label: string
   prompt: string
-  route: CxRoute
+  route: OrbitRoute
   toolFilter?: RoleToolFilter
   capabilities?: readonly string[]
   signal?: AbortSignal
@@ -22,7 +22,7 @@ export interface RoleRunResult {
   interrupted: boolean
   reason?: string
   capabilityUnavailable?: string
-  telemetry?: CxTelemetry
+  telemetry?: OrbitTelemetry
   changedFiles?: string[]
   testSummary?: string[]
   usage?: { turns?: number; tools?: number }
@@ -40,11 +40,11 @@ export interface RoleHandle {
   /** Release the handle's resources. One-shot: dispose; continuable: drain. */
   dispose?: () => Promise<void>
   /** Bounded runtime telemetry for this exact handle (not a previous role). */
-  runtimeSnapshot?: () => Promise<CxTelemetry>
+  runtimeSnapshot?: () => Promise<OrbitTelemetry>
 }
 
 /** DSH-facing seam. The supervisor only depends on this, never on subagent internals. */
-export interface CxHost {
+export interface OrbitHost {
   now(): number
   sleep(ms: number, signal?: AbortSignal): Promise<void>
   startRole(request: RoleRunRequest): Promise<RoleHandle>

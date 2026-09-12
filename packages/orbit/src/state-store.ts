@@ -3,13 +3,13 @@ import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { redactValue } from './sanitize.ts'
-import { CX_SCHEMA_VERSION, type CxDriverOwnership, type CxState } from './types.ts'
+import { ORBIT_SCHEMA_VERSION, type OrbitDriverOwnership, type OrbitState } from './types.ts'
 
 const LOCK_TIMEOUT_MS = 5_000
 const LOCK_STALE_MS = 30_000
 const LOCK_SPIN_MS = 20
 
-export function driverOwnershipFor(phase: CxState['phase'], status: CxState['status']): CxDriverOwnership {
+export function driverOwnershipFor(phase: OrbitState['phase'], status: OrbitState['status']): OrbitDriverOwnership {
   if (['SUCCESS', 'STOPPED', 'BUDGET_EXHAUSTED'].includes(phase) || ['success', 'stopped', 'budget_exhausted'].includes(status)) {
     return 'CLOSED'
   }
@@ -24,22 +24,22 @@ function nowIso(): string {
  * Project-scoped durable store for `.cx/state.json`.
  * Atomic write + short-transaction directory lock + monotonic revision.
  */
-export class CxStateStore {
-  readonly cxDir: string
+export class OrbitStateStore {
+  readonly stateDir: string
   private lockDepth = 0
 
   constructor(projectDir: string) {
-    this.cxDir = join(projectDir, '.cx')
+    this.stateDir = join(projectDir, '.cx')
   }
 
   get statePath(): string {
-    return join(this.cxDir, 'state.json')
+    return join(this.stateDir, 'state.json')
   }
 
   transact<T>(operation: () => T): T {
     if (this.lockDepth > 0) return operation()
-    mkdirSync(this.cxDir, { recursive: true, mode: 0o700 })
-    const lock = join(this.cxDir, 'controller.lock')
+    mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
+    const lock = join(this.stateDir, 'controller.lock')
     const deadline = Date.now() + LOCK_TIMEOUT_MS
     for (;;) {
       try {
@@ -49,7 +49,7 @@ export class CxStateStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error
         if (isStale(lock) || Date.now() > deadline) {
-          if (Date.now() > deadline && !isStale(lock)) throw new Error('CX_STATE_LOCK_TIMEOUT: another controller transaction is active')
+          if (Date.now() > deadline && !isStale(lock)) throw new Error('ORBIT_STATE_LOCK_TIMEOUT: another controller transaction is active')
           rmSync(lock, { recursive: true, force: true })
           continue
         }
@@ -75,23 +75,23 @@ export class CxStateStore {
     }
   }
 
-  readState(): CxState | null {
+  readState(): OrbitState | null {
     const raw = this.readRawState()
     if (raw === null) return null
-    return raw as unknown as CxState
+    return raw as unknown as OrbitState
   }
 
-  writeState(state: CxState): CxState {
+  writeState(state: OrbitState): OrbitState {
     return this.transact(() => {
       const current = this.readRawState()
       const revision = Number(current?.['state_revision'] ?? 0) + 1
       const next = {
         ...state,
-        schema_version: CX_SCHEMA_VERSION,
+        schema_version: ORBIT_SCHEMA_VERSION,
         state_revision: revision,
         driver_ownership: driverOwnershipFor(state.phase, state.status),
         updated_at: nowIso(),
-      } as CxState
+      } as OrbitState
       Object.assign(state, next)
       this.writeJson(this.statePath, next)
       return next

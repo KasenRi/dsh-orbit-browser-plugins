@@ -2,20 +2,23 @@ import { accessSync, constants, mkdirSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
-import { DshCxHost } from './dsh-host.ts'
-import { CxStateStore } from './state-store.ts'
-import { CxSupervisor, type CxRunInput, type GuardBlockOutcome } from './supervisor.ts'
-import type { CxActionResult, CxRoutes, GuardCode } from './types.ts'
+import { DshOrbitHost } from './dsh-host.ts'
+import { OrbitStateStore } from './state-store.ts'
+import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome } from './supervisor.ts'
+import type { OrbitActionResult, OrbitRoutes, GuardCode } from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    cx: CxService
+    /** Canonical Orbit service. */
+    orbit: OrbitService
+    /** @deprecated Legacy CX (now Orbit) alias for the same {@link OrbitService} instance. */
+    cx: OrbitService
   }
 }
 
-export interface CxPluginConfig {
+export interface OrbitPluginConfig {
   projectDir?: string
-  routes: CxRoutes
+  routes: OrbitRoutes
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
@@ -23,24 +26,24 @@ export interface CxPluginConfig {
   executorTimeoutMs?: number
 }
 
-export interface CxDoctorReport {
+export interface OrbitDoctorReport {
   status: 'pass' | 'warn' | 'fail'
   generatedAt: string
   checks: Array<{ name: string; status: 'pass' | 'warn' | 'fail'; detail: string }>
 }
 
-export class CxService extends Service {
-  private readonly host: DshCxHost
-  private readonly config: CxPluginConfig
+export class OrbitService extends Service {
+  private readonly host: DshOrbitHost
+  private readonly config: OrbitPluginConfig
 
-  constructor(ctx: Context, config: CxPluginConfig) {
-    super(ctx, 'cx')
-    this.host = new DshCxHost(ctx)
+  constructor(ctx: Context, config: OrbitPluginConfig) {
+    super(ctx, 'orbit')
+    this.host = new DshOrbitHost(ctx)
     this.config = config
   }
 
-  supervisorFor(projectDir: string): CxSupervisor {
-    return new CxSupervisor(new CxStateStore(projectDir), this.host, {
+  supervisorFor(projectDir: string): OrbitSupervisor {
+    return new OrbitSupervisor(new OrbitStateStore(projectDir), this.host, {
       defaultRoutes: this.config.routes,
       browserTools: this.config.browserTools,
       commanderReadOnlyTools: this.config.commanderReadOnlyTools,
@@ -54,23 +57,23 @@ export class CxService extends Service {
     return projectDir ?? this.config.projectDir ?? process.cwd()
   }
 
-  run(input: CxRunInput, projectDir?: string, signal?: AbortSignal): Promise<CxActionResult> {
+  run(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal): Promise<OrbitActionResult> {
     return this.supervisorFor(this.resolveProjectDir(projectDir)).bootstrap(input, signal)
   }
 
-  async resume(input: CxRunInput, projectDir?: string, signal?: AbortSignal): Promise<CxActionResult> {
+  async resume(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal): Promise<OrbitActionResult> {
     const dir = this.resolveProjectDir(projectDir)
-    const state = new CxStateStore(dir).readState()
-    if (!state) return { ok: false, action: 'resume', message: 'CX_RUN_NOT_FOUND: no durable run to resume.' }
+    const state = new OrbitStateStore(dir).readState()
+    if (!state) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: no durable run to resume.' }
     const supervisor = this.supervisorFor(dir)
     return supervisor.run(state, signal)
   }
 
-  stop(runId?: string, projectDir?: string): CxActionResult {
+  stop(runId?: string, projectDir?: string): OrbitActionResult {
     return this.supervisorFor(this.resolveProjectDir(projectDir)).stop('stop', runId)
   }
 
-  status(projectDir?: string): Promise<CxActionResult> {
+  status(projectDir?: string): Promise<OrbitActionResult> {
     return this.supervisorFor(this.resolveProjectDir(projectDir)).status()
   }
 
@@ -79,18 +82,18 @@ export class CxService extends Service {
   }
 
   hasActiveRun(projectDir?: string): boolean {
-    const state = new CxStateStore(this.resolveProjectDir(projectDir)).readState()
+    const state = new OrbitStateStore(this.resolveProjectDir(projectDir)).readState()
     return state !== null && state.driver_ownership !== 'CLOSED'
   }
 
   githubAllowed(projectDir?: string): boolean {
-    const state = new CxStateStore(this.resolveProjectDir(projectDir)).readState()
+    const state = new OrbitStateStore(this.resolveProjectDir(projectDir)).readState()
     return state?.github_allowed === true
   }
 
-  async doctor(projectDir?: string): Promise<CxDoctorReport> {
+  async doctor(projectDir?: string): Promise<OrbitDoctorReport> {
     const dir = this.resolveProjectDir(projectDir)
-    const checks: CxDoctorReport['checks'] = []
+    const checks: OrbitDoctorReport['checks'] = []
     try {
       mkdirSync(`${dir}/.cx`, { recursive: true, mode: 0o700 })
       accessSync(`${dir}/.cx`, constants.W_OK)
@@ -119,13 +122,13 @@ export class CxService extends Service {
       status: 'pass',
       detail:
         driverTools.length > 0
-          ? `CX mutation guard will deny ${driverTools.join(', ')} while a run is active`
+          ? `Orbit mutation guard will deny ${driverTools.join(', ')} while a run is active`
           : 'no top-level mutation driver tool is registered in this profile',
     })
     checks.push({
       name: 'host-adapter-lifecycle',
       status: 'pass',
-      detail: 'DshCxHost provides cancel/dispose/runtimeSnapshot for every role handle',
+      detail: 'DshOrbitHost provides cancel/dispose/runtimeSnapshot for every role handle',
     })
     checks.push({
       name: 'role-routes',

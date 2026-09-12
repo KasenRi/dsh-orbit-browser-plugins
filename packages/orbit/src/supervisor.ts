@@ -14,9 +14,9 @@ import {
   parseJsonObject,
   type EvaluationMode,
 } from './decisions.ts'
-import type { CxHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
+import type { OrbitHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
 import { truncateSafe } from './sanitize.ts'
-import { CxStateStore } from './state-store.ts'
+import { OrbitStateStore } from './state-store.ts'
 import {
   COMMANDER_EXTENSION_MS,
   COMMANDER_HARD_CEILING_MS,
@@ -35,10 +35,10 @@ import {
   WATCHDOG_TIMEOUT_MS,
   type CommanderDecision,
   type CommanderMode,
-  type CxActionResult,
-  type CxPlanStep,
-  type CxState,
-  type CxTelemetry,
+  type OrbitActionResult,
+  type OrbitPlanStep,
+  type OrbitState,
+  type OrbitTelemetry,
   type GuardCode,
   type GuardWatchdogDecision,
   type StrategyDecision,
@@ -46,8 +46,8 @@ import {
   type WatchdogDecision,
 } from './types.ts'
 
-export interface CxSupervisorConfig {
-  defaultRoutes: CxState['routes']
+export interface OrbitSupervisorConfig {
+  defaultRoutes: OrbitState['routes']
   browserTools: readonly string[]
   commanderReadOnlyTools: readonly string[]
   watchdogTools: readonly string[]
@@ -56,7 +56,7 @@ export interface CxSupervisorConfig {
   watchdogTimeoutMs?: number
 }
 
-export interface CxRunInput {
+export interface OrbitRunInput {
   goal?: string
   preset?: string
   approved_loop_count?: number
@@ -94,7 +94,7 @@ interface AuxRoleRequest {
   timeoutMs?: number
 }
 
-const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[]) => `You are the CX Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
+const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[]) => `You are the Orbit Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
 Return ONLY JSON: {"summary":"...","steps":[{"id":"P0","goal":"...","capabilities":[]}]}
 Rules: ordinary engineering steps must omit capabilities. Add capability "browser" only when the step must drive a real web page, and "web-api-recon" when it must analyze captured network/API traffic. Keep it minimal.
 Goal: ${goal}
@@ -102,10 +102,10 @@ Hard constraints: ${constraints.join('; ') || 'none'}`
 
 const COMMANDER_STEP_PROMPT = (
   goal: string,
-  step: CxPlanStep,
+  step: OrbitPlanStep,
   evidence: string,
-  state: CxState,
-) => `You are the CX Commander doing STEP_EVALUATE. Verify the real project state; do not trust the Executor summary blindly.
+  state: OrbitState,
+) => `You are the Orbit Commander doing STEP_EVALUATE. Verify the real project state; do not trust the Executor summary blindly.
 Allowed decisions ONLY: PASS_CURRENT_STEP | CORRECT_CURRENT_STEP | NEEDS_USER.
 - CORRECT_CURRENT_STEP requires next_step_goal (optional next_step_capabilities).
 Return ONLY JSON: {"decision":"...","reason":"...","next_step_goal":"...","next_step_capabilities":[]}
@@ -115,8 +115,8 @@ Iteration counters: loop ${state.loop.used}/${state.loop.max}
 Executor evidence:
 ${evidence}`
 
-const COMMANDER_FINAL_PROMPT = (goal: string, plan: CxState['plan'], evidence: string, state: CxState) =>
-  `You are the CX Commander doing FINAL_EVALUATE. All planned steps are done. Decide whether the original goal is truly satisfied against the real project state.
+const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence: string, state: OrbitState) =>
+  `You are the Orbit Commander doing FINAL_EVALUATE. All planned steps are done. Decide whether the original goal is truly satisfied against the real project state.
 Allowed decisions ONLY: SUCCESS | APPEND | NEEDS_USER.
 - APPEND requires next_steps (array) or next_step_goal; appends are bounded by the remaining loop budget.
 Return ONLY JSON: {"decision":"...","summary":"...","next_steps":[{"goal":"...","capabilities":[]}]}
@@ -127,8 +127,8 @@ Loop: ${state.loop.used}/${state.loop.max}
 Evidence:
 ${evidence}`
 
-const COMMANDER_STRATEGY_PROMPT = (goal: string, base: string, challenge: string, state: CxState) =>
-  `You are the CX Commander reconsidering strategy after a repeated correction on ${base} (STRATEGY_RECONSIDER).
+const COMMANDER_STRATEGY_PROMPT = (goal: string, base: string, challenge: string, state: OrbitState) =>
+  `You are the Orbit Commander reconsidering strategy after a repeated correction on ${base} (STRATEGY_RECONSIDER).
 Allowed decisions ONLY: KEEP_APPROACH | REPLACE_CURRENT_STEP | NEEDS_USER.
 - REPLACE_CURRENT_STEP requires replacement_goal.
 Return ONLY JSON: {"decision":"...","reason":"...","replacement_goal":"..."}
@@ -136,30 +136,30 @@ Goal: ${goal}
 Loop: ${state.loop.used}/${state.loop.max}
 Watchdog challenge: ${challenge}`
 
-const WATCHDOG_RUNTIME_PROMPT = (step: CxPlanStep, reason: string, telemetry: CxTelemetry | undefined) =>
-  `You are the CX Smart Watchdog doing RUNTIME_DIAGNOSE. Diagnose only the current runtime anomaly. Do not review code quality.
+const WATCHDOG_RUNTIME_PROMPT = (step: OrbitPlanStep, reason: string, telemetry: OrbitTelemetry | undefined) =>
+  `You are the Orbit Smart Watchdog doing RUNTIME_DIAGNOSE. Diagnose only the current runtime anomaly. Do not review code quality.
 Allowed decisions ONLY: RESUME_CHILD | RESTART_STEP | NEEDS_USER | RUNTIME_BUG.
 Return ONLY JSON: {"decision":"...","reason":"..."}
 Failed step ${step.id}: ${step.goal}
 Runtime anomaly: ${reason}
 Telemetry: ${JSON.stringify(telemetry ?? {})}`
 
-const WATCHDOG_STRATEGY_PROMPT = (step: CxPlanStep, reason: string, state: CxState) =>
-  `You are the CX Smart Watchdog doing STRATEGY_CHALLENGE. Ask: is the current approach tunnel vision? Is this blocker truly required? Is there a simpler route?
+const WATCHDOG_STRATEGY_PROMPT = (step: OrbitPlanStep, reason: string, state: OrbitState) =>
+  `You are the Orbit Smart Watchdog doing STRATEGY_CHALLENGE. Ask: is the current approach tunnel vision? Is this blocker truly required? Is there a simpler route?
 Return ONLY JSON: {"question":"..."}
 Step ${step.id}: ${step.goal}
 Repeated correction: ${reason}
 Loop: ${state.loop.used}/${state.loop.max}`
 
 const WATCHDOG_GUARD_PROMPT = (code: GuardCode, count: number, stepId: string) =>
-  `You are the CX Smart Watchdog doing GUARD_ESCALATION. A safety guard blocked a tool ${count} times.
+  `You are the Orbit Smart Watchdog doing GUARD_ESCALATION. A safety guard blocked a tool ${count} times.
 Allowed decisions ONLY: RETRY_DIFFERENTLY | NEEDS_USER.
 Return ONLY JSON: {"decision":"...","instruction":"..."}
 Guard code: ${code}
 Step: ${stepId}`
 
-const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extensions: number, telemetry: CxTelemetry | undefined) =>
-  `You are the CX Smart Watchdog doing COMMANDER_TIMEOUT_REVIEW. The Commander has run ${elapsed}ms with ${extensions} extension(s).
+const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extensions: number, telemetry: OrbitTelemetry | undefined) =>
+  `You are the Orbit Smart Watchdog doing COMMANDER_TIMEOUT_REVIEW. The Commander has run ${elapsed}ms with ${extensions} extension(s).
 Allowed decisions ONLY: EXTEND | INTERRUPT | NEEDS_USER.
 Return ONLY JSON: {"decision":"...","reason":"..."}
 Mode: ${mode}
@@ -170,12 +170,12 @@ type CommanderOutcome =
   | { kind: 'interrupted'; reason: string }
   | { kind: 'needs_user'; reason: string }
 
-export class CxSupervisor {
-  private readonly store: CxStateStore
-  private readonly host: CxHost
-  private readonly config: CxSupervisorConfig
+export class OrbitSupervisor {
+  private readonly store: OrbitStateStore
+  private readonly host: OrbitHost
+  private readonly config: OrbitSupervisorConfig
 
-  constructor(store: CxStateStore, host: CxHost, config: CxSupervisorConfig) {
+  constructor(store: OrbitStateStore, host: OrbitHost, config: OrbitSupervisorConfig) {
     this.store = store
     this.host = host
     this.config = config
@@ -185,7 +185,7 @@ export class CxSupervisor {
     return this.host.now()
   }
 
-  createState(input: CxRunInput): CxState {
+  createState(input: OrbitRunInput): OrbitState {
     const runId = typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID()
     const max = this.explicitLoopBudget(input) ?? this.estimateLoopCount(input.goal ?? '')
     const goal = (input.goal ?? '').trim()
@@ -200,7 +200,7 @@ export class CxSupervisor {
       updated_at: new Date(this.now()).toISOString(),
       goal,
       goal_hash: hashGoal(goal),
-      preset: input.preset ?? 'cx-lite',
+      preset: input.preset ?? 'orbit-lite',
       routes: this.config.defaultRoutes,
       loop: { used: 0, max },
       approved_loop_count: max,
@@ -216,11 +216,11 @@ export class CxSupervisor {
     }
   }
 
-  private explicitLoopBudget(input: CxRunInput): number | undefined {
+  private explicitLoopBudget(input: OrbitRunInput): number | undefined {
     const raw = input.approved_loop_count ?? input.max_loops
     if (raw === undefined) return undefined
-    if (!Number.isSafeInteger(raw) || raw <= 0) throw new Error('CX_LOOP_BUDGET_INVALID: approved_loop_count must be a positive integer')
-    if (raw > 10) throw new Error('CX_LOOP_BUDGET_INVALID: approved_loop_count above 10 requires an explicit execution request')
+    if (!Number.isSafeInteger(raw) || raw <= 0) throw new Error('ORBIT_LOOP_BUDGET_INVALID: approved_loop_count must be a positive integer')
+    if (raw > 10) throw new Error('ORBIT_LOOP_BUDGET_INVALID: approved_loop_count above 10 requires an explicit execution request')
     return raw
   }
 
@@ -233,15 +233,15 @@ export class CxSupervisor {
     return 1
   }
 
-  private updateLoopBudget(state: CxState, budget: number): void {
-    if (budget < state.loop.used) throw new Error(`CX_LOOP_BUDGET_BELOW_USED: requested ${budget}, already used ${state.loop.used}`)
+  private updateLoopBudget(state: OrbitState, budget: number): void {
+    if (budget < state.loop.used) throw new Error(`ORBIT_LOOP_BUDGET_BELOW_USED: requested ${budget}, already used ${state.loop.used}`)
     state.approved_loop_count = budget
     state.loop = { used: state.loop.used, max: budget }
     state.loop_count = state.loop.used
     state.remaining_budget = Math.max(0, budget - state.loop.used)
   }
 
-  async bootstrap(input: CxRunInput, signal?: AbortSignal): Promise<CxActionResult> {
+  async bootstrap(input: OrbitRunInput, signal?: AbortSignal): Promise<OrbitActionResult> {
     const requestedGoal = (input.goal ?? '').trim()
     let state = this.store.readState()
     const raw = this.store.readRawState()
@@ -250,10 +250,10 @@ export class CxSupervisor {
     if (legacy && requestedGoal) {
       state = this.store.writeState(this.createState(input))
     } else if (!state) {
-      if (!requestedGoal) return { ok: false, action: 'run', message: 'CX_GOAL_REQUIRED: provide a goal to start a run.' }
+      if (!requestedGoal) return { ok: false, action: 'run', message: 'ORBIT_GOAL_REQUIRED: provide a goal to start a run.' }
       state = this.store.writeState(this.createState(input))
     } else if (input.run_id && input.run_id !== state.run_id && !legacy) {
-      return { ok: false, action: 'run', message: `CX_RUN_NOT_FOUND: ${input.run_id}` }
+      return { ok: false, action: 'run', message: `ORBIT_RUN_NOT_FOUND: ${input.run_id}` }
     }
 
     if (['SUCCESS', 'STOPPED', 'BUDGET_EXHAUSTED'].includes(state.phase) && requestedGoal) {
@@ -264,7 +264,7 @@ export class CxSupervisor {
         ok: false,
         action: 'run',
         run_id: state.run_id,
-        message: 'CX_ACTIVE_RUN_EXISTS: current Lite run owns this project; resume it or stop it before starting a different goal.',
+        message: 'ORBIT_ACTIVE_RUN_EXISTS: current Lite run owns this project; resume it or stop it before starting a different goal.',
       }
     }
     if (state.phase === 'NEEDS_USER' && requestedGoal) {
@@ -275,9 +275,9 @@ export class CxSupervisor {
     return this.run(state, signal)
   }
 
-  async run(state: CxState, signal?: AbortSignal): Promise<CxActionResult> {
-    if (signal?.aborted) return this.result(state, false, 'CX_ABORTED')
-    const projectDir = join(this.store.cxDir, '..')
+  async run(state: OrbitState, signal?: AbortSignal): Promise<OrbitActionResult> {
+    if (signal?.aborted) return this.result(state, false, 'ORBIT_ABORTED')
+    const projectDir = join(this.store.stateDir, '..')
     const competitors = await this.host.otherMutationDrivers(projectDir)
     if (competitors.length > 0) {
       return {
@@ -286,11 +286,11 @@ export class CxSupervisor {
         run_id: state.run_id,
         phase: state.phase,
         status: state.status,
-        message: `CX_MUTATION_DRIVER_CONFLICT: ${competitors.join(', ')} already owns mutation in this workspace.`,
+        message: `ORBIT_MUTATION_DRIVER_CONFLICT: ${competitors.join(', ')} already owns mutation in this workspace.`,
       }
     }
 
-    if (state.phase === 'NEEDS_USER') return this.result(state, true, 'CX_AWAITING_USER')
+    if (state.phase === 'NEEDS_USER') return this.result(state, true, 'ORBIT_AWAITING_USER')
     if (state.phase === 'SUCCESS') return this.result(state, true)
     if (state.phase === 'STOPPED') return this.result(state, true)
     if (state.phase === 'BUDGET_EXHAUSTED') return this.result(state, true)
@@ -354,14 +354,14 @@ export class CxSupervisor {
   private toolAllow(names: readonly string[], label: string): RoleToolFilter {
     const allowed = names.filter((name) => this.host.hasTool(name))
     if (allowed.length === 0) {
-      throw new Error(`CX_TOOL_FILTER_EMPTY: none of [${names.join(', ')}] are registered for ${label}`)
+      throw new Error(`ORBIT_TOOL_FILTER_EMPTY: none of [${names.join(', ')}] are registered for ${label}`)
     }
     return { allow: allowed }
   }
 
   // ── commander supervised path ──────────────────────────────────────────────
 
-  private async makePlan(state: CxState, signal?: AbortSignal): Promise<CxActionResult | undefined> {
+  private async makePlan(state: OrbitState, signal?: AbortSignal): Promise<OrbitActionResult | undefined> {
     const outcome = await this.runCommander(
       state,
       'PLAN',
@@ -394,8 +394,8 @@ export class CxSupervisor {
   }
 
   private async commanderEvaluate(
-    state: CxState,
-    step: CxPlanStep | undefined,
+    state: OrbitState,
+    step: OrbitPlanStep | undefined,
     final: boolean,
     signal?: AbortSignal,
   ): Promise<CommanderOutcome> {
@@ -403,7 +403,7 @@ export class CxSupervisor {
     const evidence = state.commander?.summary ?? state.last_error ?? 'no evidence recorded'
     const prompt = final
       ? COMMANDER_FINAL_PROMPT(state.goal, state.plan, evidence, state)
-      : COMMANDER_STEP_PROMPT(state.goal, step as CxPlanStep, evidence, state)
+      : COMMANDER_STEP_PROMPT(state.goal, step as OrbitPlanStep, evidence, state)
     const outcome = await this.runCommander(state, mode, prompt, signal)
     if (outcome.kind === 'needs_user') return { kind: 'needs_user', reason: outcome.reason }
     if (outcome.kind === 'interrupted') return { kind: 'interrupted', reason: outcome.reason }
@@ -422,7 +422,7 @@ export class CxSupervisor {
    * EXTEND always keeps the same child.
    */
   private async runCommander(
-    state: CxState,
+    state: OrbitState,
     mode: CommanderMode,
     prompt: string,
     signal?: AbortSignal,
@@ -457,8 +457,8 @@ export class CxSupervisor {
           return { kind: 'output', output: raced.value.output }
         }
         if (raced.kind === 'aborted' || signal?.aborted) {
-          await this.cancelHandle(handle, 'CX_ABORTED')
-          return { kind: 'interrupted', reason: 'CX_ABORTED' }
+          await this.cancelHandle(handle, 'ORBIT_ABORTED')
+          return { kind: 'interrupted', reason: 'ORBIT_ABORTED' }
         }
         if (extensions >= 2) {
           await this.cancelHandle(handle, 'COMMANDER_HARD_TIMEOUT')
@@ -479,7 +479,7 @@ export class CxSupervisor {
   }
 
   private async commanderTimeoutReview(
-    state: CxState,
+    state: OrbitState,
     mode: CommanderMode,
     elapsed: number,
     extensions: number,
@@ -507,8 +507,8 @@ export class CxSupervisor {
   // ── executor runtime ───────────────────────────────────────────────────────
 
   private async executeStep(
-    state: CxState,
-    step: CxPlanStep,
+    state: OrbitState,
+    step: OrbitPlanStep,
     signal?: AbortSignal,
   ): Promise<{ done: boolean; ok: boolean; message?: string }> {
     const capabilities = step.capabilities ?? []
@@ -569,7 +569,7 @@ export class CxSupervisor {
       state.interruption_retries = retries
       this.store.writeState(state)
 
-      if (signal?.aborted) return { done: true, ok: false, message: 'CX_ABORTED' }
+      if (signal?.aborted) return { done: true, ok: false, message: 'ORBIT_ABORTED' }
       if (result.reason === 'USER_HARD_SCOPE_VIOLATION') {
         state.phase = 'NEEDS_USER'
         state.status = 'needs_user'
@@ -589,7 +589,7 @@ export class CxSupervisor {
         return { done: false, ok: false }
       }
       if (recovery === 'restart') {
-        await this.cancelHandle(handle, 'CX_RESTART_STEP')
+        await this.cancelHandle(handle, 'ORBIT_RESTART_STEP')
         await this.disposeHandle(handle)
         state.child = undefined
         state.interruption_retries = 0
@@ -611,7 +611,7 @@ export class CxSupervisor {
     state.loop = { used: state.loop.used + 1, max: state.loop.max }
     state.loop_count = state.loop.used
     state.remaining_budget = Math.max(0, state.loop.max - state.loop.used)
-    state.changed_files = result.changedFiles ?? this.host.changedFiles(join(this.store.cxDir, '..'))
+    state.changed_files = result.changedFiles ?? this.host.changedFiles(join(this.store.stateDir, '..'))
     state.test_summary = result.testSummary ?? []
     state.last_error = null
     state.commander = {
@@ -635,16 +635,16 @@ export class CxSupervisor {
       ...(handle.childId ? { childId: handle.childId } : {}),
       output: '',
       interrupted: true,
-      reason: raced.kind === 'aborted' ? 'CX_ABORTED' : 'EXECUTOR_TIMEOUT',
+      reason: raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'EXECUTOR_TIMEOUT',
       ...(telemetry ? { telemetry } : {}),
     }
   }
 
-  private executorPrompt(state: CxState, step: CxPlanStep): string {
+  private executorPrompt(state: OrbitState, step: OrbitPlanStep): string {
     const lines = [
-      'You are the CX Executor. Implement exactly the current step with real tools and real verification.',
+      'You are the Orbit Executor. Implement exactly the current step with real tools and real verification.',
       `Current step ${step.id}: ${step.goal}`,
-      `Working directory: ${join(this.store.cxDir, '..')}`,
+      `Working directory: ${join(this.store.stateDir, '..')}`,
       `Hard constraints: ${state.user_hard_constraints.join('; ') || 'none'}`,
     ]
     if ((step.capabilities ?? []).length > 0) lines.push(`Capabilities: ${(step.capabilities ?? []).join(', ')}`)
@@ -655,12 +655,12 @@ export class CxSupervisor {
   // ── decision application ───────────────────────────────────────────────────
 
   private async applyCommanderOutcome(
-    state: CxState,
+    state: OrbitState,
     outcome: CommanderOutcome,
-    step: CxPlanStep | undefined,
+    step: OrbitPlanStep | undefined,
     final: boolean,
     signal?: AbortSignal,
-  ): Promise<CxActionResult | undefined> {
+  ): Promise<OrbitActionResult | undefined> {
     state.guard_recovery = undefined
 
     if (outcome.kind === 'interrupted') {
@@ -695,7 +695,7 @@ export class CxSupervisor {
     }
 
     if (decision.decision === 'CORRECT_CURRENT_STEP') {
-      return this.applyCorrection(state, step as CxPlanStep, decision, signal)
+      return this.applyCorrection(state, step as OrbitPlanStep, decision, signal)
     }
 
     if (decision.decision === 'APPEND') {
@@ -723,7 +723,7 @@ export class CxSupervisor {
     return this.setNeedsUser(state, 'COMMANDER_FINAL_DECISION_INVALID')
   }
 
-  private setNeedsUser(state: CxState, reason: string): CxActionResult {
+  private setNeedsUser(state: OrbitState, reason: string): OrbitActionResult {
     state.phase = 'NEEDS_USER'
     state.status = 'needs_user'
     state.last_error = truncateSafe(reason, 500)
@@ -731,8 +731,8 @@ export class CxSupervisor {
     return this.result(state, false)
   }
 
-  private normalizeAppend(decision: CommanderDecision): Array<{ goal: string; capabilities?: CxPlanStep['capabilities'] }> {
-    const items: Array<{ goal: string; capabilities?: CxPlanStep['capabilities'] }> = []
+  private normalizeAppend(decision: CommanderDecision): Array<{ goal: string; capabilities?: OrbitPlanStep['capabilities'] }> {
+    const items: Array<{ goal: string; capabilities?: OrbitPlanStep['capabilities'] }> = []
     if (Array.isArray(decision.next_steps)) {
       for (const entry of decision.next_steps) {
         if (typeof entry === 'string' && entry.trim()) items.push({ goal: entry.trim() })
@@ -753,11 +753,11 @@ export class CxSupervisor {
   }
 
   private async applyCorrection(
-    state: CxState,
-    step: CxPlanStep,
+    state: OrbitState,
+    step: OrbitPlanStep,
     decision: CommanderDecision,
     signal?: AbortSignal,
-  ): Promise<CxActionResult | undefined> {
+  ): Promise<OrbitActionResult | undefined> {
     if (!step || !decision.next_step_goal) {
       return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: correction needs next_step_goal')
     }
@@ -807,9 +807,9 @@ export class CxSupervisor {
   }
 
   private async strategyChallenge(
-    state: CxState,
+    state: OrbitState,
     base: string,
-    step: CxPlanStep,
+    step: OrbitPlanStep,
     reason: string,
     signal?: AbortSignal,
   ): Promise<StrategyOutcome> {
@@ -851,8 +851,8 @@ export class CxSupervisor {
   }
 
   private async runtimeWatchdog(
-    state: CxState,
-    step: CxPlanStep,
+    state: OrbitState,
+    step: OrbitPlanStep,
     result: RoleRunResult,
     retries: number,
     signal?: AbortSignal,
@@ -930,7 +930,7 @@ export class CxSupervisor {
     return { disposition: 'block_continue', code, count, watchdog_calls: 1, instruction: watchdog.instruction ?? GUARD_RETRY_INSTRUCTION }
   }
 
-  private async guardEscalation(state: CxState, code: GuardCode, count: number): Promise<GuardWatchdogDecision> {
+  private async guardEscalation(state: OrbitState, code: GuardCode, count: number): Promise<GuardWatchdogDecision> {
     const result = await this.runAuxRole(state, {
       role: 'watchdog',
       label: 'watchdog-guard',
@@ -950,10 +950,10 @@ export class CxSupervisor {
       : { decision: 'RETRY_DIFFERENTLY', instruction: GUARD_RETRY_INSTRUCTION }
   }
 
-  private guardNeedsUser(state: CxState, code: GuardCode, reason: string, count: number, instruction?: string): GuardBlockOutcome {
+  private guardNeedsUser(state: OrbitState, code: GuardCode, reason: string, count: number, instruction?: string): GuardBlockOutcome {
     state.phase = 'NEEDS_USER'
     state.status = 'needs_user'
-    state.last_error = `CX_GUARD_ESCALATION: ${reason.slice(0, 300)}`
+    state.last_error = `ORBIT_GUARD_ESCALATION: ${reason.slice(0, 300)}`
     this.store.writeState(state)
     return { disposition: 'block_needs_user', code, count, watchdog_calls: 0, instruction: instruction ?? GUARD_NEEDS_USER_INSTRUCTION }
   }
@@ -964,7 +964,7 @@ export class CxSupervisor {
    * One-shot auxiliary role (watchdogs and similar). Always releases the handle,
    * even on interruption or timeout.
    */
-  private async runAuxRole(state: CxState, request: AuxRoleRequest): Promise<RoleRunResult | undefined> {
+  private async runAuxRole(state: OrbitState, request: AuxRoleRequest): Promise<RoleRunResult | undefined> {
     const names = request.role === 'watchdog' ? this.config.watchdogTools : this.config.commanderReadOnlyTools
     let handle: RoleHandle | undefined
     try {
@@ -979,12 +979,12 @@ export class CxSupervisor {
       const timeoutMs = request.timeoutMs ?? this.config.watchdogTimeoutMs ?? WATCHDOG_TIMEOUT_MS
       const raced = await this.raceWithSleep(handle.result, timeoutMs, request.signal)
       if (raced.kind === 'work') return raced.value
-      await this.cancelHandle(handle, raced.kind === 'aborted' ? 'CX_ABORTED' : 'WATCHDOG_TIMEOUT')
+      await this.cancelHandle(handle, raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'WATCHDOG_TIMEOUT')
       return {
         ...(handle.childId ? { childId: handle.childId } : {}),
         output: '',
         interrupted: true,
-        reason: raced.kind === 'aborted' ? 'CX_ABORTED' : 'WATCHDOG_TIMEOUT',
+        reason: raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'WATCHDOG_TIMEOUT',
       }
     } catch {
       return undefined
@@ -1040,23 +1040,43 @@ export class CxSupervisor {
 
   // ── lifecycle ──────────────────────────────────────────────────────────────
 
-  stop(action: string, runId?: string): CxActionResult {
+  stop(action: string, runId?: string): OrbitActionResult {
     const state = this.store.readState()
-    if (!state) return { ok: false, action, message: 'CX_RUN_NOT_FOUND: no active run.' }
-    if (runId && runId !== state.run_id) return { ok: false, action, message: `CX_RUN_NOT_FOUND: ${runId}` }
+    if (!state) return { ok: false, action, message: 'ORBIT_RUN_NOT_FOUND: no active run.' }
+    if (runId && runId !== state.run_id) return { ok: false, action, message: `ORBIT_RUN_NOT_FOUND: ${runId}` }
     state.phase = 'STOPPED'
     state.status = 'stopped'
     this.store.writeState(state)
     return this.result(state, true)
   }
 
-  async status(): Promise<CxActionResult> {
+  async status(): Promise<OrbitActionResult> {
     const state = this.store.readState()
-    if (!state) return { ok: false, action: 'status', message: 'CX_RUN_NOT_FOUND: no run state.' }
+    if (!state) return { ok: false, action: 'status', message: 'ORBIT_RUN_NOT_FOUND: no run state.' }
     return this.result(state, true)
   }
 
-  private result(state: CxState, ok: boolean, message?: string): CxActionResult {
+  private result(state: OrbitState, ok: boolean, message?: string): OrbitActionResult {
+    // Tool output must be lossless JSON: optional state fields are omitted, not
+    // emitted as `undefined`.
+    const data = {
+      goal: state.goal,
+      preset: state.preset,
+      loop: state.loop,
+      remaining_budget: state.remaining_budget,
+      current_step: state.current_step,
+      child: state.child,
+      plan: state.plan,
+      commander: state.commander,
+      smart_watchdog: state.smart_watchdog,
+      strategy_challenge: state.strategy_challenge,
+      guard_recovery: state.guard_recovery,
+      last_error: state.last_error,
+      changed_files: state.changed_files,
+      test_summary: state.test_summary,
+      driver_ownership: state.driver_ownership,
+      state_revision: state.state_revision,
+    }
     return {
       ok,
       action: 'run',
@@ -1064,24 +1084,7 @@ export class CxSupervisor {
       phase: state.phase,
       status: state.status,
       ...(message ? { message } : {}),
-      data: {
-        goal: state.goal,
-        preset: state.preset,
-        loop: state.loop,
-        remaining_budget: state.remaining_budget,
-        current_step: state.current_step,
-        child: state.child,
-        plan: state.plan,
-        commander: state.commander,
-        smart_watchdog: state.smart_watchdog,
-        strategy_challenge: state.strategy_challenge,
-        guard_recovery: state.guard_recovery,
-        last_error: state.last_error,
-        changed_files: state.changed_files,
-        test_summary: state.test_summary,
-        driver_ownership: state.driver_ownership,
-        state_revision: state.state_revision,
-      },
+      data: Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)),
     }
   }
 }

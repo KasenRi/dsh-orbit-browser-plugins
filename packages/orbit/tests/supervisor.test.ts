@@ -3,11 +3,11 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CxStateStore } from '../src/state-store.ts'
-import { CxSupervisor, type CxSupervisorConfig } from '../src/supervisor.ts'
+import { OrbitStateStore } from '../src/state-store.ts'
+import { OrbitSupervisor, type OrbitSupervisorConfig } from '../src/supervisor.ts'
 import { FakeHost } from './helpers/fake-host.ts'
 
-const config: CxSupervisorConfig = {
+const config: OrbitSupervisorConfig = {
   defaultRoutes: {
     commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
     executor: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
@@ -20,12 +20,12 @@ const config: CxSupervisorConfig = {
 }
 
 function project(): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-test-'))
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-test-'))
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
-function make(host: FakeHost, dir: string): CxSupervisor {
-  return new CxSupervisor(new CxStateStore(dir), host, config)
+function make(host: FakeHost, dir: string): OrbitSupervisor {
+  return new OrbitSupervisor(new OrbitStateStore(dir), host, config)
 }
 
 const plan = (steps: Array<{ id: string; goal: string; capabilities?: string[] }>, summary = 'plan') =>
@@ -173,7 +173,7 @@ test('runtime watchdog RESTART_STEP interrupts the old child first', async () =>
     ])
     .script('watchdog', [{ output: commander({ decision: 'RESTART_STEP' }) }])
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
-  assert.ok(host.interruptCalls.some((call) => call.childId === 'exec-1' && call.reason === 'CX_RESTART_STEP'))
+  assert.ok(host.interruptCalls.some((call) => call.childId === 'exec-1' && call.reason === 'ORBIT_RESTART_STEP'))
   const executors = host.scriptsFor('executor')
   assert.equal(executors[1]?.request.resumeOf, undefined)
   cleanup()
@@ -198,7 +198,7 @@ test('runtime watchdog caps at two calls per step', async () => {
 
 test('commander adaptive timeout reviews then hard ceiling cancels the same child', async () => {
   const { dir, cleanup } = project()
-  const store = new CxStateStore(dir)
+  const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -212,7 +212,7 @@ test('commander adaptive timeout reviews then hard ceiling cancels the same chil
       { output: commander({ decision: 'EXTEND' }) },
       { output: commander({ decision: 'EXTEND' }) },
     ])
-  const supervisor = new CxSupervisor(store, host, config)
+  const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(first.ok, false)
   assert.equal(first.phase, 'EVALUATE')
@@ -229,7 +229,7 @@ test('commander adaptive timeout reviews then hard ceiling cancels the same chil
 
 test('commander timeout watchdog unavailable: EXTEND then INTERRUPT', async () => {
   const { dir, cleanup } = project()
-  const store = new CxStateStore(dir)
+  const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -239,7 +239,7 @@ test('commander timeout watchdog unavailable: EXTEND then INTERRUPT', async () =
       { output: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
-  const supervisor = new CxSupervisor(store, host, config)
+  const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(first.ok, false)
   assert.deepEqual(host.sleepCalls.slice(0, 2), [360000, 240000])
@@ -258,7 +258,7 @@ test('parent abort short-circuits', async () => {
   controller.abort()
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 }, controller.signal)
   assert.equal(result.ok, false)
-  assert.equal(result.message, 'CX_ABORTED')
+  assert.equal(result.message, 'ORBIT_ABORTED')
   cleanup()
 })
 
@@ -275,12 +275,12 @@ test('recoverable guard escalation: block_continue -> watchdog -> needs_user', a
   state.status = 'running'
   state.plan = { summary: 'p', steps: [{ id: 'P1', goal: 'a', status: 'running' }] }
   state.current_step = { id: 'P1', attempt: 1 }
-  new CxStateStore(dir).writeState(state)
+  new OrbitStateStore(dir).writeState(state)
 
   const first = await supervisor.recordGuardBlock('secret_operation', 'printenv')
   assert.equal(first.disposition, 'block_continue')
   assert.equal(first.watchdog_calls, 0)
-  assert.equal(new CxStateStore(dir).readState()?.phase, 'EXECUTE')
+  assert.equal(new OrbitStateStore(dir).readState()?.phase, 'EXECUTE')
 
   const second = await supervisor.recordGuardBlock('secret_operation', 'printenv')
   assert.equal(second.count, 2)
@@ -360,7 +360,7 @@ test('ordinary Executor scope excludes driver and browser tools, allows writers'
 
 test('PLAN also runs under the adaptive Commander timeout', async () => {
   const { dir, cleanup } = project()
-  const store = new CxStateStore(dir)
+  const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [{ pending: true, childId: 'cmd-plan' }])
@@ -368,7 +368,7 @@ test('PLAN also runs under the adaptive Commander timeout', async () => {
       { output: commander({ decision: 'EXTEND' }) },
       { output: commander({ decision: 'EXTEND' }) },
     ])
-  const supervisor = new CxSupervisor(store, host, config)
+  const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(first.ok, false)
   assert.equal(first.phase, 'PLAN')
@@ -379,7 +379,7 @@ test('PLAN also runs under the adaptive Commander timeout', async () => {
 
 test('FINAL_EVALUATE also runs under the adaptive Commander timeout', async () => {
   const { dir, cleanup } = project()
-  const store = new CxStateStore(dir)
+  const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -392,7 +392,7 @@ test('FINAL_EVALUATE also runs under the adaptive Commander timeout', async () =
       { output: commander({ decision: 'EXTEND' }) },
       { output: commander({ decision: 'EXTEND' }) },
     ])
-  const supervisor = new CxSupervisor(store, host, config)
+  const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(first.ok, false)
   assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-final'))
@@ -404,7 +404,7 @@ test('FINAL_EVALUATE also runs under the adaptive Commander timeout', async () =
 
 test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays resumable', async () => {
   const { dir, cleanup } = project()
-  const store = new CxStateStore(dir)
+  const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -419,7 +419,7 @@ test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays re
       { output: commander({ decision: 'EXTEND' }) },
       { output: commander({ decision: 'EXTEND' }) },
     ])
-  const supervisor = new CxSupervisor(store, host, config)
+  const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 10 })
   assert.equal(first.ok, false)
   assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-strategy'))
@@ -431,7 +431,7 @@ test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays re
 
 test('temporary strategy watchdog failure does not consume the challenge', async () => {
   const { dir, cleanup } = project()
-  const store = new CxStateStore(dir)
+  const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -441,7 +441,7 @@ test('temporary strategy watchdog failure does not consume the challenge', async
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }])
   // No watchdog script: the strategy challenge is temporarily unavailable.
-  const supervisor = new CxSupervisor(store, host, config)
+  const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 10 })
   assert.equal(first.ok, false)
   assert.equal(store.readState()?.strategy_challenge, undefined)

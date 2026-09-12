@@ -3,11 +3,11 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CxStateStore, driverOwnershipFor } from '../src/state-store.ts'
-import { CxSupervisor, type CxSupervisorConfig } from '../src/supervisor.ts'
+import { OrbitStateStore, driverOwnershipFor } from '../src/state-store.ts'
+import { OrbitSupervisor, type OrbitSupervisorConfig } from '../src/supervisor.ts'
 import { FakeHost } from './helpers/fake-host.ts'
 
-const config: CxSupervisorConfig = {
+const config: OrbitSupervisorConfig = {
   defaultRoutes: {
     commander: { provider: 'deepseek-official', model: 'm' },
     executor: { provider: 'deepseek-official', model: 'm' },
@@ -20,9 +20,9 @@ const config: CxSupervisorConfig = {
 }
 
 test('atomic write increments revision and leaves no lock or temp files', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
-  const store = new CxStateStore(dir)
-  const state = new CxSupervisor(store, new FakeHost(), config).createState({ goal: 'g', approved_loop_count: 3 })
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-store-'))
+  const store = new OrbitStateStore(dir)
+  const state = new OrbitSupervisor(store, new FakeHost(), config).createState({ goal: 'g', approved_loop_count: 3 })
   store.writeState(state)
   const first = store.readState()
   const firstRevision = first?.state_revision
@@ -45,9 +45,9 @@ test('driver ownership derives from phase and status', () => {
 })
 
 test('redacts secret-looking values before writing state', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
-  const store = new CxStateStore(dir)
-  const state = new CxSupervisor(store, new FakeHost(), config).createState({ goal: 'g', approved_loop_count: 3 })
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-store-'))
+  const store = new OrbitStateStore(dir)
+  const state = new OrbitSupervisor(store, new FakeHost(), config).createState({ goal: 'g', approved_loop_count: 3 })
   state.last_error = 'api_key=supersecret'
   store.writeState(state)
   const raw = store.readState() as unknown as Record<string, unknown>
@@ -56,17 +56,17 @@ test('redacts secret-looking values before writing state', () => {
 })
 
 test('blocks run when another mutation driver owns the workspace', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-store-'))
   const host = new FakeHost()
   host.drivers = ['autoresearch']
-  const result = await new CxSupervisor(new CxStateStore(dir), host, config).bootstrap({ goal: 'x', approved_loop_count: 3 })
+  const result = await new OrbitSupervisor(new OrbitStateStore(dir), host, config).bootstrap({ goal: 'x', approved_loop_count: 3 })
   assert.equal(result.ok, false)
-  assert.match(String(result.message), /CX_MUTATION_DRIVER_CONFLICT/)
+  assert.match(String(result.message), /ORBIT_MUTATION_DRIVER_CONFLICT/)
   rmSync(dir, { recursive: true, force: true })
 })
 
 test('active run with a different goal is rejected', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-store-'))
   const host = new FakeHost()
   host
     .script('commander', [
@@ -75,8 +75,8 @@ test('active run with a different goal is rejected', async () => {
       { output: JSON.stringify({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }])
-  const store = new CxStateStore(dir)
-  const supervisor = new CxSupervisor(store, host, config)
+  const store = new OrbitStateStore(dir)
+  const supervisor = new OrbitSupervisor(store, host, config)
   await supervisor.bootstrap({ goal: 'first', approved_loop_count: 3 })
   // Reopen a fresh terminal run then attempt a different active goal.
   const state = store.readState()!
@@ -86,6 +86,6 @@ test('active run with a different goal is rejected', async () => {
   store.writeState(state)
   const conflict = await supervisor.bootstrap({ goal: 'second', approved_loop_count: 3 })
   assert.equal(conflict.ok, false)
-  assert.match(String(conflict.message), /CX_ACTIVE_RUN_EXISTS/)
+  assert.match(String(conflict.message), /ORBIT_ACTIVE_RUN_EXISTS/)
   rmSync(dir, { recursive: true, force: true })
 })

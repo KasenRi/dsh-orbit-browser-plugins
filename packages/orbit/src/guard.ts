@@ -42,11 +42,11 @@ const DANGEROUS_PATTERNS: ReadonlyArray<[GuardCode, RegExp, string]> = [
 
 const SENSITIVE_ENV_NAME = /(?:^|_)(?:KEY|TOKEN|PASSWORD|PASSWD|SECRET|COOKIE|AUTH|CREDENTIAL|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN)(?:_|$)/i
 
-const CX_PATH = /(?:^|[\s/'"])(?:\.\/)?\.cx(?:[/'"\s]|$)/i
-const CX_REDIRECTION = /(?:^|[\s;&|])(?:\d+)?>>?\s*["']?(?:[^\s"']*\/)?\.cx(?:[/'"\s]|$)/i
-const CX_WRITE_COMMAND = /\b(?:tee|touch|mkdir|install|cp|mv|rm|rmdir|truncate|dd)\b/i
-const CX_IN_PLACE_COMMAND = /\b(?:sed|perl)\b[^\n]*\s-[^\n]*\bi\b/i
-const CX_WRITE_API = /\b(?:write(?:File|_text)?|write_text|writeFileSync)\s*\(|\bopen\s*\([^,]+,\s*["'][^"']*(?:w|a|x|\+)[^"']*["']/i
+const DURABLE_STATE_PATH = /(?:^|[\s/'"])(?:\.\/)?\.cx(?:[/'"\s]|$)/i
+const DURABLE_STATE_REDIRECTION = /(?:^|[\s;&|])(?:\d+)?>>?\s*["']?(?:[^\s"']*\/)?\.cx(?:[/'"\s]|$)/i
+const DURABLE_STATE_WRITE_COMMAND = /\b(?:tee|touch|mkdir|install|cp|mv|rm|rmdir|truncate|dd)\b/i
+const DURABLE_STATE_IN_PLACE_COMMAND = /\b(?:sed|perl)\b[^\n]*\s-[^\n]*\bi\b/i
+const DURABLE_STATE_WRITE_API = /\b(?:write(?:File|_text)?|write_text|writeFileSync)\s*\(|\bopen\s*\([^,]+,\s*["'][^"']*(?:w|a|x|\+)[^"']*["']/i
 
 function block(code: GuardCode, reason: string, disposition: GuardDisposition = 'block_continue'): GuardDecision {
   return { allowed: false, code, reason, disposition }
@@ -73,16 +73,16 @@ function looksLikeEnvSecret(command: string): boolean {
   return false
 }
 
-function isCxDurableWrite(command: string): boolean {
-  if (CX_REDIRECTION.test(command)) return true
-  if (!CX_PATH.test(command)) return false
-  if (CX_WRITE_COMMAND.test(command)) return true
-  if (CX_IN_PLACE_COMMAND.test(command)) return true
-  if (CX_WRITE_API.test(command)) return true
+function isDurableStateWrite(command: string): boolean {
+  if (DURABLE_STATE_REDIRECTION.test(command)) return true
+  if (!DURABLE_STATE_PATH.test(command)) return false
+  if (DURABLE_STATE_WRITE_COMMAND.test(command)) return true
+  if (DURABLE_STATE_IN_PLACE_COMMAND.test(command)) return true
+  if (DURABLE_STATE_WRITE_API.test(command)) return true
   return false
 }
 
-/** Guard a bash command string. Order matters and mirrors the Pi CX contract. */
+/** Guard a bash command string. Order matters and mirrors the Pi CX (now Orbit) reference contract. */
 export function guardBashCommand(command: string, intent: GuardIntent = {}): GuardDecision {
   const trimmed = command.trim()
   if (!trimmed) return { allowed: true }
@@ -93,8 +93,8 @@ export function guardBashCommand(command: string, intent: GuardIntent = {}): Gua
     }
   }
 
-  if (isCxDurableWrite(trimmed)) {
-    return block('durable_state_write', 'Only the CX controller may write .cx durable state.')
+  if (isDurableStateWrite(trimmed)) {
+    return block('durable_state_write', 'Only the Orbit controller may write .cx durable state.')
   }
 
   if (looksLikeEnvSecret(trimmed)) {
@@ -132,19 +132,19 @@ export function guardToolPath(toolName: string, targetPath: unknown, deps: ToolP
   if (typeof targetPath !== 'string' || targetPath.length === 0) return { allowed: true }
   const cwd = deps.cwd
   const absolute = isAbsolute(targetPath) ? targetPath : resolve(cwd, targetPath)
-  if (isInsideCx(absolute, cwd)) {
-    return block('durable_state_write', 'Only the CX controller may write .cx durable state.')
+  if (isInsideDurableState(absolute, cwd)) {
+    return block('durable_state_write', 'Only the Orbit controller may write .cx durable state.')
   }
   const realpath = deps.realpath ?? safeRealpath
-  if (isInsideCx(realpathWithin(absolute, realpath), cwd)) {
-    return block('durable_state_write', 'Only the CX controller may write .cx durable state (symlink resolved).')
+  if (isInsideDurableState(realpathWithin(absolute, realpath), cwd)) {
+    return block('durable_state_write', 'Only the Orbit controller may write .cx durable state (symlink resolved).')
   }
   return { allowed: true }
 }
 
-function isInsideCx(absolute: string, cwd: string): boolean {
-  const cxRoot = resolve(cwd, '.cx')
-  const rel = relative(cxRoot, absolute)
+function isInsideDurableState(absolute: string, cwd: string): boolean {
+  const stateRoot = resolve(cwd, '.cx')
+  const rel = relative(stateRoot, absolute)
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
 }
 
@@ -170,5 +170,5 @@ function safeRealpath(path: string): string {
 }
 
 export function guardReason(decision: Extract<GuardDecision, { allowed: false }>): string {
-  return `Blocked by CX safety guard (${decision.code}): ${decision.reason}`
+  return `Blocked by Orbit safety guard (${decision.code}): ${decision.reason}`
 }

@@ -1,5 +1,5 @@
 /**
- * Settlement classification for CX executor/commander children.
+ * Settlement classification for Orbit executor/commander children.
  *
  * The durable seam is the session `turn/end` event: its `data.reason.kind` is
  * `completed | aborted | error | blocked | max-tokens` (`interrupted` only

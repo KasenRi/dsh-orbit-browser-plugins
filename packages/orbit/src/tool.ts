@@ -2,16 +2,20 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-import type { CxActionResult } from './types.ts'
-import type { CxService } from './service.ts'
+import type { OrbitActionResult } from './types.ts'
+import type { OrbitService } from './service.ts'
 
-export const CX_TOOL_NAME = 'cx_controller'
+export const ORBIT_TOOL_NAME = 'orbit_controller'
+/** Legacy tool name kept as a backward-compatible alias. */
+export const LEGACY_CX_TOOL_NAME = 'cx_controller'
 
 const TOOL_DESCRIPTION =
-  'Drive CX Lite engineering autonomy for the current project. CX runs a deterministic Supervisor ' +
+  'Drive Orbit engineering autonomy for the current project. Orbit runs a deterministic Supervisor ' +
   '(Commander -> Executor -> Smart Watchdog) over a durable .cx/state.json. Use action "run" with a ' +
   'goal to start or continue, "resume" to continue a persisted run, "status" to inspect, "stop" to ' +
-  'close the run, and "doctor" to check the environment. Only CX writes .cx durable state.'
+  'close the run, and "doctor" to check the environment. Only Orbit writes .cx durable state.'
+
+const LEGACY_TOOL_DESCRIPTION = `Legacy compatibility alias. Prefer ${ORBIT_TOOL_NAME}. ${TOOL_DESCRIPTION}`
 
 interface ToolArgs {
   action: 'run' | 'start' | 'resume' | 'stop' | 'status' | 'doctor'
@@ -25,11 +29,11 @@ interface ToolArgs {
 
 interface AgentLike {
   session?: { header?: { cwd?: string } }
-  ctx?: { cx?: CxService }
+  ctx?: { orbit?: OrbitService; cx?: OrbitService }
 }
 
-function summarize(result: CxActionResult): string {
-  const lines = [`cx ${result.action}: ok=${result.ok} phase=${result.phase ?? '-'} status=${result.status ?? '-'}`]
+function summarize(result: OrbitActionResult): string {
+  const lines = [`orbit ${result.action}: ok=${result.ok} phase=${result.phase ?? '-'} status=${result.status ?? '-'}`]
   if (result.run_id) lines.push(`run_id: ${result.run_id}`)
   if (result.message) lines.push(`message: ${result.message}`)
   const data = result.data
@@ -42,10 +46,20 @@ function summarize(result: CxActionResult): string {
   return lines.join('\n')
 }
 
-export function createCxTool(ctx: Context) {
+export interface OrbitToolOptions {
+  /** Register the legacy `cx_controller` alias instead of the canonical name. */
+  legacy?: boolean
+}
+
+/**
+ * One tool implementation shared by the canonical `orbit_controller` tool and
+ * the legacy `cx_controller` alias. Both names call the same OrbitService.
+ */
+export function createOrbitTool(ctx: Context, options: OrbitToolOptions = {}) {
+  const legacy = options.legacy === true
   return defineTool({
-    name: CX_TOOL_NAME,
-    description: TOOL_DESCRIPTION,
+    name: legacy ? LEGACY_CX_TOOL_NAME : ORBIT_TOOL_NAME,
+    description: legacy ? LEGACY_TOOL_DESCRIPTION : TOOL_DESCRIPTION,
     parameters: {
       action: { type: 'string', required: true, enum: ['run', 'start', 'resume', 'stop', 'status', 'doctor'] },
       goal: { type: 'string', description: 'The engineering goal (required for run/start).' },
@@ -58,14 +72,17 @@ export function createCxTool(ctx: Context) {
     output: {
       schema: { type: 'json' },
       render: (_args, value) => {
-        const result = value as unknown as CxActionResult
+        const result = value as unknown as OrbitActionResult
         return [{ type: 'text', text: summarize(result) }] satisfies ContentBlock[]
       },
     },
     async execute(args, exec) {
+      // The service is provided by this plugin's own fiber; reading it through
+      // `agent.ctx` would require an inject declaration on the agent scope.
+      const scope = ctx as Context & { orbit?: OrbitService; cx?: OrbitService }
+      const service = scope.orbit ?? scope.cx
+      if (!service) throw new Error('orbit service is unavailable; dsh-orbit is not loaded.')
       const agent = exec.agent as AgentLike | undefined
-      const service = agent?.ctx?.cx ?? (ctx as Context & { cx?: CxService }).cx
-      if (!service) throw new Error('cx service is unavailable; dsh-cx is not loaded.')
       const cwd = agent?.session?.header?.cwd ?? process.cwd()
       const input = {
         ...(args.goal !== undefined ? { goal: args.goal } : {}),
