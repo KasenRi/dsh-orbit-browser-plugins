@@ -1,0 +1,90 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { CxStateStore, driverOwnershipFor } from '../src/state-store.ts'
+import { CxSupervisor, type CxSupervisorConfig } from '../src/supervisor.ts'
+import { FakeHost } from './helpers/fake-host.ts'
+
+const config: CxSupervisorConfig = {
+  defaultRoutes: {
+    commander: { provider: 'deepseek-official', model: 'm' },
+    executor: { provider: 'deepseek-official', model: 'm' },
+    watchdog: { provider: 'deepseek-official', model: 'm' },
+  },
+  browserTools: ['agent_browser'],
+  commanderReadOnlyTools: ['read'],
+  watchdogTools: ['read'],
+}
+
+test('atomic write increments revision and leaves no lock or temp files', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
+  const store = new CxStateStore(dir)
+  const state = new CxSupervisor(store, new FakeHost(), config).createState({ goal: 'g', approved_loop_count: 3 })
+  store.writeState(state)
+  const first = store.readState()
+  const firstRevision = first?.state_revision
+  store.writeState(first!)
+  const second = store.readState()
+  assert.equal(firstRevision, 1)
+  assert.equal(second?.state_revision, 2)
+  const entries = readdirSync(join(dir, '.cx'))
+  assert.ok(!entries.some((entry) => entry.includes('.tmp')))
+  assert.ok(!existsSync(join(dir, '.cx', 'controller.lock')))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('driver ownership derives from phase and status', () => {
+  assert.equal(driverOwnershipFor('SUCCESS', 'success'), 'CLOSED')
+  assert.equal(driverOwnershipFor('STOPPED', 'stopped'), 'CLOSED')
+  assert.equal(driverOwnershipFor('BUDGET_EXHAUSTED', 'budget_exhausted'), 'CLOSED')
+  assert.equal(driverOwnershipFor('NEEDS_USER', 'needs_user'), 'AWAITING_USER')
+  assert.equal(driverOwnershipFor('EXECUTE', 'running'), 'ACTIVE')
+})
+
+test('redacts secret-looking values before writing state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
+  const store = new CxStateStore(dir)
+  const state = new CxSupervisor(store, new FakeHost(), config).createState({ goal: 'g', approved_loop_count: 3 })
+  state.last_error = 'api_key=supersecret'
+  store.writeState(state)
+  const raw = store.readState() as unknown as Record<string, unknown>
+  assert.doesNotMatch(JSON.stringify(raw), /supersecret/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('blocks run when another mutation driver owns the workspace', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
+  const host = new FakeHost()
+  host.drivers = ['autoresearch']
+  const result = await new CxSupervisor(new CxStateStore(dir), host, config).bootstrap({ goal: 'x', approved_loop_count: 3 })
+  assert.equal(result.ok, false)
+  assert.match(String(result.message), /CX_MUTATION_DRIVER_CONFLICT/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('active run with a different goal is rejected', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cx-store-'))
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { output: JSON.stringify({ summary: 's', steps: [{ id: 'P1', goal: 'a' }] }) },
+      { output: JSON.stringify({ decision: 'PASS_CURRENT_STEP' }) },
+      { output: JSON.stringify({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [{ output: 'e', childId: 'e1' }])
+  const store = new CxStateStore(dir)
+  const supervisor = new CxSupervisor(store, host, config)
+  await supervisor.bootstrap({ goal: 'first', approved_loop_count: 3 })
+  // Reopen a fresh terminal run then attempt a different active goal.
+  const state = store.readState()!
+  state.phase = 'EXECUTE'
+  state.status = 'running'
+  state.goal = 'first'
+  store.writeState(state)
+  const conflict = await supervisor.bootstrap({ goal: 'second', approved_loop_count: 3 })
+  assert.equal(conflict.ok, false)
+  assert.match(String(conflict.message), /CX_ACTIVE_RUN_EXISTS/)
+  rmSync(dir, { recursive: true, force: true })
+})
