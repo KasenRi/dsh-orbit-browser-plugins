@@ -12,14 +12,20 @@ const TOOL_DESCRIPTION =
   'rendered-page inspection, and browser-based verification. Standard workflow: open, then ' +
   'snapshot -i to read current @refs, then click/fill/select, then snapshot again after the page ' +
   'changes. Choose exactly one input mode: args (raw argv), semanticAction (stable role/text/label ' +
-  'targets), job (short deterministic multi-step chain), or qa (page QA preset). Refs are page-scoped: ' +
-  'never reuse a @ref after navigation or a major DOM change; take a fresh snapshot instead.'
+  'targets), job (short deterministic multi-step chain), qa (page QA preset), electron (explicit CDP ' +
+  'attach for an already-running Electron/Chrome debug endpoint), sourceLookup (candidate source ' +
+  'locations from DOM/React evidence plus a bounded workspace scan), or networkSourceLookup ' +
+  '(failed-request evidence plus candidate source/workspace hints). Refs are page-scoped: never ' +
+  'reuse a @ref after navigation or a major DOM change; take a fresh snapshot instead.'
 
 interface ToolArgs {
   args?: string[]
   semanticAction?: Record<string, unknown>
   job?: Record<string, unknown>
   qa?: Record<string, unknown>
+  electron?: Record<string, unknown>
+  sourceLookup?: Record<string, unknown>
+  networkSourceLookup?: Record<string, unknown>
   stdin?: string
   outputPath?: string
   timeoutMs?: number
@@ -56,6 +62,9 @@ export function createAgentBrowserTool(ctx: Context) {
       semanticAction: { type: 'json', description: 'Stable semantic target: action plus locator/role/selector.' },
       job: { type: 'json', description: 'Short deterministic batch job (steps).' },
       qa: { type: 'json', description: 'Page QA preset (url or attached).' },
+      electron: { type: 'json', description: 'Explicit Electron/CDP attach: {action:"connect", port|url} or {action:"probe"}.' },
+      sourceLookup: { type: 'json', description: 'Source lookup: selector/reactFiberId/componentName; returns bounded candidates.' },
+      networkSourceLookup: { type: 'json', description: 'Network source lookup: requestId/filter/url; returns bounded failed requests and candidates.' },
       stdin: { type: 'string', description: 'Stdin payload for batch/eval/auth commands.' },
       outputPath: { type: 'string', description: 'Write the structured result to this path.' },
       timeoutMs: { type: 'integer', description: 'Subprocess watchdog override in milliseconds.' },

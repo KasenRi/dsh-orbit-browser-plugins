@@ -87,18 +87,47 @@ export interface QaInput {
   loadState?: 'domcontentloaded' | 'load' | 'networkidle'
 }
 
+export type ElectronAction = 'connect' | 'probe'
+
+export interface ElectronInput {
+  action: ElectronAction
+  /** Explicit CDP port of an already-running Electron/Chrome debug endpoint. */
+  port?: number
+  /** Explicit CDP URL (ws/wss/http/https). */
+  url?: string
+  timeoutMs?: number
+}
+
+export interface SourceLookupInput {
+  selector?: string
+  reactFiberId?: string
+  componentName?: string
+  includeDomHints?: boolean
+  maxWorkspaceFiles?: number
+}
+
+export interface NetworkSourceLookupInput {
+  requestId?: string
+  filter?: string
+  url?: string
+  maxWorkspaceFiles?: number
+}
+
 export interface AgentBrowserInput {
   args?: string[]
   semanticAction?: SemanticActionInput
   job?: JobInput
   qa?: QaInput
+  electron?: ElectronInput
+  sourceLookup?: SourceLookupInput
+  networkSourceLookup?: NetworkSourceLookupInput
   stdin?: string
   outputPath?: string
   timeoutMs?: number
   sessionMode?: SessionMode
 }
 
-export type InputKind = 'args' | 'semanticAction' | 'job' | 'qa'
+export type InputKind = 'args' | 'semanticAction' | 'job' | 'qa' | 'electron' | 'sourceLookup' | 'networkSourceLookup'
 
 export interface ValidatedInput {
   ok: true
@@ -114,6 +143,50 @@ export interface ValidatedInput {
   providesStdin: boolean
   /** Artifact candidates discovered inside compiled job/qa batch steps. */
   artifactRequests?: ArtifactRequest[]
+  /** Lookup descriptor: analysis runs after a successful batch execution. */
+  lookup?: LookupDescriptor
+}
+
+export interface LookupDescriptor {
+  kind: 'source' | 'network'
+  query: Record<string, string | number | boolean | undefined>
+  steps: Array<{ action: string; args: string[] }>
+}
+
+export interface PageChangeSummary {
+  command: string
+  changeType: 'navigation' | 'mutation' | 'artifact' | 'confirmation' | 'recovery'
+  summary: string
+  title?: string
+  url?: string
+  previousUrl?: string
+  titleChanged?: boolean
+  urlChanged?: boolean
+  refsBefore?: number
+  refsAfter?: number
+  refsRefreshed?: boolean
+  activeTargetChanged?: boolean
+  artifactCount?: number
+  recoveryApplied?: boolean
+}
+
+export interface SourceCandidate {
+  source: string
+  file?: string
+  line?: number
+  column?: number
+  componentName?: string
+  confidence: 'high' | 'medium' | 'low'
+  evidence: string[]
+  requestUrl?: string
+}
+
+export interface LookupAnalysis {
+  status: string
+  summary: string
+  candidates?: SourceCandidate[]
+  failedRequests?: Array<{ requestId?: string; url?: string; method?: string; status?: number; error?: string }>
+  limitations: string[]
 }
 
 export interface CliEnvelope {
@@ -193,4 +266,10 @@ export interface AgentBrowserResult {
   fullOutputPath?: string
   /** Absolute path written from `outputPath`, when requested and written successfully. */
   outputFile?: string
+  /** Deterministic summary of what this call changed on the page. */
+  pageChangeSummary?: PageChangeSummary
+  /** sourceLookup analysis (candidate source locations, bounded). */
+  sourceLookup?: LookupAnalysis
+  /** networkSourceLookup analysis (failed requests + candidate locations, bounded). */
+  networkSourceLookup?: LookupAnalysis
 }

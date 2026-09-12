@@ -1,5 +1,7 @@
 import { compileSemanticAction } from './semantic.ts'
 import { compileJob, compileQa } from './job.ts'
+import { compileElectron } from './electron.ts'
+import { compileNetworkSourceLookup, compileSourceLookup } from './lookups.ts'
 import { artifactRequestsFromCompiledSteps } from './artifacts.ts'
 import type { AgentBrowserInput, ValidatedInput } from './types.ts'
 
@@ -27,13 +29,16 @@ export function validateInput(input: AgentBrowserInput): ValidatedInput | Valida
     input.semanticAction !== undefined,
     input.job !== undefined,
     input.qa !== undefined,
+    input.electron !== undefined,
+    input.sourceLookup !== undefined,
+    input.networkSourceLookup !== undefined,
   ].filter(Boolean).length
 
   if (modePresent !== 1) {
     return {
       ok: false,
       code: 'validation-error',
-      message: 'Provide exactly one of args, semanticAction, job, or qa.',
+      message: 'Provide exactly one of args, semanticAction, job, qa, electron, sourceLookup, or networkSourceLookup.',
     }
   }
 
@@ -106,6 +111,10 @@ export function validateInput(input: AgentBrowserInput): ValidatedInput | Valida
     }
   }
 
+  if (input.electron !== undefined || input.sourceLookup !== undefined || input.networkSourceLookup !== undefined) {
+    return compileLookupMode(input, sessionMode)
+  }
+
   const qa = input.qa!
   if (input.stdin !== undefined) {
     return { ok: false, code: 'validation-error', message: 'Do not provide stdin with qa; qa generates its own batch stdin.' }
@@ -129,5 +138,63 @@ export function validateInput(input: AgentBrowserInput): ValidatedInput | Valida
     ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
     ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
     providesStdin: true,
+  }
+}
+
+function lookupFailure(message: string): ValidationFailure {
+  return { ok: false, code: 'validation-error', message }
+}
+
+function compileLookupMode(
+  input: AgentBrowserInput,
+  sessionMode: ValidatedInput['sessionMode'],
+): ValidatedInput | ValidationFailure {
+  if (input.sourceLookup !== undefined) {
+    if (input.stdin !== undefined) return lookupFailure('Do not provide stdin with sourceLookup.')
+    const compiled = compileSourceLookup(input.sourceLookup)
+    if (!compiled.ok) return lookupFailure(compiled.message)
+    return {
+      ok: true,
+      kind: 'sourceLookup',
+      args: compiled.args,
+      generatedStdin: compiled.stdin,
+      sessionMode,
+      lookup: { kind: 'source', query: compiled.query, steps: compiled.steps },
+      ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      providesStdin: true,
+    }
+  }
+
+  if (input.networkSourceLookup !== undefined) {
+    if (input.stdin !== undefined) return lookupFailure('Do not provide stdin with networkSourceLookup.')
+    const compiled = compileNetworkSourceLookup(input.networkSourceLookup)
+    if (!compiled.ok) return lookupFailure(compiled.message)
+    return {
+      ok: true,
+      kind: 'networkSourceLookup',
+      args: compiled.args,
+      generatedStdin: compiled.stdin,
+      sessionMode,
+      lookup: { kind: 'network', query: compiled.query, steps: compiled.steps },
+      ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      providesStdin: true,
+    }
+  }
+
+  const electron = input.electron as NonNullable<AgentBrowserInput['electron']>
+  if (input.stdin !== undefined) return lookupFailure('Do not provide stdin with electron; electron manages its own input.')
+  const compiled = compileElectron(electron)
+  if (!compiled.ok) return lookupFailure(compiled.message)
+  return {
+    ok: true,
+    kind: 'electron',
+    args: compiled.args,
+    ...(compiled.generatedStdin !== undefined ? { generatedStdin: compiled.generatedStdin } : {}),
+    sessionMode,
+    ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
+    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    providesStdin: compiled.generatedStdin !== undefined,
   }
 }

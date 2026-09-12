@@ -103,7 +103,55 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     }
   }
 
+  // Capability probes only read CLI help; they never open a page.
+  checks.push(
+    await probeCapability(options, {
+      name: 'electron-attach-support',
+      args: ['connect', '--help'],
+      needles: ['port', 'url'],
+      okDetail: 'agent-browser connect accepts an explicit port or CDP URL',
+      failDetail: 'agent-browser connect does not advertise an explicit port/URL target',
+    }),
+  )
+  checks.push(
+    await probeCapability(options, {
+      name: 'network-inspection-support',
+      args: ['network', '--help'],
+      needles: ['requests', 'request'],
+      okDetail: 'agent-browser network requests/request are available',
+      failDetail: 'agent-browser network inspection commands are unavailable',
+    }),
+  )
+  checks.push(
+    await probeCapability(options, {
+      name: 'source-lookup-support',
+      args: ['--help'],
+      needles: ['react'],
+      okDetail: 'agent-browser advertises react inspection used by sourceLookup',
+      failDetail: 'agent-browser does not advertise react inspection for sourceLookup',
+    }),
+  )
+
   return finalize(checks)
+}
+
+async function probeCapability(
+  options: DoctorOptions,
+  probe: { name: string; args: string[]; needles: string[]; okDetail: string; failDetail: string },
+): Promise<DoctorCheck> {
+  if (!options.executable) return { name: probe.name, status: 'fail', detail: 'agent-browser executable is unavailable.' }
+  try {
+    const result = await options.executor(options.executable, probe.args, {
+      cwd: options.cwd,
+      timeoutMs: options.timeoutMs ?? 10_000,
+      env: options.env,
+    })
+    const text = `${result.stdout}\n${result.stderr}`.toLowerCase()
+    const supported = probe.needles.every((needle) => text.includes(needle.toLowerCase()))
+    return { name: probe.name, status: supported ? 'pass' : 'fail', detail: supported ? probe.okDetail : probe.failDetail }
+  } catch (error) {
+    return { name: probe.name, status: 'fail', detail: `capability probe failed: ${String(error)}` }
+  }
 }
 
 function finalize(checks: DoctorCheck[]): DoctorReport {
