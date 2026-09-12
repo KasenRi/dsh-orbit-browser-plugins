@@ -1,6 +1,6 @@
 {
   "name": "dsh-orbit-browser-plugins",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Community DeepSeek Harness plugins: Orbit deterministic engineering orchestration and controlled browser automation.",

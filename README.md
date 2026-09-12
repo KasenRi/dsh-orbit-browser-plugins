@@ -62,14 +62,14 @@ registers the bundle layer automatically. `pnpm` must be on `PATH`.
 
 ```bash
 # Orbit plugin only
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.2.0/kasenri-dsh-orbit-0.2.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-orbit-0.3.0.tgz
 
 # Browser plugin only
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.2.0/kasenri-dsh-browser-0.1.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-browser-0.1.0.tgz
 
 # Both (Orbit browser-capability steps may then use the browser plugin)
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.2.0/kasenri-dsh-orbit-0.2.0.tgz
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.2.0/kasenri-dsh-browser-0.1.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-orbit-0.3.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-browser-0.1.0.tgz
 ```
 
 Each package declares a `dsh.bundle` manifest, so `dsh plugin add` installs it
