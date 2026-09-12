@@ -3,6 +3,9 @@ import type { CxService } from './service.ts'
 
 const WRITE_PATH_TOOLS = new Set(['write', 'edit', 'str_replace_editor'])
 
+/** Top-level autonomous mutation drivers that must not run beside an active CX run. */
+export const MUTATION_DRIVER_TOOLS = new Set(['create_goal', 'ralph', 'workflow'])
+
 export interface GuardExecLike {
   name: string
   arguments?: unknown
@@ -11,18 +14,52 @@ export interface GuardExecLike {
 
 export type PreExecuteDecision = { kind: 'allow' } | { kind: 'deny'; reason: string }
 
+export interface CxPreExecuteOptions {
+  /** Returns the name of a competing top-level mutation driver for this agent, if any. */
+  competingDriver?: (agent: GuardExecLike['agent']) => string | undefined
+}
+
 /**
- * The CX recoverable tool guard. It answers only "may this one tool call run?".
- * A denial blocks the single call; the agent turn and CX phase continue.
+ * The CX recoverable tool guard plus mutation-driver mutual exclusion.
+ *
+ * Recovery contract: a denial blocks only this one tool call; the agent turn and
+ * the CX phase continue. Mutation exclusion, by contrast, is an ownership fence:
+ * CX and another top-level autonomous driver must never run in the same project.
  */
-export function createCxPreExecuteHandler(service: CxService) {
+export function createCxPreExecuteHandler(service: CxService, options: CxPreExecuteOptions = {}) {
   return async function cxPreExecute(
     exec: GuardExecLike,
     next: () => Promise<PreExecuteDecision>,
   ): Promise<PreExecuteDecision> {
     const cwd = exec.agent?.session?.header?.cwd ?? process.cwd()
-    if (!service.hasActiveRun(cwd)) return next()
+    const active = service.hasActiveRun(cwd)
     const args = (exec.arguments ?? {}) as Record<string, unknown>
+
+    // CX owns the workspace: refuse to start another top-level mutation driver.
+    if (active && MUTATION_DRIVER_TOOLS.has(exec.name)) {
+      return {
+        kind: 'deny',
+        reason:
+          `CX_MUTATION_DRIVER_CONFLICT: an active CX run owns this workspace, so ${exec.name} must not start. ` +
+          'Resume or stop the CX run first, or continue through cx_controller.',
+      }
+    }
+
+    // Another driver already owns the workspace: refuse to start CX.
+    if (!active && exec.name === 'cx_controller') {
+      const action = typeof args['action'] === 'string' ? args['action'] : ''
+      if (action === 'run' || action === 'start') {
+        const competing = options.competingDriver?.(exec.agent)
+        if (competing) {
+          return {
+            kind: 'deny',
+            reason: `CX_MUTATION_DRIVER_CONFLICT: ${competing} already owns mutation in this workspace; stop it before starting CX.`,
+          }
+        }
+      }
+    }
+
+    if (!active) return next()
 
     if (exec.name === 'bash') {
       const command = typeof args['command'] === 'string' ? args['command'] : ''
@@ -40,6 +77,20 @@ export function createCxPreExecuteHandler(service: CxService) {
       if (!decision.allowed) {
         const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd)
         return { kind: 'deny', reason: `${guardReason(decision)} ${outcome.instruction}` }
+      }
+      return next()
+    }
+
+    // The browser tool can write its structured result to a caller path; route
+    // that path through the same durable-state policy instead of a second copy.
+    if (exec.name === 'agent_browser') {
+      const outputPath = args['outputPath']
+      if (typeof outputPath === 'string' && outputPath.length > 0) {
+        const decision = guardToolPath('write', outputPath, { cwd })
+        if (!decision.allowed) {
+          const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd)
+          return { kind: 'deny', reason: `${guardReason(decision)} ${outcome.instruction}` }
+        }
       }
       return next()
     }

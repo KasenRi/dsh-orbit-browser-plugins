@@ -128,7 +128,7 @@ export interface GuardWatchdogDecision {
 }
 
 export interface CxTelemetry {
-  status?: 'idle' | 'running'
+  status?: 'idle' | 'running' | 'unknown'
   current_tool?: string
   tool_count?: number
   turn_count?: number
@@ -150,6 +150,11 @@ export interface CxActionResult {
 export const COMMANDER_SOFT_DEADLINE_MS = 6 * 60_000
 export const COMMANDER_EXTENSION_MS = 4 * 60_000
 export const COMMANDER_HARD_CEILING_MS = 14 * 60_000
+
+export const EXECUTOR_TIMEOUT_MS = 8 * 60_000
+export const WATCHDOG_TIMEOUT_MS = 2 * 60_000
+
+export type CommanderMode = 'PLAN' | 'STEP_EVALUATE' | 'FINAL_EVALUATE' | 'STRATEGY_RECONSIDER'
 
 export const GUARD_ESCALATION_THRESHOLD = 3
 export const GUARD_RECOVERY_CAP = 4

@@ -30,6 +30,10 @@ export const Config = z.object({
   browserTools: z.array(z.string()).default(['agent_browser']),
   commanderReadOnlyTools: z.array(z.string()).default(['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch']),
   watchdogTools: z.array(z.string()).default(['read', 'read_image', 'glob', 'grep']),
+  executorTools: z
+    .array(z.string())
+    .default(['read', 'read_image', 'glob', 'grep', 'bash', 'write', 'edit', 'str_replace_editor', 'web_search', 'web_fetch']),
+  executorTimeoutMs: z.natural().default(480_000),
   registerTool: z.boolean().default(true),
   registerGuards: z.boolean().default(true),
 })
@@ -40,8 +44,14 @@ export interface CxConfigShape {
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
+  executorTools: string[]
+  executorTimeoutMs: number
   registerTool: boolean
   registerGuards: boolean
+}
+
+interface GoalsLike {
+  get(agent: unknown): { phase?: string } | undefined
 }
 
 export function apply(ctx: Context, config: CxConfigShape): void {
@@ -50,6 +60,8 @@ export function apply(ctx: Context, config: CxConfigShape): void {
     browserTools: config.browserTools,
     commanderReadOnlyTools: config.commanderReadOnlyTools,
     watchdogTools: config.watchdogTools,
+    executorTools: config.executorTools,
+    executorTimeoutMs: config.executorTimeoutMs,
     ...(config.projectDir ? { projectDir: config.projectDir } : {}),
   }
   const service = new CxService(ctx, serviceConfig)
@@ -58,7 +70,21 @@ export function apply(ctx: Context, config: CxConfigShape): void {
   if (config.registerTool) ctx.tools.register(createCxTool(ctx))
 
   if (config.registerGuards) {
-    const handler = createCxPreExecuteHandler(service)
+    const handler = createCxPreExecuteHandler(service, {
+      competingDriver: (agent) => {
+        const reflect = (ctx as unknown as { reflect?: { get(name: string, strict?: boolean): unknown } }).reflect
+        const goals = reflect?.get('goals') as GoalsLike | undefined
+        if (goals && agent) {
+          try {
+            const goal = goals.get(agent)
+            if (goal?.phase === 'active') return 'goal'
+          } catch {
+            return undefined
+          }
+        }
+        return undefined
+      },
+    })
     ctx.on('tools/pre-execute', (exec, next) => handler(exec as never, next as never) as never)
   }
 }

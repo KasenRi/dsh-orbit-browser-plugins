@@ -1,4 +1,4 @@
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import {
   assertCommanderDecision,
@@ -14,15 +14,15 @@ import {
   parseJsonObject,
   type EvaluationMode,
 } from './decisions.ts'
-import { guardReason } from './guard.ts'
-import type { CxHost, RoleHandle, RoleRunResult } from './host.ts'
-import { redactText, truncateSafe } from './sanitize.ts'
+import type { CxHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
+import { truncateSafe } from './sanitize.ts'
 import { CxStateStore } from './state-store.ts'
 import {
   COMMANDER_EXTENSION_MS,
   COMMANDER_HARD_CEILING_MS,
   COMMANDER_SOFT_DEADLINE_MS,
   DEFAULT_CAPABILITIES,
+  EXECUTOR_TIMEOUT_MS,
   GUARD_ESCALATION_THRESHOLD,
   GUARD_FIRST_INSTRUCTION,
   GUARD_NEEDS_USER_INSTRUCTION,
@@ -32,11 +32,13 @@ import {
   MAX_CORRECTION_DEPTH,
   MAX_EXECUTOR_INTERRUPT_RETRIES,
   MAX_WATCHDOG_CALLS_PER_STEP,
+  WATCHDOG_TIMEOUT_MS,
+  type CommanderDecision,
+  type CommanderMode,
   type CxActionResult,
   type CxPlanStep,
   type CxState,
   type CxTelemetry,
-  type CommanderDecision,
   type GuardCode,
   type GuardWatchdogDecision,
   type StrategyDecision,
@@ -49,6 +51,9 @@ export interface CxSupervisorConfig {
   browserTools: readonly string[]
   commanderReadOnlyTools: readonly string[]
   watchdogTools: readonly string[]
+  executorTools: readonly string[]
+  executorTimeoutMs?: number
+  watchdogTimeoutMs?: number
 }
 
 export interface CxRunInput {
@@ -68,6 +73,25 @@ export interface GuardBlockOutcome {
   count: number
   watchdog_calls: number
   instruction: string
+}
+
+type SupervisedResult =
+  | { kind: 'output'; output: string }
+  | { kind: 'interrupted'; reason: string }
+  | { kind: 'needs_user'; reason: string }
+
+type StrategyOutcome =
+  | { kind: 'keep' }
+  | { kind: 'replace'; replacementGoal: string }
+  | { kind: 'needs_user'; reason: string }
+  | { kind: 'interrupted'; reason: string }
+
+interface AuxRoleRequest {
+  role: 'watchdog' | 'commander'
+  label: string
+  prompt: string
+  signal?: AbortSignal
+  timeoutMs?: number
 }
 
 const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[]) => `You are the CX Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
@@ -104,7 +128,7 @@ Evidence:
 ${evidence}`
 
 const COMMANDER_STRATEGY_PROMPT = (goal: string, base: string, challenge: string, state: CxState) =>
-  `You are the CX Commander reconsidering strategy after a repeated correction on ${base}.
+  `You are the CX Commander reconsidering strategy after a repeated correction on ${base} (STRATEGY_RECONSIDER).
 Allowed decisions ONLY: KEEP_APPROACH | REPLACE_CURRENT_STEP | NEEDS_USER.
 - REPLACE_CURRENT_STEP requires replacement_goal.
 Return ONLY JSON: {"decision":"...","reason":"...","replacement_goal":"..."}
@@ -134,7 +158,7 @@ Return ONLY JSON: {"decision":"...","instruction":"..."}
 Guard code: ${code}
 Step: ${stepId}`
 
-const WATCHDOG_TIMEOUT_PROMPT = (mode: string, elapsed: number, extensions: number, telemetry: CxTelemetry | undefined) =>
+const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extensions: number, telemetry: CxTelemetry | undefined) =>
   `You are the CX Smart Watchdog doing COMMANDER_TIMEOUT_REVIEW. The Commander has run ${elapsed}ms with ${extensions} extension(s).
 Allowed decisions ONLY: EXTEND | INTERRUPT | NEEDS_USER.
 Return ONLY JSON: {"decision":"...","reason":"..."}
@@ -150,7 +174,6 @@ export class CxSupervisor {
   private readonly store: CxStateStore
   private readonly host: CxHost
   private readonly config: CxSupervisorConfig
-  private lastTelemetry: CxTelemetry | undefined
 
   constructor(store: CxStateStore, host: CxHost, config: CxSupervisorConfig) {
     this.store = store
@@ -272,7 +295,7 @@ export class CxSupervisor {
     if (state.phase === 'STOPPED') return this.result(state, true)
     if (state.phase === 'BUDGET_EXHAUSTED') return this.result(state, true)
 
-    if (state.plan.steps.length === 0) {
+    if (state.plan.steps.length === 0 && state.phase === 'PLAN') {
       const planOutcome = await this.makePlan(state, signal)
       if (planOutcome) return planOutcome
     }
@@ -318,43 +341,176 @@ export class CxSupervisor {
     this.store.writeState(state)
 
     const executed = await this.executeStep(state, step, signal)
-    if (executed.done) return this.result(state, executed.ok)
+    if (executed.done) return this.result(state, executed.ok, executed.message)
     return this.run(state, signal)
   }
 
+  // ── tool scoping ───────────────────────────────────────────────────────────
+
+  /**
+   * Build an allow-filter from configured names, keeping only tools that are
+   * actually registered (an unknown name makes `tools.restrict()` fail).
+   */
+  private toolAllow(names: readonly string[], label: string): RoleToolFilter {
+    const allowed = names.filter((name) => this.host.hasTool(name))
+    if (allowed.length === 0) {
+      throw new Error(`CX_TOOL_FILTER_EMPTY: none of [${names.join(', ')}] are registered for ${label}`)
+    }
+    return { allow: allowed }
+  }
+
+  // ── commander supervised path ──────────────────────────────────────────────
+
   private async makePlan(state: CxState, signal?: AbortSignal): Promise<CxActionResult | undefined> {
-    const handle = await this.host.startRole({
-      role: 'commander',
-      label: 'commander-plan',
-      prompt: COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints),
-      route: state.routes.commander,
-      toolFilter: { allow: this.config.commanderReadOnlyTools },
-      ...(signal ? { signal } : {}),
-    })
-    const result = await handle.result
-    if (result.interrupted) {
-      state.last_error = redactText(result.reason ?? 'COMMANDER_PLAN_INTERRUPTED')
+    const outcome = await this.runCommander(
+      state,
+      'PLAN',
+      COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints),
+      signal,
+    )
+    if (outcome.kind === 'needs_user') return this.setNeedsUser(state, outcome.reason)
+    if (outcome.kind === 'interrupted') {
       state.phase = 'PLAN'
+      state.status = 'running'
+      state.last_error = truncateSafe(outcome.reason, 500)
       this.store.writeState(state)
-      return this.result(state, false)
+      return this.result(state, false, outcome.reason)
     }
     try {
-      const plan = normalizePlan(parseJsonObject<{ summary?: unknown; steps?: unknown }>(result.output, 'COMMANDER_PLAN'))
+      const plan = normalizePlan(parseJsonObject<{ summary?: unknown; steps?: unknown }>(outcome.output, 'COMMANDER_PLAN'))
       state.plan = plan
       state.phase = 'EXECUTE'
       state.status = 'running'
       this.store.writeState(state)
       return undefined
     } catch (error) {
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
-      state.last_error = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      state.phase = 'PLAN'
+      state.status = 'running'
+      state.last_error = reason
       this.store.writeState(state)
-      return this.result(state, false)
+      return this.result(state, false, reason)
     }
   }
 
-  private async executeStep(state: CxState, step: CxPlanStep, signal?: AbortSignal): Promise<{ done: boolean; ok: boolean }> {
+  private async commanderEvaluate(
+    state: CxState,
+    step: CxPlanStep | undefined,
+    final: boolean,
+    signal?: AbortSignal,
+  ): Promise<CommanderOutcome> {
+    const mode: EvaluationMode = final ? 'FINAL_EVALUATE' : 'STEP_EVALUATE'
+    const evidence = state.commander?.summary ?? state.last_error ?? 'no evidence recorded'
+    const prompt = final
+      ? COMMANDER_FINAL_PROMPT(state.goal, state.plan, evidence, state)
+      : COMMANDER_STEP_PROMPT(state.goal, step as CxPlanStep, evidence, state)
+    const outcome = await this.runCommander(state, mode, prompt, signal)
+    if (outcome.kind === 'needs_user') return { kind: 'needs_user', reason: outcome.reason }
+    if (outcome.kind === 'interrupted') return { kind: 'interrupted', reason: outcome.reason }
+    try {
+      const decision = parseJsonObject<CommanderDecision>(outcome.output, 'COMMANDER_EVALUATION')
+      return { kind: 'decision', decision: assertCommanderDecision(decision, mode) }
+    } catch (error) {
+      // Invalid/temporary output is recoverable; it must not become NEEDS_USER.
+      return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+    }
+  }
+
+  /**
+   * The single adaptive Commander runner for PLAN, STEP_EVALUATE, FINAL_EVALUATE
+   * and STRATEGY_RECONSIDER. 360s/600s soft reviews, 840s deterministic ceiling;
+   * EXTEND always keeps the same child.
+   */
+  private async runCommander(
+    state: CxState,
+    mode: CommanderMode,
+    prompt: string,
+    signal?: AbortSignal,
+  ): Promise<SupervisedResult> {
+    const startedAt = this.now()
+    let handle: RoleHandle
+    try {
+      handle = await this.host.startRole({
+        role: 'commander',
+        label: `commander-${mode.toLowerCase()}`,
+        prompt,
+        route: state.routes.commander,
+        toolFilter: this.toolAllow(this.config.commanderReadOnlyTools, `commander ${mode}`),
+        ...(signal ? { signal } : {}),
+      })
+    } catch (error) {
+      return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+    }
+
+    try {
+      for (let extensions = 0; ; ) {
+        const deadline =
+          extensions === 0
+            ? COMMANDER_SOFT_DEADLINE_MS
+            : extensions === 1
+              ? COMMANDER_SOFT_DEADLINE_MS + COMMANDER_EXTENSION_MS
+              : COMMANDER_HARD_CEILING_MS
+        const remaining = Math.max(0, deadline - (this.now() - startedAt))
+        const raced = await this.raceWithSleep(handle.result, remaining, signal)
+        if (raced.kind === 'work') {
+          if (raced.value.interrupted) return { kind: 'interrupted', reason: raced.value.reason ?? `${mode}_INTERRUPTED` }
+          return { kind: 'output', output: raced.value.output }
+        }
+        if (raced.kind === 'aborted' || signal?.aborted) {
+          await this.cancelHandle(handle, 'CX_ABORTED')
+          return { kind: 'interrupted', reason: 'CX_ABORTED' }
+        }
+        if (extensions >= 2) {
+          await this.cancelHandle(handle, 'COMMANDER_HARD_TIMEOUT')
+          return { kind: 'interrupted', reason: 'COMMANDER_HARD_TIMEOUT' }
+        }
+        const review = await this.commanderTimeoutReview(state, mode, this.now() - startedAt, extensions, handle, signal)
+        if (review.decision === 'EXTEND') {
+          extensions += 1
+          continue
+        }
+        await this.cancelHandle(handle, review.decision === 'NEEDS_USER' ? 'COMMANDER_NEEDS_USER' : 'COMMANDER_TIMEOUT_INTERRUPTED')
+        if (review.decision === 'NEEDS_USER') return { kind: 'needs_user', reason: review.reason ?? 'COMMANDER_TIMEOUT_NEEDS_USER' }
+        return { kind: 'interrupted', reason: 'COMMANDER_TIMEOUT_INTERRUPTED' }
+      }
+    } finally {
+      await this.disposeHandle(handle)
+    }
+  }
+
+  private async commanderTimeoutReview(
+    state: CxState,
+    mode: CommanderMode,
+    elapsed: number,
+    extensions: number,
+    commanderHandle: RoleHandle,
+    signal?: AbortSignal,
+  ): Promise<TimeoutDecision> {
+    // Telemetry must describe the *current* Commander child, never a past Executor.
+    const telemetry = await commanderHandle.runtimeSnapshot?.()
+    const result = await this.runAuxRole(state, {
+      role: 'watchdog',
+      label: 'watchdog-commander-timeout',
+      prompt: WATCHDOG_TIMEOUT_PROMPT(mode, elapsed, extensions, telemetry),
+      ...(signal ? { signal } : {}),
+    })
+    if (!result || result.interrupted) {
+      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog unavailable' }
+    }
+    try {
+      return assertTimeoutDecision(parseJsonObject<TimeoutDecision>(result.output, 'COMMANDER_TIMEOUT_WATCHDOG'))
+    } catch {
+      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog invalid output' }
+    }
+  }
+
+  // ── executor runtime ───────────────────────────────────────────────────────
+
+  private async executeStep(
+    state: CxState,
+    step: CxPlanStep,
+    signal?: AbortSignal,
+  ): Promise<{ done: boolean; ok: boolean; message?: string }> {
     const capabilities = step.capabilities ?? []
     if (capabilities.includes('browser') && !this.host.hasTool(this.config.browserTools[0] ?? 'agent_browser')) {
       state.child = { status: 'completed' }
@@ -368,45 +524,64 @@ export class CxSupervisor {
       return { done: false, ok: false }
     }
 
-    const toolFilter = capabilities.includes('browser')
-      ? undefined
-      : { deny: [...this.config.browserTools] }
+    let toolFilter: RoleToolFilter
+    try {
+      const capabilityTools = capabilities.includes('browser') ? [...this.config.browserTools] : []
+      toolFilter = this.toolAllow([...this.config.executorTools, ...capabilityTools], `executor ${step.id}`)
+    } catch (error) {
+      const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      state.phase = 'NEEDS_USER'
+      state.status = 'needs_user'
+      state.last_error = reason
+      this.store.writeState(state)
+      return { done: true, ok: false, message: reason }
+    }
 
-    const handle = await this.host.startRole({
-      role: 'executor',
-      label: `executor-${step.id}`,
-      prompt: this.executorPrompt(state, step),
-      route: state.routes.executor,
-      ...(toolFilter ? { toolFilter } : {}),
-      capabilities,
-      ...(signal ? { signal } : {}),
-      ...(state.child?.id && state.child.status === 'interrupted' && state.child.id ? { resumeOf: state.child.id } : {}),
-    })
-    const result = await handle.result
-    this.lastTelemetry = result.telemetry
+    let handle: RoleHandle
+    try {
+      handle = await this.host.startRole({
+        role: 'executor',
+        label: `executor-${step.id}`,
+        prompt: this.executorPrompt(state, step),
+        route: state.routes.executor,
+        toolFilter,
+        capabilities,
+        ...(signal ? { signal } : {}),
+        ...(state.child?.id && state.child.status === 'interrupted' ? { resumeOf: state.child.id } : {}),
+      })
+    } catch (error) {
+      const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      state.last_error = reason
+      state.phase = 'NEEDS_USER'
+      state.status = 'needs_user'
+      this.store.writeState(state)
+      return { done: true, ok: false, message: reason }
+    }
+
+    const result = await this.awaitExecutor(handle, signal)
 
     if (result.interrupted) {
       state.child = { ...(result.childId ? { id: result.childId } : {}), status: 'interrupted' }
-      state.last_error = redactText(result.reason ?? 'EXECUTOR_INTERRUPTED')
+      state.last_error = truncateSafe(result.reason ?? 'EXECUTOR_INTERRUPTED', 500)
       state.phase = 'EXECUTE'
       state.status = 'running'
       const retries = state.interruption_retries + 1
       state.interruption_retries = retries
       this.store.writeState(state)
 
-      if (signal?.aborted) return { done: false, ok: false }
+      if (signal?.aborted) return { done: true, ok: false, message: 'CX_ABORTED' }
       if (result.reason === 'USER_HARD_SCOPE_VIOLATION') {
         state.phase = 'NEEDS_USER'
         state.status = 'needs_user'
         this.store.writeState(state)
-        return { done: true, ok: false }
+        return { done: true, ok: false, message: 'USER_HARD_SCOPE_VIOLATION' }
       }
       const recovery = await this.runtimeWatchdog(state, step, result, retries, signal)
       if (recovery === 'needs_user') {
         state.phase = 'NEEDS_USER'
         state.status = 'needs_user'
         this.store.writeState(state)
-        return { done: true, ok: false }
+        return { done: true, ok: false, message: state.last_error ?? undefined }
       }
       if (recovery === 'resume' && result.childId) {
         state.child = { id: result.childId, status: 'interrupted' }
@@ -414,9 +589,8 @@ export class CxSupervisor {
         return { done: false, ok: false }
       }
       if (recovery === 'restart') {
-        if (handle.childId || result.childId) {
-          await this.host.interruptRole(handle, 'CX_RESTART_STEP')
-        }
+        await this.cancelHandle(handle, 'CX_RESTART_STEP')
+        await this.disposeHandle(handle)
         state.child = undefined
         state.interruption_retries = 0
         this.store.writeState(state)
@@ -427,7 +601,7 @@ export class CxSupervisor {
         state.status = 'needs_user'
         state.last_error = `EXECUTOR_INTERRUPTED: ${state.last_error ?? ''}`
         this.store.writeState(state)
-        return { done: true, ok: false }
+        return { done: true, ok: false, message: state.last_error ?? undefined }
       }
       return { done: false, ok: false }
     }
@@ -442,13 +616,28 @@ export class CxSupervisor {
     state.last_error = null
     state.commander = {
       last_decision: state.commander?.last_decision,
-      summary: truncateSafe(redactText(result.output), 2000),
+      summary: truncateSafe(result.output, 2000),
     }
     state.phase = 'EVALUATE'
     state.status = 'running'
     this.store.writeState(state)
-    await this.host.releaseRole(handle)
+    await this.disposeHandle(handle)
     return { done: false, ok: false }
+  }
+
+  /** Deterministic executor runtime timeout; a timeout does not destroy the child. */
+  private async awaitExecutor(handle: RoleHandle, signal?: AbortSignal): Promise<RoleRunResult> {
+    const timeoutMs = this.config.executorTimeoutMs ?? EXECUTOR_TIMEOUT_MS
+    const raced = await this.raceWithSleep(handle.result, timeoutMs, signal)
+    if (raced.kind === 'work') return raced.value
+    const telemetry = await handle.runtimeSnapshot?.()
+    return {
+      ...(handle.childId ? { childId: handle.childId } : {}),
+      output: '',
+      interrupted: true,
+      reason: raced.kind === 'aborted' ? 'CX_ABORTED' : 'EXECUTOR_TIMEOUT',
+      ...(telemetry ? { telemetry } : {}),
+    }
   }
 
   private executorPrompt(state: CxState, step: CxPlanStep): string {
@@ -463,100 +652,7 @@ export class CxSupervisor {
     return lines.join('\n')
   }
 
-  private async commanderEvaluate(
-    state: CxState,
-    step: CxPlanStep | undefined,
-    final: boolean,
-    signal?: AbortSignal,
-  ): Promise<CommanderOutcome> {
-    const mode: EvaluationMode = final ? 'FINAL_EVALUATE' : 'STEP_EVALUATE'
-    const evidence = state.commander?.summary ?? state.last_error ?? 'no evidence recorded'
-    const prompt = final
-      ? COMMANDER_FINAL_PROMPT(state.goal, state.plan, evidence, state)
-      : COMMANDER_STEP_PROMPT(state.goal, step as CxPlanStep, evidence, state)
-    return this.runCommander(state, prompt, mode, signal)
-  }
-
-  private async runCommander(
-    state: CxState,
-    prompt: string,
-    mode: EvaluationMode,
-    signal?: AbortSignal,
-  ): Promise<CommanderOutcome> {
-    const startedAt = this.now()
-    const handle = await this.host.startRole({
-      role: 'commander',
-      label: `commander-${mode.toLowerCase()}`,
-      prompt,
-      route: state.routes.commander,
-      toolFilter: { allow: this.config.commanderReadOnlyTools },
-      ...(signal ? { signal } : {}),
-    })
-
-    for (let extensions = 0; ; ) {
-      const deadline =
-        extensions === 0
-          ? COMMANDER_SOFT_DEADLINE_MS
-          : extensions === 1
-            ? COMMANDER_SOFT_DEADLINE_MS + COMMANDER_EXTENSION_MS
-            : COMMANDER_HARD_CEILING_MS
-      const remaining = Math.max(0, deadline - (this.now() - startedAt))
-      const outcome = await Promise.race([
-        handle.result.then((value) => ({ value }) as const),
-        this.host.sleep(remaining, signal).then(() => ({ deadline: true }) as const),
-      ])
-      if ('value' in outcome) {
-        if (outcome.value.interrupted) return { kind: 'interrupted', reason: outcome.value.reason ?? 'COMMANDER_INTERRUPTED' }
-        try {
-          const decision = parseJsonObject<CommanderDecision>(outcome.value.output, 'COMMANDER_EVALUATION')
-          return { kind: 'decision', decision: assertCommanderDecision(decision, mode) }
-        } catch (error) {
-          return { kind: 'needs_user', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
-        }
-      }
-      if (signal?.aborted) {
-        await this.host.interruptRole(handle, 'CX_ABORTED')
-        return { kind: 'interrupted', reason: 'CX_ABORTED' }
-      }
-      if (extensions >= 2) {
-        await this.host.interruptRole(handle, 'COMMANDER_HARD_TIMEOUT')
-        return { kind: 'interrupted', reason: 'COMMANDER_HARD_TIMEOUT' }
-      }
-      const review = await this.commanderTimeoutReview(state, mode, this.now() - startedAt, extensions, signal)
-      if (review.decision === 'EXTEND') {
-        extensions += 1
-        continue
-      }
-      await this.host.interruptRole(handle, review.decision === 'NEEDS_USER' ? 'COMMANDER_NEEDS_USER' : 'COMMANDER_TIMEOUT_INTERRUPTED')
-      if (review.decision === 'NEEDS_USER') return { kind: 'needs_user', reason: review.reason ?? 'COMMANDER_TIMEOUT_NEEDS_USER' }
-      return { kind: 'interrupted', reason: 'COMMANDER_TIMEOUT_INTERRUPTED' }
-    }
-  }
-
-  private async commanderTimeoutReview(
-    state: CxState,
-    mode: EvaluationMode,
-    elapsed: number,
-    extensions: number,
-    signal?: AbortSignal,
-  ): Promise<TimeoutDecision> {
-    try {
-      const handle = await this.host.startRole({
-        role: 'watchdog',
-        label: 'watchdog-commander-timeout',
-        prompt: WATCHDOG_TIMEOUT_PROMPT(mode, elapsed, extensions, this.lastTelemetry),
-        route: state.routes.watchdog,
-        toolFilter: { allow: this.config.watchdogTools },
-        ...(signal ? { signal } : {}),
-      })
-      const result = await handle.result
-      await this.host.releaseRole(handle)
-      if (result.interrupted) return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog interrupted' }
-      return assertTimeoutDecision(parseJsonObject<TimeoutDecision>(result.output, 'COMMANDER_TIMEOUT_WATCHDOG'))
-    } catch {
-      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog unavailable' }
-    }
-  }
+  // ── decision application ───────────────────────────────────────────────────
 
   private async applyCommanderOutcome(
     state: CxState,
@@ -568,26 +664,17 @@ export class CxSupervisor {
     state.guard_recovery = undefined
 
     if (outcome.kind === 'interrupted') {
+      // Recoverable: the run stops and a later resume retries the same phase.
       state.last_error = truncateSafe(outcome.reason, 500)
       this.store.writeState(state)
-      return undefined
+      return this.result(state, false, outcome.reason)
     }
-    if (outcome.kind === 'needs_user') {
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
-      state.last_error = truncateSafe(outcome.reason, 500)
-      this.store.writeState(state)
-      return this.result(state, false)
-    }
+    if (outcome.kind === 'needs_user') return this.setNeedsUser(state, outcome.reason)
     const decision = outcome.decision
 
     if (decision.decision === 'NEEDS_USER') {
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
       state.commander = { last_decision: decision.decision, summary: state.commander?.summary }
-      state.last_error = truncateSafe(decision.reason ?? 'COMMANDER_NEEDS_USER', 500)
-      this.store.writeState(state)
-      return this.result(state, false)
+      return this.setNeedsUser(state, decision.reason ?? 'COMMANDER_NEEDS_USER')
     }
 
     if (decision.decision === 'SUCCESS') {
@@ -614,13 +701,7 @@ export class CxSupervisor {
     if (decision.decision === 'APPEND') {
       const remaining = state.loop.max - state.loop.used
       const appended = this.normalizeAppend(decision)
-      if (appended.length === 0) {
-        state.phase = 'NEEDS_USER'
-        state.status = 'needs_user'
-        state.last_error = 'COMMANDER_EVALUATION_OUTPUT_INVALID: append needs next_steps or next_step_goal'
-        this.store.writeState(state)
-        return this.result(state, false)
-      }
+      if (appended.length === 0) return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: append needs next_steps or next_step_goal')
       if (remaining <= 0) {
         state.phase = 'BUDGET_EXHAUSTED'
         state.status = 'budget_exhausted'
@@ -639,9 +720,13 @@ export class CxSupervisor {
     }
 
     // FINAL_EVALUATE must not return PASS/CORRECT; assertCommanderDecision already rejects it.
+    return this.setNeedsUser(state, 'COMMANDER_FINAL_DECISION_INVALID')
+  }
+
+  private setNeedsUser(state: CxState, reason: string): CxActionResult {
     state.phase = 'NEEDS_USER'
     state.status = 'needs_user'
-    state.last_error = 'COMMANDER_FINAL_DECISION_INVALID'
+    state.last_error = truncateSafe(reason, 500)
     this.store.writeState(state)
     return this.result(state, false)
   }
@@ -674,11 +759,7 @@ export class CxSupervisor {
     signal?: AbortSignal,
   ): Promise<CxActionResult | undefined> {
     if (!step || !decision.next_step_goal) {
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
-      state.last_error = 'COMMANDER_EVALUATION_OUTPUT_INVALID: correction needs next_step_goal'
-      this.store.writeState(state)
-      return this.result(state, false)
+      return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: correction needs next_step_goal')
     }
     const base = baseStepIdOf(step.id)
     const correctionDepth = correctionDepthOf(step.id)
@@ -686,29 +767,25 @@ export class CxSupervisor {
     const reservedForLaterStages = state.plan.steps.filter((candidate) => isBaseStepId(candidate.id) && candidate.status === 'pending').length
 
     if (correctionDepth >= MAX_CORRECTION_DEPTH) {
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
       state.last_error = 'CORRECTION_LIMIT_REACHED'
-      this.store.writeState(state)
-      return this.result(state, false)
+      return this.setNeedsUser(state, 'CORRECTION_LIMIT_REACHED')
     }
     if (remaining <= reservedForLaterStages) {
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
       state.last_error = 'LOOP_BUDGET_RESERVED_FOR_LATER_STEPS'
-      this.store.writeState(state)
-      return this.result(state, false)
+      return this.setNeedsUser(state, 'LOOP_BUDGET_RESERVED_FOR_LATER_STEPS')
     }
 
     let nextGoal = decision.next_step_goal
     if (correctionDepth === 1 && state.strategy_challenge?.base_step_id !== base) {
       const reconsider = await this.strategyChallenge(state, base, step, decision.reason ?? 'repeated correction', signal)
-      if (reconsider.kind === 'needs_user') {
-        state.phase = 'NEEDS_USER'
-        state.status = 'needs_user'
+      if (reconsider.kind === 'needs_user') return this.setNeedsUser(state, reconsider.reason)
+      if (reconsider.kind === 'interrupted') {
+        // Temporary failure: keep the run resumable and do NOT consume the challenge.
+        state.phase = 'EVALUATE'
+        state.status = 'running'
         state.last_error = truncateSafe(reconsider.reason, 500)
         this.store.writeState(state)
-        return this.result(state, false)
+        return this.result(state, false, reconsider.reason)
       }
       if (reconsider.kind === 'replace') nextGoal = reconsider.replacementGoal
     }
@@ -735,46 +812,41 @@ export class CxSupervisor {
     step: CxPlanStep,
     reason: string,
     signal?: AbortSignal,
-  ): Promise<{ kind: 'keep' } | { kind: 'replace'; replacementGoal: string } | { kind: 'needs_user'; reason: string }> {
+  ): Promise<StrategyOutcome> {
+    const challengeResult = await this.runAuxRole(state, {
+      role: 'watchdog',
+      label: 'watchdog-strategy',
+      prompt: WATCHDOG_STRATEGY_PROMPT(step, reason, state),
+      ...(signal ? { signal } : {}),
+    })
+    if (!challengeResult || challengeResult.interrupted) {
+      return { kind: 'interrupted', reason: 'SMART_WATCHDOG_UNAVAILABLE' }
+    }
     let challenge = ''
     try {
-      const handle = await this.host.startRole({
-        role: 'watchdog',
-        label: 'watchdog-strategy',
-        prompt: WATCHDOG_STRATEGY_PROMPT(step, reason, state),
-        route: state.routes.watchdog,
-        toolFilter: { allow: this.config.watchdogTools },
-        ...(signal ? { signal } : {}),
-      })
-      const result = await handle.result
-      await this.host.releaseRole(handle)
-      if (result.interrupted) return { kind: 'needs_user', reason: 'SMART_WATCHDOG_INTERRUPTED' }
-      const parsed = parseJsonObject<{ question?: unknown }>(result.output, 'SMART_WATCHDOG_STRATEGY')
+      const parsed = parseJsonObject<{ question?: unknown }>(challengeResult.output, 'SMART_WATCHDOG_STRATEGY')
       challenge = String(parsed.question ?? '').trim()
-      if (!challenge) return { kind: 'needs_user', reason: 'SMART_WATCHDOG_STRATEGY_OUTPUT_INVALID: question is required' }
     } catch (error) {
-      return { kind: 'needs_user', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+      return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
     }
+    if (!challenge) return { kind: 'interrupted', reason: 'SMART_WATCHDOG_STRATEGY_OUTPUT_INVALID: question is required' }
 
+    const outcome = await this.runCommander(
+      state,
+      'STRATEGY_RECONSIDER',
+      COMMANDER_STRATEGY_PROMPT(state.goal, base, challenge, state),
+      signal,
+    )
+    if (outcome.kind === 'needs_user') return { kind: 'needs_user', reason: outcome.reason }
+    if (outcome.kind === 'interrupted') return { kind: 'interrupted', reason: outcome.reason }
     try {
-      const handle = await this.host.startRole({
-        role: 'commander',
-        label: 'commander-strategy-reconsider',
-        prompt: COMMANDER_STRATEGY_PROMPT(state.goal, base, challenge, state),
-        route: state.routes.commander,
-        toolFilter: { allow: this.config.commanderReadOnlyTools },
-        ...(signal ? { signal } : {}),
-      })
-      const result = await handle.result
-      await this.host.releaseRole(handle)
-      if (result.interrupted) return { kind: 'needs_user', reason: 'COMMANDER_STRATEGY_INTERRUPTED' }
-      const decision = assertStrategyDecision(parseJsonObject<StrategyDecision>(result.output, 'COMMANDER_STRATEGY'))
+      const decision = assertStrategyDecision(parseJsonObject<StrategyDecision>(outcome.output, 'COMMANDER_STRATEGY'))
       if (decision.decision === 'NEEDS_USER') return { kind: 'needs_user', reason: decision.reason ?? 'COMMANDER_STRATEGY_NEEDS_USER' }
       state.strategy_challenge = { base_step_id: base, used: true }
       if (decision.decision === 'REPLACE_CURRENT_STEP') return { kind: 'replace', replacementGoal: decision.replacement_goal as string }
       return { kind: 'keep' }
     } catch (error) {
-      return { kind: 'needs_user', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+      return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
     }
   }
 
@@ -799,23 +871,20 @@ export class CxSupervisor {
     }
     this.store.writeState(state)
 
+    const watchdogResult = await this.runAuxRole(state, {
+      role: 'watchdog',
+      label: 'watchdog-runtime',
+      prompt: WATCHDOG_RUNTIME_PROMPT(step, result.reason ?? 'runtime failure', result.telemetry),
+      ...(signal ? { signal } : {}),
+    })
+    if (!watchdogResult || watchdogResult.interrupted) {
+      state.smart_watchdog.last_decision = 'UNAVAILABLE'
+      this.store.writeState(state)
+      return 'fallback'
+    }
+
     let diagnosis: WatchdogDecision
     try {
-      const handle = await this.host.startRole({
-        role: 'watchdog',
-        label: 'watchdog-runtime',
-        prompt: WATCHDOG_RUNTIME_PROMPT(step, result.reason ?? 'runtime failure', result.telemetry),
-        route: state.routes.watchdog,
-        toolFilter: { allow: this.config.watchdogTools },
-        ...(signal ? { signal } : {}),
-      })
-      const watchdogResult = await handle.result
-      await this.host.releaseRole(handle)
-      if (watchdogResult.interrupted) {
-        state.smart_watchdog.last_decision = 'UNAVAILABLE'
-        this.store.writeState(state)
-        return 'fallback'
-      }
       diagnosis = assertWatchdogDecision(parseJsonObject<WatchdogDecision>(watchdogResult.output, 'SMART_WATCHDOG_RUNTIME'))
     } catch {
       state.smart_watchdog.last_decision = 'UNAVAILABLE'
@@ -830,9 +899,10 @@ export class CxSupervisor {
     if (diagnosis.decision === 'RESUME_CHILD') {
       return result.childId && retries < MAX_EXECUTOR_INTERRUPT_RETRIES ? 'resume' : 'fallback'
     }
-    // RESTART_STEP
     return state.current_step?.id === step.id && !signal?.aborted && retries < MAX_EXECUTOR_INTERRUPT_RETRIES ? 'restart' : 'fallback'
   }
+
+  // ── guards ─────────────────────────────────────────────────────────────────
 
   async recordGuardBlock(code: GuardCode, reason: string): Promise<GuardBlockOutcome> {
     const state = this.store.readState()
@@ -861,17 +931,13 @@ export class CxSupervisor {
   }
 
   private async guardEscalation(state: CxState, code: GuardCode, count: number): Promise<GuardWatchdogDecision> {
+    const result = await this.runAuxRole(state, {
+      role: 'watchdog',
+      label: 'watchdog-guard',
+      prompt: WATCHDOG_GUARD_PROMPT(code, count, state.current_step?.id ?? ''),
+    })
+    if (!result || result.interrupted) return this.guardWatchdogFallback(count)
     try {
-      const handle = await this.host.startRole({
-        role: 'watchdog',
-        label: 'watchdog-guard',
-        prompt: WATCHDOG_GUARD_PROMPT(code, count, state.current_step?.id ?? ''),
-        route: state.routes.watchdog,
-        toolFilter: { allow: this.config.watchdogTools },
-      })
-      const result = await handle.result
-      await this.host.releaseRole(handle)
-      if (result.interrupted) return this.guardWatchdogFallback(count)
       return assertGuardWatchdogDecision(parseJsonObject<GuardWatchdogDecision>(result.output, 'SMART_WATCHDOG_GUARD'))
     } catch {
       return this.guardWatchdogFallback(count)
@@ -887,10 +953,92 @@ export class CxSupervisor {
   private guardNeedsUser(state: CxState, code: GuardCode, reason: string, count: number, instruction?: string): GuardBlockOutcome {
     state.phase = 'NEEDS_USER'
     state.status = 'needs_user'
-    state.last_error = `CX_GUARD_ESCALATION: ${redactText(reason).slice(0, 300)}`
+    state.last_error = `CX_GUARD_ESCALATION: ${reason.slice(0, 300)}`
     this.store.writeState(state)
     return { disposition: 'block_needs_user', code, count, watchdog_calls: 0, instruction: instruction ?? GUARD_NEEDS_USER_INSTRUCTION }
   }
+
+  // ── role lifecycle helpers ─────────────────────────────────────────────────
+
+  /**
+   * One-shot auxiliary role (watchdogs and similar). Always releases the handle,
+   * even on interruption or timeout.
+   */
+  private async runAuxRole(state: CxState, request: AuxRoleRequest): Promise<RoleRunResult | undefined> {
+    const names = request.role === 'watchdog' ? this.config.watchdogTools : this.config.commanderReadOnlyTools
+    let handle: RoleHandle | undefined
+    try {
+      handle = await this.host.startRole({
+        role: request.role,
+        label: request.label,
+        prompt: request.prompt,
+        route: state.routes[request.role],
+        toolFilter: this.toolAllow(names, request.role),
+        ...(request.signal ? { signal: request.signal } : {}),
+      })
+      const timeoutMs = request.timeoutMs ?? this.config.watchdogTimeoutMs ?? WATCHDOG_TIMEOUT_MS
+      const raced = await this.raceWithSleep(handle.result, timeoutMs, request.signal)
+      if (raced.kind === 'work') return raced.value
+      await this.cancelHandle(handle, raced.kind === 'aborted' ? 'CX_ABORTED' : 'WATCHDOG_TIMEOUT')
+      return {
+        ...(handle.childId ? { childId: handle.childId } : {}),
+        output: '',
+        interrupted: true,
+        reason: raced.kind === 'aborted' ? 'CX_ABORTED' : 'WATCHDOG_TIMEOUT',
+      }
+    } catch {
+      return undefined
+    } finally {
+      if (handle) await this.disposeHandle(handle)
+    }
+  }
+
+  private async cancelHandle(handle: RoleHandle, reason: string): Promise<void> {
+    try {
+      if (handle.cancel) await handle.cancel(reason)
+      else await this.host.interruptRole(handle, reason)
+    } catch {
+      // cancellation is best-effort; dispose still runs
+    }
+  }
+
+  private async disposeHandle(handle: RoleHandle): Promise<void> {
+    try {
+      if (handle.dispose) await handle.dispose()
+      else await this.host.releaseRole(handle)
+    } catch {
+      // idempotent cleanup
+    }
+  }
+
+  /** Race a work promise against a sleeping deadline, aborting the timer cleanly. */
+  private async raceWithSleep<T>(
+    work: Promise<T>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ kind: 'work'; value: T } | { kind: 'timeout' } | { kind: 'aborted' }> {
+    const controller = new AbortController()
+    const onAbort = (): void => controller.abort()
+    signal?.addEventListener('abort', onAbort, { once: true })
+    const timeout = this.host
+      .sleep(timeoutMs, controller.signal)
+      .then(() => ({ kind: 'timeout' as const }))
+      .catch(() => ({ kind: 'aborted' as const }))
+    try {
+      return await Promise.race([
+        work.then((value) => {
+          controller.abort()
+          return { kind: 'work' as const, value }
+        }),
+        timeout,
+      ])
+    } finally {
+      controller.abort()
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  // ── lifecycle ──────────────────────────────────────────────────────────────
 
   stop(action: string, runId?: string): CxActionResult {
     const state = this.store.readState()
@@ -947,8 +1095,3 @@ function hashGoal(goal: string): string {
 }
 
 export { DEFAULT_CAPABILITIES }
-function guardReasonReexport(decision: Parameters<typeof guardReason>[0]): string {
-  return guardReason(decision)
-}
-void guardReasonReexport
-void basename

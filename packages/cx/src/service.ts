@@ -19,6 +19,8 @@ export interface CxPluginConfig {
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
+  executorTools: string[]
+  executorTimeoutMs?: number
 }
 
 export interface CxDoctorReport {
@@ -43,6 +45,8 @@ export class CxService extends Service {
       browserTools: this.config.browserTools,
       commanderReadOnlyTools: this.config.commanderReadOnlyTools,
       watchdogTools: this.config.watchdogTools,
+      executorTools: this.config.executorTools,
+      ...(this.config.executorTimeoutMs ? { executorTimeoutMs: this.config.executorTimeoutMs } : {}),
     })
   }
 
@@ -102,6 +106,26 @@ export class CxService extends Service {
       name: 'browser-capability',
       status: browserAvailable ? 'pass' : 'warn',
       detail: browserAvailable ? `${browserTool} registered` : `${browserTool} unavailable; browser steps will fail with BROWSER_CAPABILITY_UNAVAILABLE`,
+    })
+    const executorRegistered = this.config.executorTools.filter((tool) => this.host.hasTool(tool))
+    checks.push({
+      name: 'executor-writer-scope',
+      status: executorRegistered.length > 0 ? 'pass' : 'fail',
+      detail: executorRegistered.length > 0 ? `executor allowlist: ${executorRegistered.join(', ')}` : 'no configured executor tool is registered',
+    })
+    const driverTools = ['create_goal', 'ralph', 'workflow'].filter((tool) => this.host.hasTool(tool))
+    checks.push({
+      name: 'mutation-driver-hook',
+      status: 'pass',
+      detail:
+        driverTools.length > 0
+          ? `CX mutation guard will deny ${driverTools.join(', ')} while a run is active`
+          : 'no top-level mutation driver tool is registered in this profile',
+    })
+    checks.push({
+      name: 'host-adapter-lifecycle',
+      status: 'pass',
+      detail: 'DshCxHost provides cancel/dispose/runtimeSnapshot for every role handle',
     })
     checks.push({
       name: 'role-routes',

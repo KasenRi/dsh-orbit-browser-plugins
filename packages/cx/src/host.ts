@@ -31,6 +31,16 @@ export interface RoleRunResult {
 export interface RoleHandle {
   childId?: string
   result: Promise<RoleRunResult>
+  /**
+   * Real lifecycle control for the role's child. For one-shot roles this aborts
+   * the launch signal and disposes the run; for continuable roles it interrupts
+   * the child while keeping it alive for a later resume.
+   */
+  cancel?: (reason: string) => Promise<void>
+  /** Release the handle's resources. One-shot: dispose; continuable: drain. */
+  dispose?: () => Promise<void>
+  /** Bounded runtime telemetry for this exact handle (not a previous role). */
+  runtimeSnapshot?: () => Promise<CxTelemetry>
 }
 
 /** DSH-facing seam. The supervisor only depends on this, never on subagent internals. */
