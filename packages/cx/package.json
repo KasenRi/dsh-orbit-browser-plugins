@@ -1,17 +1,49 @@
 {
-  "name": "@local/dsh-cx",
+  "name": "@kasenri/dsh-cx",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "Cordis plugin implementing CX Lite engineering autonomy (Service + cx_controller tool + recoverable guards) for DeepSeek Harness.",
+  "description": "Community DeepSeek Harness plugin: deterministic engineering orchestration with Commander, Executor and Smart Watchdog (CxService + cx_controller tool).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KasenRi/dsh-cx-browser-plugins.git",
+    "directory": "packages/cx"
+  },
+  "homepage": "https://github.com/KasenRi/dsh-cx-browser-plugins/tree/main/packages/cx#readme",
+  "bugs": {
+    "url": "https://github.com/KasenRi/dsh-cx-browser-plugins/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "agent",
+    "workflow",
+    "orchestration"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
   ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-agent": "^0.1.5-rc.2",

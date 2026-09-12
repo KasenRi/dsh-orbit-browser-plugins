@@ -1,0 +1,8 @@
+# @kasenri/dsh-cx bundle layer.
+#
+# Adds the CX engineering orchestration plugin (CxService + cx_controller tool)
+# on top of the active bundle stack. Model routes use the plugin defaults and
+# can be overridden in the profile's own cordis.patch.yml.
+- insert:
+    - id: dsh-cx
+      name: '@kasenri/dsh-cx'

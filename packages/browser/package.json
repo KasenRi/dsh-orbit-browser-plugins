@@ -1,17 +1,49 @@
 {
-  "name": "@local/dsh-browser",
+  "name": "@kasenri/dsh-browser",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "Cordis plugin exposing controlled agent-browser automation to DeepSeek Harness (BrowserAutomationService + agent_browser tool).",
+  "description": "Community DeepSeek Harness plugin: controlled browser automation via agent-browser (BrowserAutomationService + agent_browser tool).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KasenRi/dsh-cx-browser-plugins.git",
+    "directory": "packages/browser"
+  },
+  "homepage": "https://github.com/KasenRi/dsh-cx-browser-plugins/tree/main/packages/browser#readme",
+  "bugs": {
+    "url": "https://github.com/KasenRi/dsh-cx-browser-plugins/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "browser",
+    "browser-automation",
+    "agent-browser"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
   ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"

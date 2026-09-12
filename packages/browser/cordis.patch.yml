@@ -1,0 +1,8 @@
+# @kasenri/dsh-browser bundle layer.
+#
+# Adds the browser automation plugin (BrowserAutomationService + agent_browser
+# tool) on top of the active bundle stack. All values come from plugin defaults
+# or user configuration; this file contains no machine-specific paths.
+- insert:
+    - id: dsh-browser
+      name: '@kasenri/dsh-browser'

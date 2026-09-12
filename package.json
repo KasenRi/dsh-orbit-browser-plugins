@@ -1,9 +1,23 @@
 {
-  "name": "dsh-pi-parity",
+  "name": "dsh-cx-browser-plugins",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Native DeepSeek Harness (Cordis) plugins reproducing the CX Lite orchestration and agent-browser automation capabilities of the local Pi environment.",
+  "description": "Community DeepSeek Harness plugins: CX engineering orchestration (@kasenri/dsh-cx) and controlled browser automation (@kasenri/dsh-browser).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KasenRi/dsh-cx-browser-plugins.git"
+  },
+  "homepage": "https://github.com/KasenRi/dsh-cx-browser-plugins#readme",
+  "bugs": {
+    "url": "https://github.com/KasenRi/dsh-cx-browser-plugins/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis"
+  ],
   "workspaces": [
     "packages/cx",
     "packages/browser"

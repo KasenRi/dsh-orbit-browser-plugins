@@ -1,16 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { BrowserRunner, type BrowserRunnerConfig } from '../../src/runner.ts'
 import { resolveExecutable } from '../../src/cli.ts'
+import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
-const chromium =
-  process.env.DSH_BROWSER_EXECUTABLE_PATH ??
-  ['/root/.cache/ms-playwright/chromium-1228/chrome-linux/chrome', '/root/.cache/ms-playwright/chromium-1223/chrome-linux/chrome'].find((candidate) =>
-    existsSync(candidate),
-  )
+const chromium = findChromium()
 
 const config: BrowserRunnerConfig = {
   command: 'agent-browser',

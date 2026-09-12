@@ -33,8 +33,8 @@ test('redacts sensitive flag values but keeps position', () => {
 })
 
 test('blocks protected browser state operands', () => {
-  assert.ok(findProtectedStateViolation(['open', '/root/.agent-browser/state.json']))
-  assert.ok(findProtectedStateViolation(['open', 'file:///root/x']))
+  assert.ok(findProtectedStateViolation(['open', '/tmp/protected/.agent-browser/state.json']))
+  assert.ok(findProtectedStateViolation(['open', 'file:///tmp/protected/x']))
   assert.ok(findProtectedStateViolation(['open', '--config', 'x.yml']))
   assert.equal(findProtectedStateViolation(['open', 'https://example.com']), undefined)
 })

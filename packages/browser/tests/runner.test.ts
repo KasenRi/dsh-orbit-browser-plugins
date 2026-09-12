@@ -15,7 +15,7 @@ const config: BrowserRunnerConfig = {
   allowedDomains: [],
 }
 
-const context = { sessionId: '12345678-1234-1234-1234-1234567890ab', cwd: '/root/code/demo' }
+const context = { sessionId: '12345678-1234-1234-1234-1234567890ab', cwd: '/tmp/dsh-pi-parity-demo' }
 
 function envelope(data: unknown, success = true): string {
   return JSON.stringify({ success, data })
@@ -94,7 +94,7 @@ test('protected state operand is policy-blocked before spawn', async () => {
       return { stdout: envelope({}) }
     }),
   })
-  const result = await runner.run({ args: ['open', '/root/.agent-browser/state.json'] }, context)
+  const result = await runner.run({ args: ['open', '/tmp/protected/.agent-browser/state.json'] }, context)
   assert.equal(result.failureCategory, 'policy-blocked')
   assert.equal(spawned, 0)
 })

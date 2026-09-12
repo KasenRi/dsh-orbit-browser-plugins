@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -18,6 +18,7 @@ import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as CxPlugin from '../../src/index.ts'
 import { DshCxHost } from '../../src/dsh-host.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
+import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
 const MODEL = { provider: 'fake', model: 'fm' }
 const ROUTE = { provider: 'fake', model: 'fm', reasoningEffort: 'off' }
@@ -342,11 +343,7 @@ test('real host capability scoping: agent_browser is unavailable to a restricted
 })
 
 test('real Cordis tool pipeline: agent_browser tool -> BrowserAutomationService -> Chromium', { timeout: 180_000 }, async () => {
-  const chromium =
-    process.env.DSH_BROWSER_EXECUTABLE_PATH ??
-    ['/root/.cache/ms-playwright/chromium-1228/chrome-linux/chrome', '/root/.cache/ms-playwright/chromium-1223/chrome-linux/chrome'].find((candidate) =>
-      existsSync(candidate),
-    )
+  const chromium = findChromium()
   assert.ok(chromium, 'a working chromium executable is required')
   assert.ok(resolveExecutable('agent-browser', process.env.PATH), 'agent-browser must be on PATH')
 

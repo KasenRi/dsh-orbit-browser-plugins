@@ -1,20 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
 import { BrowserRunner, type BrowserRunnerConfig } from '../../src/runner.ts'
 import { resolveExecutable } from '../../src/cli.ts'
-
-function findChromium(): string | undefined {
-  const explicit = process.env.DSH_BROWSER_EXECUTABLE_PATH
-  if (explicit && existsSync(explicit)) return explicit
-  const candidates = [
-    '/root/.cache/ms-playwright/chromium-1228/chrome-linux/chrome',
-    '/root/.cache/ms-playwright/chromium-1223/chrome-linux/chrome',
-  ]
-  for (const candidate of candidates) if (existsSync(candidate)) return candidate
-  const executable = resolveExecutable('chromium-browser', process.env.PATH) ?? resolveExecutable('chromium', process.env.PATH)
-  return executable
-}
+import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
 const chromium = findChromium()
 const agentBrowser = resolveExecutable('agent-browser', process.env.PATH)

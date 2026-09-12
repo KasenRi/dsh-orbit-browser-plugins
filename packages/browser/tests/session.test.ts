@@ -10,16 +10,16 @@ import {
 } from '../src/session.ts'
 
 test('implicit session name is stable and cwd-scoped', () => {
-  const a = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/root/code/demo')
-  const b = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/root/code/demo')
-  const c = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/root/code/other')
+  const a = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/tmp/projects/demo')
+  const b = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/tmp/projects/demo')
+  const c = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/tmp/projects/other')
   assert.equal(a, b)
   assert.notEqual(a, c)
   assert.ok(a.startsWith('dshab-'))
 })
 
 test('fresh session name differs each time', () => {
-  const base = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/root/code/demo')
+  const base = buildImplicitSessionName('12345678-1234-1234-1234-1234567890ab', '/tmp/projects/demo')
   assert.notEqual(buildFreshSessionName(base), buildFreshSessionName(base))
 })
 

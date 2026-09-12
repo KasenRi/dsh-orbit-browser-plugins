@@ -1,23 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BrowserRunner } from '../../../browser/src/runner.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
+import { findChromium } from '../../../../tests/helpers/chromium.ts'
 import { CxStateStore } from '../../src/state-store.ts'
 import { CxSupervisor, type CxSupervisorConfig } from '../../src/supervisor.ts'
 import type { CxHost, RoleHandle, RoleRunRequest, RoleRunResult } from '../../src/host.ts'
-
-function findChromium(): string | undefined {
-  const explicit = process.env.DSH_BROWSER_EXECUTABLE_PATH
-  if (explicit && existsSync(explicit)) return explicit
-  const candidates = [
-    '/root/.cache/ms-playwright/chromium-1228/chrome-linux/chrome',
-    '/root/.cache/ms-playwright/chromium-1223/chrome-linux/chrome',
-  ]
-  return candidates.find((candidate) => existsSync(candidate))
-}
 
 const chromium = findChromium()
 const agentBrowser = resolveExecutable('agent-browser', process.env.PATH)

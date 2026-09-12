@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
-import { existsSync } from 'node:fs'
 import { BrowserRunner, type BrowserRunnerConfig } from '../../src/runner.ts'
 import { resolveExecutable } from '../../src/cli.ts'
+import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
 const FIXTURE_HTML = `<!doctype html>
 <html>
@@ -76,11 +76,7 @@ function startFixture(): Promise<{ server: Server; url: string; close: () => Pro
   })
 }
 
-const chromium =
-  process.env.DSH_BROWSER_EXECUTABLE_PATH ??
-  ['/root/.cache/ms-playwright/chromium-1228/chrome-linux/chrome', '/root/.cache/ms-playwright/chromium-1223/chrome-linux/chrome'].find((candidate) =>
-    existsSync(candidate),
-  )
+const chromium = findChromium()
 
 const config: BrowserRunnerConfig = {
   command: 'agent-browser',
