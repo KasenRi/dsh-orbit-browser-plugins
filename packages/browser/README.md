@@ -34,9 +34,10 @@ versions above, not with every future DSH release.
 
 ## Install
 
+Distributed as a GitHub Release asset (npm registry publishing is pending):
+
 ```bash
-# inside the DSH profile you use, e.g. the web profile
-dsh plugin --profile web add @kasenri/dsh-browser@0.1.0
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.2.0/kasenri-dsh-browser-0.1.0.tgz
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a
