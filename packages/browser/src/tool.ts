@@ -71,7 +71,7 @@ export function createAgentBrowserTool(ctx: Context) {
     },
     async execute(args, exec) {
       const agent = exec.agent as AgentLike | undefined
-      const service = agent?.ctx?.browserAutomation ?? (ctx as Context & { browserAutomation?: BrowserAutomationService }).browserAutomation
+      const service = (ctx as Context & { browserAutomation?: BrowserAutomationService }).browserAutomation
       if (!service) {
         throw new Error('browserAutomation service is unavailable; dsh-browser is not loaded.')
       }

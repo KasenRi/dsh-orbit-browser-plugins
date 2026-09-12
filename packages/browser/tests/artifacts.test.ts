@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { artifactRequestsFromArgs, mediaTypeForPath, verifyArtifacts } from '../src/artifacts.ts'
+import { artifactRequestsFromArgs, artifactRequestsFromCompiledSteps, mediaTypeForPath, verifyArtifacts } from '../src/artifacts.ts'
 
 const statOk = async (path: string) => ({ isFile: () => true, size: path.length })
 const statMissing = async () => {
@@ -38,6 +38,18 @@ test('fails closed on missing artifact', async () => {
   const report = await verifyArtifacts([{ requestedPath: 'a.png', kind: 'image' }], '/tmp', statMissing)
   assert.equal(report.verified, false)
   assert.equal(report.missingCount, 1)
+})
+
+test('extracts artifact requests from compiled batch steps', () => {
+  const requests = artifactRequestsFromCompiledSteps([
+    { action: 'open', args: ['open', 'https://example.com'] },
+    { action: 'screenshot', args: ['screenshot', '/tmp/a.png'] },
+    { action: 'waitForDownload', args: ['wait', '--download', '/tmp/f.pdf'] },
+  ])
+  assert.deepEqual(requests, [
+    { requestedPath: '/tmp/a.png', kind: 'image' },
+    { requestedPath: '/tmp/f.pdf', kind: 'file' },
+  ])
 })
 
 test('pending artifact is not missing', async () => {

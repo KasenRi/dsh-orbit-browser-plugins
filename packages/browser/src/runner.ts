@@ -1,5 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
-import { resolve as resolvePath } from 'node:path'
+import { mkdir as mkdirPromise, rename as renamePromise, writeFile as writeFilePromise } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { dirname, isAbsolute as isAbsolutePath, resolve as resolvePath } from 'node:path'
 import { buildArgv, defaultCommandExecutor, parseEnvelope, type CommandExecutor } from './cli.ts'
 import { artifactRequestsFromArgs, verifyArtifacts, type StatFn } from './artifacts.ts'
 import { checkBatchRefOrdering, checkRefSafety, parseSnapshotRefs } from './refs.ts'
@@ -9,6 +11,7 @@ import { validateInput } from './validate.ts'
 import type {
   AgentBrowserInput,
   AgentBrowserResult,
+  ArtifactRequest,
   CliEnvelope,
   FailureCategory,
   RefSnapshot,
@@ -90,12 +93,36 @@ export class BrowserRunner {
     if (protectedViolation) return this.failure('policy-blocked', protectedViolation)
 
     const sessionState = this.sessions.get(implicitSessionName)
-    const decision = decideSession(args, validated.sessionMode, implicitSessionName, sessionState?.alive === true)
+
+    // Known-URL preflight: fail before any browser request leaves the machine.
+    if (this.config.allowedDomains.length > 0) {
+      for (const url of collectPlannedUrls(input, args)) {
+        const violation = checkAllowedDomains(url, this.config.allowedDomains)
+        if (violation) return this.failure('policy-blocked', violation.message)
+      }
+    }
+
+    // Strict containment launches a fresh managed context with the upstream
+    // --allowed-domains guard; the postflight check stays as defense in depth.
+    const containmentLaunch =
+      this.config.allowedDomains.length > 0 &&
+      collectPlannedUrls(input, args).length > 0 &&
+      !args.some((token) => token === '--session' || token.startsWith('--session='))
+    const launchArgs = containmentLaunch
+      ? ['--allowed-domains', this.config.allowedDomains.join(','), ...args]
+      : args
+
+    const decision = decideSession(
+      launchArgs,
+      containmentLaunch ? 'fresh' : validated.sessionMode,
+      implicitSessionName,
+      sessionState?.alive === true,
+    )
     if (decision.launchFlagError) return this.failure('validation-error', decision.launchFlagError)
 
     const command = args[0] ?? ''
     const effectiveArgv = buildArgv({
-      args,
+      args: launchArgs,
       ...(decision.sessionName ? { sessionName: decision.sessionName } : {}),
       ...(this.config.namespace ? { namespace: this.config.namespace } : {}),
     })
@@ -113,7 +140,7 @@ export class BrowserRunner {
     const timeoutMs = validated.timeoutMs ?? this.config.timeoutMs
     const result = await this.executor(this.config.command, effectiveArgv, {
       cwd: context.cwd,
-      input: validated.generatedStdin,
+      input: validated.generatedStdin ?? validated.stdin,
       timeoutMs,
       signal: context.signal,
       env: this.childEnv(),
@@ -136,7 +163,7 @@ export class BrowserRunner {
       return this.failure('upstream-error', detail)
     }
 
-    return this.success(command, args, effectiveArgv, decision.sessionName, decision.usedImplicitSession, envelope, sessionState, implicitSessionName, context)
+    return this.success(command, args, effectiveArgv, decision.sessionName, decision.usedImplicitSession, envelope, sessionState, implicitSessionName, context, validated)
   }
 
   private async success(
@@ -149,8 +176,9 @@ export class BrowserRunner {
     sessionState: SessionState | undefined,
     implicitSessionName: string,
     context: RunContext,
+    validated: ValidatedInput,
   ): Promise<AgentBrowserResult> {
-    const requests = artifactRequestsFromArgs(args)
+    const requests = dedupeRequests([...artifactRequestsFromArgs(args), ...(validated.artifactRequests ?? [])])
     const verification = requests.length > 0 ? await verifyArtifacts(requests, context.cwd, this.statFn) : undefined
     if (verification && verification.missingCount > 0) {
       const missing = verification.artifacts.filter((entry) => entry.status === 'missing').map((entry) => entry.absolutePath)
@@ -186,7 +214,7 @@ export class BrowserRunner {
     if (domainViolation) return this.failure('policy-blocked', domainViolation.message)
     const output = this.boundOutput(command, redactedData)
 
-    return {
+    const result: AgentBrowserResult = {
       resultCategory: 'success',
       successCategory: categories,
       command,
@@ -200,6 +228,35 @@ export class BrowserRunner {
       ...(verification ? { artifacts: verification.artifacts, artifactVerification: verification } : {}),
       ...(state.refSnapshot ? { refSnapshot: state.refSnapshot } : {}),
       ...(output.fullOutputPath ? { fullOutputPath: output.fullOutputPath } : {}),
+    }
+
+    if (validated.outputPath) {
+      const written = await this.writeOutputFile(validated.outputPath, output.data, context.cwd)
+      if ('error' in written) return this.failure('validation-error', written.error)
+      result.outputFile = written.path
+    }
+    return result
+  }
+
+  /** Atomic 0600 write of the structured result; caller path is resolved from cwd. */
+  private async writeOutputFile(
+    requestedPath: string,
+    data: unknown,
+    cwd: string,
+  ): Promise<{ path: string } | { error: string }> {
+    const target = isAbsolutePath(requestedPath) ? requestedPath : resolvePath(cwd, requestedPath)
+    const payload =
+      typeof data === 'string'
+        ? data
+        : `${JSON.stringify(redactValue(data), null, 2)}\n`
+    const temp = `${target}.${randomUUID()}.tmp`
+    try {
+      await mkdirPromise(dirname(target), { recursive: true })
+      await writeFilePromise(temp, payload, { encoding: 'utf8', mode: 0o600 })
+      await renamePromise(temp, target)
+      return { path: target }
+    } catch (error) {
+      return { error: `failed to write outputPath ${target}: ${error instanceof Error ? error.message : String(error)}` }
     }
   }
 
@@ -284,7 +341,36 @@ function extractObservedUrl(
   return sessionState?.target.url
 }
 
-function extractBatchRows(validated: ValidatedInput): string[][] {  if (!validated.generatedStdin) return []
+/** URLs a single call is known to navigate to, for preflight containment. */
+function collectPlannedUrls(input: AgentBrowserInput, args: readonly string[]): string[] {
+  const urls: string[] = []
+  const command = args[0]
+  if (command === 'open' || command === 'goto' || command === 'navigate') {
+    const target = args.slice(1).find((token) => !token.startsWith('-'))
+    if (target) urls.push(target)
+  }
+  if (input.job) {
+    for (const step of input.job.steps) {
+      if (step.action === 'open' && step.url) urls.push(step.url)
+    }
+  }
+  if (input.qa?.url) urls.push(input.qa.url)
+  return urls
+}
+
+function dedupeRequests(requests: readonly ArtifactRequest[]): ArtifactRequest[] {
+  const seen = new Set<string>()
+  const out: ArtifactRequest[] = []
+  for (const request of requests) {
+    if (seen.has(request.requestedPath)) continue
+    seen.add(request.requestedPath)
+    out.push(request)
+  }
+  return out
+}
+
+function extractBatchRows(validated: ValidatedInput): string[][] {
+  if (!validated.generatedStdin) return []
   try {
     const parsed = JSON.parse(validated.generatedStdin)
     return Array.isArray(parsed) ? (parsed as string[][]) : []

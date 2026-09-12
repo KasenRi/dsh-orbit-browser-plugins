@@ -1,11 +1,24 @@
 import { compileSemanticAction } from './semantic.ts'
 import { compileJob, compileQa } from './job.ts'
+import { artifactRequestsFromCompiledSteps } from './artifacts.ts'
 import type { AgentBrowserInput, ValidatedInput } from './types.ts'
 
 export interface ValidationFailure {
   ok: false
   code: 'validation-error'
   message: string
+}
+
+/**
+ * Upstream agent-browser commands that consume caller stdin. Everything else
+ * rejects stdin so a secret payload can never be silently dropped or echoed.
+ */
+export function argsStdinAllowed(args: readonly string[]): boolean {
+  const [command, subcommand] = args
+  if (command === 'batch') return true
+  if (command === 'eval' && args.includes('--stdin')) return true
+  if (command === 'auth' && subcommand === 'save' && args.includes('--password-stdin')) return true
+  return false
 }
 
 export function validateInput(input: AgentBrowserInput): ValidatedInput | ValidationFailure {
@@ -37,17 +50,22 @@ export function validateInput(input: AgentBrowserInput): ValidatedInput | Valida
     if (!Array.isArray(input.args) || input.args.length === 0) {
       return { ok: false, code: 'validation-error', message: 'args must be a non-empty string array.' }
     }
-    if (input.stdin !== undefined) {
-      return { ok: false, code: 'validation-error', message: 'stdin is only supported when args is omitted and job/qa generate their own input.' }
+    if (input.stdin !== undefined && !argsStdinAllowed(input.args)) {
+      return {
+        ok: false,
+        code: 'validation-error',
+        message: 'stdin is only supported with batch, eval --stdin, or auth save --password-stdin.',
+      }
     }
     return {
       ok: true,
       kind: 'args',
       args: [...input.args],
+      ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
       sessionMode,
       ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
       ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
-      providesStdin: false,
+      providesStdin: input.stdin !== undefined,
     }
   }
 
@@ -81,6 +99,7 @@ export function validateInput(input: AgentBrowserInput): ValidatedInput | Valida
       generatedStdin: compiled.stdin,
       failFast: input.job.failFast !== false,
       sessionMode,
+      artifactRequests: artifactRequestsFromCompiledSteps(compiled.steps),
       ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
       ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
       providesStdin: true,
@@ -106,6 +125,7 @@ export function validateInput(input: AgentBrowserInput): ValidatedInput | Valida
     args: compiled.args,
     generatedStdin: compiled.stdin,
     sessionMode,
+    artifactRequests: artifactRequestsFromCompiledSteps(compiled.steps),
     ...(input.outputPath !== undefined ? { outputPath: input.outputPath } : {}),
     ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
     providesStdin: true,

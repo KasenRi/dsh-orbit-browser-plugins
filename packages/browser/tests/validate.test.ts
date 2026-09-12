@@ -60,3 +60,30 @@ test('compiles job into batch stdin', () => {
     ])
   }
 })
+
+test('args + stdin is accepted only for whitelisted upstream commands', () => {
+  const batch = validateInput({ args: ['batch'], stdin: '[]' })
+  assert.equal(batch.ok, true)
+  if (batch.ok) {
+    assert.equal(batch.stdin, '[]')
+    assert.equal(batch.providesStdin, true)
+  }
+  assert.equal(validateInput({ args: ['eval', '--stdin'], stdin: '1+1' }).ok, true)
+  assert.equal(validateInput({ args: ['auth', 'save', 'x', '--password-stdin'], stdin: 'pw' }).ok, true)
+  const rejected = validateInput({ args: ['open', 'https://example.com'], stdin: 'secret' })
+  assert.equal(rejected.ok, false)
+  if (!rejected.ok) assert.match(rejected.message, /stdin is only supported/)
+})
+
+test('job and qa carry artifact requests from compiled steps', () => {
+  const job = validateInput({
+    job: { steps: [{ action: 'open', url: 'https://example.com' }, { action: 'screenshot', path: '/tmp/job.png' }] },
+  })
+  assert.equal(job.ok, true)
+  if (job.ok) assert.deepEqual(job.artifactRequests, [{ requestedPath: '/tmp/job.png', kind: 'image' }])
+  assert.equal(job.ok && job.providesStdin, true)
+
+  const qa = validateInput({ qa: { url: 'https://example.com', screenshotPath: '/tmp/qa.png' } })
+  assert.equal(qa.ok, true)
+  if (qa.ok) assert.deepEqual(qa.artifactRequests, [{ requestedPath: '/tmp/qa.png', kind: 'image' }])
+})

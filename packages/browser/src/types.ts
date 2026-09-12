@@ -105,11 +105,15 @@ export interface ValidatedInput {
   kind: InputKind
   args: string[]
   generatedStdin?: string
+  /** Caller-provided stdin, only accepted for whitelisted upstream commands. */
+  stdin?: string
   failFast?: boolean
   sessionMode: SessionMode
   outputPath?: string
   timeoutMs?: number
   providesStdin: boolean
+  /** Artifact candidates discovered inside compiled job/qa batch steps. */
+  artifactRequests?: ArtifactRequest[]
 }
 
 export interface CliEnvelope {
@@ -124,6 +128,12 @@ export interface CommandResult {
   code: number
   timedOut: boolean
   killedBySignal: boolean
+}
+
+export interface ArtifactRequest {
+  requestedPath: string
+  kind: string
+  pending?: boolean
 }
 
 export interface ArtifactEntry {
@@ -181,4 +191,6 @@ export interface AgentBrowserResult {
   artifactVerification?: ArtifactVerification
   refSnapshot?: RefSnapshot
   fullOutputPath?: string
+  /** Absolute path written from `outputPath`, when requested and written successfully. */
+  outputFile?: string
 }

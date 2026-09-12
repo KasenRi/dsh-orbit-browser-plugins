@@ -1,5 +1,5 @@
 import { isAbsolute, resolve } from 'node:path'
-import type { ArtifactEntry, ArtifactVerification } from './types.ts'
+import type { ArtifactEntry, ArtifactRequest, ArtifactVerification } from './types.ts'
 
 export interface StatLike {
   isFile(): boolean
@@ -25,10 +25,20 @@ const EXTENSION_MEDIA_TYPES: Record<string, string> = {
   '.mp4': 'video/mp4',
 }
 
-export interface ArtifactRequest {
-  requestedPath: string
-  kind: string
-  pending?: boolean
+/** Pull artifact candidates out of compiler-produced batch steps. */
+export function artifactRequestsFromCompiledSteps(
+  steps: readonly { action: string; args: readonly string[] }[],
+): ArtifactRequest[] {
+  const requests: ArtifactRequest[] = []
+  const seen = new Set<string>()
+  for (const step of steps) {
+    for (const request of artifactRequestsFromArgs(step.args)) {
+      if (seen.has(request.requestedPath)) continue
+      seen.add(request.requestedPath)
+      requests.push(request)
+    }
+  }
+  return requests
 }
 
 export function mediaTypeForPath(path: string): string | undefined {

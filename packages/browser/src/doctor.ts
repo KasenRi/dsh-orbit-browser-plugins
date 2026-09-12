@@ -21,6 +21,7 @@ export interface DoctorOptions {
   env: NodeJS.ProcessEnv
   executor: CommandExecutor
   timeoutMs?: number
+  requiresAllowedDomains?: boolean
 }
 
 export function normalizeAgentBrowserVersion(raw: string): string | undefined {
@@ -82,6 +83,24 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     })
   } catch (error) {
     checks.push({ name: 'chromium', status: 'warn', detail: `agent-browser doctor failed: ${String(error)}` })
+  }
+
+  if (options.requiresAllowedDomains) {
+    try {
+      const help = await options.executor(options.executable, ['--help'], {
+        cwd: options.cwd,
+        timeoutMs: options.timeoutMs ?? 10_000,
+        env: options.env,
+      })
+      const supported = `${help.stdout}\n${help.stderr}`.includes('--allowed-domains')
+      checks.push({
+        name: 'allowed-domains-support',
+        status: supported ? 'pass' : 'fail',
+        detail: supported ? 'agent-browser advertises --allowed-domains' : 'allowedDomains is configured but the CLI does not advertise --allowed-domains',
+      })
+    } catch (error) {
+      checks.push({ name: 'allowed-domains-support', status: 'fail', detail: `could not probe --allowed-domains: ${String(error)}` })
+    }
   }
 
   return finalize(checks)

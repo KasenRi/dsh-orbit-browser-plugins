@@ -42,6 +42,7 @@ export class BrowserAutomationService extends Service {
       env: this.deps.env ?? process.env,
       executor: this.deps.executor ?? defaultCommandExecutor,
       ...(executable ? { executable } : {}),
+      requiresAllowedDomains: (this.config.allowedDomains ?? []).length > 0,
     })
   }
 

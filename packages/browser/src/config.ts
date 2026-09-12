@@ -1,6 +1,7 @@
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BrowserRunnerConfig } from './runner.ts'
+import { parseAllowedDomains } from './security.ts'
 
 export interface BrowserPluginConfig {
   command: string
@@ -31,7 +32,7 @@ export function resolveRunnerConfig(config: BrowserPluginConfig): BrowserRunnerC
     spillDir: config.spillDir ?? join(homedir(), '.dsh', 'browser-artifacts'),
     ...(config.namespace ? { namespace: config.namespace } : {}),
     ...(executablePath ? { executablePath } : {}),
-    allowedDomains: config.allowedDomains ?? [],
+    allowedDomains: parseAllowedDomains(config.allowedDomains ?? []),
   }
 }
 

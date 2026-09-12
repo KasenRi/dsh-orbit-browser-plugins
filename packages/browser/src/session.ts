@@ -8,6 +8,7 @@ export const DEFAULT_IMPLICIT_SESSION_IDLE_TIMEOUT_MS = 900_000
 export const DEFAULT_IMPLICIT_SESSION_CLOSE_TIMEOUT_MS = 5_000
 
 const LAUNCH_SCOPED_FLAGS = new Set([
+  '--allowed-domains',
   '--auto-connect',
   '--cdp',
   '--enable',
