@@ -21,7 +21,7 @@ const SENSITIVE_FLAG_VALUE = new Set([
 
 const SECRET_TEXT_PATTERNS: ReadonlyArray<RegExp> = [
   /(authorization\s*:\s*(?:bearer\s+)?)[^\s,;]+/gi,
-  /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|cookie|secret|private[_-]?key)\s*[=:]\s*)[^\s,;]+/gi,
+  /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|cookie|set-cookie|jwt|credential|password|passwd|secret|private[_-]?key)\s*[=:]\s*)[^\s,;]+/gi,
   /(\b(?:sk|pk|ghp|github_pat)_[A-Za-z0-9_-]{8,})/g,
   /(\bBearer\s+)[A-Za-z0-9._-]+/gi,
 ]

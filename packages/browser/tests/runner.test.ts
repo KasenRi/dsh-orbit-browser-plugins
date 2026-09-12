@@ -223,3 +223,136 @@ test('args + stdin is forwarded to the child process', async () => {
   assert.equal(result.resultCategory, 'success', result.detail)
   assert.equal(stdinSeen, '[["snapshot"]]')
 })
+
+function routedExecutor(handler: (args: readonly string[]) => unknown): { executor: CommandExecutor; argvSeen: string[][] } {
+  const argvSeen: string[][] = []
+  const executor: CommandExecutor = async (_command, args) => {
+    argvSeen.push([...args])
+    return { stdout: envelope(handler(args)), stderr: '', code: 0, timedOut: false, killedBySignal: false }
+  }
+  return { executor, argvSeen }
+}
+
+test('runner recovers a unique prior tab and reports recovery', async () => {
+  const { executor, argvSeen } = routedExecutor((args) => {
+    if (args.includes('open')) return { origin: 'https://a.test/', title: 'A' }
+    if (args.includes('get') && args.includes('url')) return { url: 'https://b.test/' }
+    if (args.includes('tab') && args.includes('list')) {
+      return {
+        tabs: [
+          { active: true, tabId: 't2', title: 'B', url: 'https://b.test/' },
+          { active: false, tabId: 't1', title: 'A', url: 'https://a.test/' },
+        ],
+      }
+    }
+    if (args.includes('tab') && args.includes('t1')) return { switched: true }
+    return {}
+  })
+  const runner = new BrowserRunner(config, { executor })
+  await runner.run({ args: ['open', 'https://a.test/'] }, context)
+  const drifted = await runner.run({ args: ['get', 'url'] }, context)
+
+  assert.equal(drifted.resultCategory, 'success', drifted.detail)
+  assert.equal(drifted.pageChangeSummary?.recoveryApplied, true)
+  assert.equal(drifted.pageChangeSummary?.changeType, 'recovery')
+  assert.deepEqual(drifted.nextActions, ['refresh-interactive-refs'])
+  assert.ok(argvSeen.some((argv) => argv.includes('tab') && argv.includes('list')))
+  assert.ok(argvSeen.some((argv) => argv.includes('t1')))
+})
+
+test('runner rejects ambiguous tab recovery and invalidates refs', async () => {
+  const executor = fakeExecutor((args) => {
+    if (args.includes('open')) return { stdout: envelope({ origin: 'https://a.test/', title: 'A' }) }
+    if (args.includes('snapshot')) {
+      return { stdout: envelope({ origin: 'https://a.test/', refs: { e1: { role: 'button', name: 'X' } }, snapshot: '- button "X" [ref=e1]' }) }
+    }
+    if (args.includes('get') && args.includes('url')) return { stdout: envelope({ url: 'https://b.test/' }) }
+    if (args.includes('tab') && args.includes('list')) return { stdout: envelope({ tabs: [{ active: true, tabId: 't9', url: 'https://b.test/' }] }) }
+    return { stdout: envelope({}) }
+  })
+  const runner = new BrowserRunner(config, { executor })
+  await runner.run({ args: ['open', 'https://a.test/'] }, context)
+  const snapshot = await runner.run({ args: ['snapshot', '-i'] }, context)
+  assert.equal(snapshot.resultCategory, 'success', snapshot.detail)
+  assert.ok(snapshot.refSnapshot, 'refs must be saved before the drift')
+
+  const drifted = await runner.run({ args: ['get', 'url'] }, context)
+  assert.equal(drifted.resultCategory, 'failure')
+  assert.equal(drifted.failureCategory, 'tab-drift')
+  assert.deepEqual(drifted.nextActions, ['list-tabs-for-tab-drift-recovery', 'refresh-interactive-refs'])
+
+  const click = await runner.run({ args: ['click', '@e1'] }, context)
+  assert.equal(click.failureCategory, 'stale-ref')
+})
+
+test('drifted snapshot refs are not adopted even after recovery', async () => {
+  const { executor } = routedExecutor((args) => {
+    if (args.includes('open')) return { origin: 'https://a.test/', title: 'A' }
+    if (args.includes('snapshot')) {
+      return { origin: 'https://b.test/', refs: { e1: { role: 'button', name: 'Drifted' } }, snapshot: '- button "Drifted" [ref=e1]' }
+    }
+    if (args.includes('tab') && args.includes('list')) return { tabs: [{ active: false, tabId: 't1', url: 'https://a.test/' }] }
+    if (args.includes('tab') && args.includes('t1')) return { switched: true }
+    return {}
+  })
+  const runner = new BrowserRunner(config, { executor })
+  await runner.run({ args: ['open', 'https://a.test/'] }, context)
+
+  const snapshot = await runner.run({ args: ['snapshot', '-i'] }, context)
+  assert.equal(snapshot.resultCategory, 'success', snapshot.detail)
+  assert.equal(snapshot.refSnapshot, undefined, 'drifted snapshot refs must not be adopted')
+  assert.equal(snapshot.pageChangeSummary?.recoveryApplied, true)
+
+  const click = await runner.run({ args: ['click', '@e1'] }, context)
+  assert.equal(click.failureCategory, 'stale-ref')
+})
+
+test('electron and raw connect are policy-blocked when allowedDomains is active', async () => {
+  let spawned = 0
+  const executor: CommandExecutor = async () => {
+    spawned += 1
+    return { stdout: envelope({}), stderr: '', code: 0, timedOut: false, killedBySignal: false }
+  }
+  const runner = new BrowserRunner({ ...config, allowedDomains: ['example.com'] }, { executor })
+
+  const electron = await runner.run({ electron: { action: 'connect', port: 9222 } }, context)
+  assert.equal(electron.failureCategory, 'policy-blocked')
+
+  const raw = await runner.run({ args: ['connect', '9222'] }, context)
+  assert.equal(raw.failureCategory, 'policy-blocked')
+
+  assert.equal(spawned, 0)
+})
+
+test('sourceLookup runner integration attaches bounded candidates', async () => {
+  const executor = fakeExecutor(() => ({
+    stdout: envelope([
+      { command: ['get', 'html', '#app'], success: true, result: '<div data-source-file="src/App.tsx:3:1"></div>' },
+    ]),
+  }))
+  const runner = new BrowserRunner(config, { executor })
+  const result = await runner.run({ sourceLookup: { selector: '#app' } }, context)
+  assert.equal(result.resultCategory, 'success', result.detail)
+  assert.equal(result.sourceLookup?.status, 'candidates-found')
+  assert.ok((result.sourceLookup?.candidates?.length ?? 0) >= 1)
+  assert.ok((result.sourceLookup?.candidates?.length ?? 0) <= 20)
+  assert.ok(!JSON.stringify(result).includes('undefined'))
+})
+
+test('networkSourceLookup runner integration attaches redacted failed requests', async () => {
+  const executor = fakeExecutor(() => ({
+    stdout: envelope([
+      {
+        command: ['network', 'requests'],
+        success: true,
+        result: { requests: [{ id: 'r1', url: 'https://api.test/fail?token=SUPERSECRET', status: 500, method: 'GET' }] },
+      },
+    ]),
+  }))
+  const runner = new BrowserRunner(config, { executor })
+  const result = await runner.run({ networkSourceLookup: { filter: '/fail' } }, context)
+  assert.equal(result.resultCategory, 'success', result.detail)
+  assert.equal(result.networkSourceLookup?.failedRequests?.length, 1)
+  assert.ok(!JSON.stringify(result).includes('SUPERSECRET'))
+  assert.ok(JSON.stringify(result).includes('[REDACTED]'))
+})

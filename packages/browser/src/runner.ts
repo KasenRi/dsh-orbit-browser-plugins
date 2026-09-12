@@ -5,6 +5,9 @@ import { dirname, isAbsolute as isAbsolutePath, resolve as resolvePath } from 'n
 import { buildArgv, defaultCommandExecutor, parseEnvelope, type CommandExecutor } from './cli.ts'
 import { artifactRequestsFromArgs, verifyArtifacts, type StatFn } from './artifacts.ts'
 import { checkBatchRefOrdering, checkRefSafety, parseSnapshotRefs } from './refs.ts'
+import { chooseRecoveryTab, detectTabDrift, parseTabList } from './tab-drift.ts'
+import { buildPageChangeSummary } from './page-change.ts'
+import { analyzeNetworkSourceLookup, analyzeSourceLookup } from './lookups.ts'
 import { findProtectedStateViolation, redactArgs, redactValue, sanitizeEnv, truncateSafe, checkAllowedDomains } from './security.ts'
 import { buildImplicitSessionName, decideSession, isManagedSessionName } from './session.ts'
 import { validateInput } from './validate.ts'
@@ -93,6 +96,16 @@ export class BrowserRunner {
     if (protectedViolation) return this.failure('policy-blocked', protectedViolation)
 
     const sessionState = this.sessions.get(implicitSessionName)
+
+    // A CDP-attached context (electron connect / raw connect) cannot install the
+    // upstream --allowed-domains containment, so it is refused when the allowlist
+    // is active. The allowlist is never silently downgraded.
+    if (this.config.allowedDomains.length > 0 && (validated.kind === 'electron' || args[0] === 'connect')) {
+      return this.failure(
+        'policy-blocked',
+        'allowedDomains containment cannot be installed on a CDP-attached session (electron/connect); remove allowedDomains or use a managed browser context.',
+      )
+    }
 
     // Known-URL preflight: fail before any browser request leaves the machine.
     if (this.config.allowedDomains.length > 0) {
@@ -186,18 +199,50 @@ export class BrowserRunner {
     }
 
     const state = this.ensureSession(implicitSessionName)
+    const previousTarget = { ...state.target }
+    const refsBefore = state.refSnapshot?.refIds.length
+    let observedTarget = extractObservedTarget(command, args, envelope.data)
+    let recoveryApplied = false
+
+    // Tab drift: the active target changed without an explicit navigation. Refs
+    // are invalidated immediately and we attempt exactly one deterministic
+    // recovery; ambiguity is a failure, never a guess.
+    const drift = detectTabDrift(previousTarget, observedTarget, command)
+    if (drift.drift) {
+      state.refSnapshot = undefined
+      const recoveryArgv = this.recoveryArgv(sessionName, args, ['tab', 'list'])
+      const recovered = recoveryArgv
+        ? await this.attemptTabRecovery(previousTarget, recoveryArgv, sessionName, args, context)
+        : false
+      if (!recovered) {
+        return this.failure(
+          'tab-drift',
+          `agent-browser detected tab drift (${drift.reason ?? 'target-changed'}) from ${previousTarget.url ?? 'unknown'} to ${observedTarget?.url ?? 'unknown'}; refs were invalidated and the intended tab could not be uniquely restored. Run tab list, re-select the intended tab, then snapshot -i.`,
+          ['list-tabs-for-tab-drift-recovery', 'refresh-interactive-refs'],
+        )
+      }
+      recoveryApplied = true
+      observedTarget = previousTarget
+    }
+
+    let refsRefreshed = false
     if (command === 'snapshot' && !args.includes('--diff')) {
-      const snapshot = parseSnapshotRefs(envelope.data)
+      const snapshot = drift.drift ? undefined : parseSnapshotRefs(envelope.data)
       if (snapshot) {
         state.refSnapshot = snapshot
-        state.target = { ...state.target, ...snapshot.target }
+        // Same-page snapshot: merge so an existing title survives (URL/title both optional).
+        state.target = { ...state.target, ...(observedTarget ?? snapshot.target) }
+        refsRefreshed = true
       }
     } else if (NAVIGATING_COMMANDS.has(command)) {
       const url = args.find((token) => /^https?:|^data:|^file:/.test(token))
       state.refSnapshot = undefined
-      state.target = { ...(url ? { url } : {}) }
+      state.target = { ...(observedTarget ?? (url ? { url } : {})) }
     } else if (command === 'tab' && args[1] === 'close') {
       state.refSnapshot = undefined
+      if (observedTarget) state.target = { ...state.target, ...observedTarget }
+    } else if (observedTarget) {
+      state.target = { ...state.target, ...observedTarget }
     }
 
     const categories: SuccessCategory = verification
@@ -214,6 +259,25 @@ export class BrowserRunner {
     if (domainViolation) return this.failure('policy-blocked', domainViolation.message)
     const output = this.boundOutput(command, redactedData)
 
+    const pageChangeSummary = buildPageChangeSummary({
+      command,
+      previousTarget,
+      currentTarget: state.target,
+      refsBefore,
+      refsAfter: state.refSnapshot?.refIds.length,
+      refsRefreshed,
+      artifactCount: verification?.artifacts.length ?? 0,
+      confirmationRequired: detectConfirmation(envelope.data),
+      recoveryApplied,
+    })
+
+    const lookup =
+      validated.lookup === undefined
+        ? undefined
+        : validated.lookup.kind === 'source'
+          ? await analyzeSourceLookup(envelope.data, validated.lookup.query, context.cwd)
+          : await analyzeNetworkSourceLookup(envelope.data, validated.lookup.query, context.cwd)
+
     const result: AgentBrowserResult = {
       resultCategory: 'success',
       successCategory: categories,
@@ -224,10 +288,13 @@ export class BrowserRunner {
       effectiveArgs: redactArgs(effectiveArgv),
       data: output.data,
       summary: summarize(command, envelope.data, usedImplicitSession ? implicitSessionName : sessionName),
-      nextActions: [],
+      nextActions: drift.drift ? ['refresh-interactive-refs'] : [],
       ...(verification ? { artifacts: verification.artifacts, artifactVerification: verification } : {}),
       ...(state.refSnapshot ? { refSnapshot: state.refSnapshot } : {}),
       ...(output.fullOutputPath ? { fullOutputPath: output.fullOutputPath } : {}),
+      ...(pageChangeSummary ? { pageChangeSummary } : {}),
+      ...(lookup && validated.lookup?.kind === 'source' ? { sourceLookup: lookup } : {}),
+      ...(lookup && validated.lookup?.kind === 'network' ? { networkSourceLookup: lookup } : {}),
     }
 
     if (validated.outputPath) {
@@ -236,6 +303,63 @@ export class BrowserRunner {
       result.outputFile = written.path
     }
     return result
+  }
+
+  private recoveryArgv(
+    sessionName: string | undefined,
+    originalArgs: readonly string[],
+    commandArgs: readonly string[],
+  ): string[] | undefined {
+    if (sessionName) {
+      return buildArgv({
+        args: [...commandArgs],
+        sessionName,
+        ...(this.config.namespace ? { namespace: this.config.namespace } : {}),
+      })
+    }
+    const explicitIndex = originalArgs.findIndex((token) => token === '--session' || token.startsWith('--session='))
+    if (explicitIndex >= 0) {
+      const explicit = originalArgs[explicitIndex] === '--session'
+        ? ['--session', originalArgs[explicitIndex + 1] ?? '']
+        : [originalArgs[explicitIndex] as string]
+      if (explicit[1] !== '' || explicit[0]?.includes('=')) {
+        return buildArgv({
+          args: [...explicit, ...commandArgs],
+          ...(this.config.namespace ? { namespace: this.config.namespace } : {}),
+        })
+      }
+    }
+    return undefined
+  }
+
+  private async attemptTabRecovery(
+    expected: { url?: string; title?: string },
+    listArgv: string[],
+    sessionName: string | undefined,
+    originalArgs: readonly string[],
+    context: RunContext,
+  ): Promise<boolean> {
+    const listed = await this.executor(this.config.command, listArgv, {
+      cwd: context.cwd,
+      timeoutMs: 10_000,
+      env: this.childEnv(),
+    })
+    if (listed.timedOut || listed.code !== 0) return false
+    const listedEnvelope = parseEnvelope(listed.stdout)
+    if ('error' in listedEnvelope || !listedEnvelope.success) return false
+    const tab = chooseRecoveryTab(expected, parseTabList(listedEnvelope.data))
+    if (!tab) return false
+
+    const selectArgv = this.recoveryArgv(sessionName, originalArgs, ['tab', tab.id])
+    if (!selectArgv) return false
+    const selected = await this.executor(this.config.command, selectArgv, {
+      cwd: context.cwd,
+      timeoutMs: 10_000,
+      env: this.childEnv(),
+    })
+    if (selected.timedOut || selected.code !== 0) return false
+    const selectedEnvelope = parseEnvelope(selected.stdout)
+    return !('error' in selectedEnvelope) && selectedEnvelope.success
   }
 
   /** Atomic 0600 write of the structured result; caller path is resolved from cwd. */
@@ -339,6 +463,49 @@ function extractObservedUrl(
     return args.find((token) => /^https?:|^data:|^file:/.test(token)) ?? sessionState?.target.url
   }
   return sessionState?.target.url
+}
+
+/** Extract the observed page target from a single envelope or a batch result array. */
+function extractObservedTarget(
+  command: string,
+  args: readonly string[],
+  data: unknown,
+): { url?: string; title?: string } | undefined {
+  const fromRecord = (value: unknown): { url?: string; title?: string } | undefined => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const record = value as Record<string, unknown>
+    const url = typeof record['origin'] === 'string' ? record['origin'] : typeof record['url'] === 'string' ? record['url'] : undefined
+    const title = typeof record['title'] === 'string' ? record['title'] : undefined
+    return url || title ? { ...(url ? { url } : {}), ...(title ? { title } : {}) } : undefined
+  }
+
+  const direct = fromRecord(data)
+  if (direct) return direct
+  if (Array.isArray(data)) {
+    for (let index = data.length - 1; index >= 0; index -= 1) {
+      const item = data[index]
+      if (item === null || typeof item !== 'object') continue
+      const result = (item as Record<string, unknown>)['result']
+      const payload = result !== null && typeof result === 'object' && 'data' in (result as Record<string, unknown>)
+        ? (result as Record<string, unknown>)['data']
+        : result
+      const found = fromRecord(payload)
+      if (found) return found
+    }
+  }
+  if (NAVIGATING_COMMANDS.has(command)) {
+    const url = args.find((token) => /^https?:|^data:|^file:/.test(token))
+    return url ? { url } : undefined
+  }
+  return undefined
+}
+
+function detectConfirmation(data: unknown): boolean {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) return false
+  const record = data as Record<string, unknown>
+  if (record['confirmationRequired'] === true) return true
+  if (typeof record['confirmation'] === 'string' && record['confirmation'].length > 0) return true
+  return record['status'] === 'confirmation-required'
 }
 
 /** URLs a single call is known to navigate to, for preflight containment. */
