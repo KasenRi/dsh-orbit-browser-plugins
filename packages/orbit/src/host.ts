@@ -1,3 +1,4 @@
+import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { OrbitRole, OrbitRoute, OrbitTelemetry } from './types.ts'
 
 export interface RoleToolFilter {
@@ -14,6 +15,12 @@ export interface RoleRunRequest {
   capabilities?: readonly string[]
   signal?: AbortSignal
   resumeOf?: string
+  /**
+   * DSH-native structured output request for one-shot decision roles
+   * (Commander/Watchdog). The provider validates the child's capture against
+   * this schema; the value arrives as {@link RoleRunResult.structured}.
+   */
+  outputSchema?: ObjectJsonSchema
 }
 
 export interface RoleRunResult {
@@ -22,6 +29,8 @@ export interface RoleRunResult {
   interrupted: boolean
   reason?: string
   capabilityUnavailable?: string
+  /** Validated structured capture when `outputSchema` was requested and satisfied. */
+  structured?: unknown
   telemetry?: OrbitTelemetry
   changedFiles?: string[]
   testSummary?: string[]

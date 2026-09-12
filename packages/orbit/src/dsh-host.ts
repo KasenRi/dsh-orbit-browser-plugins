@@ -12,7 +12,7 @@ import type { OrbitTelemetry } from './types.ts'
 interface SubagentRunLike {
   id: string
   localAgent?: Agent
-  result: Promise<{ output: ContentBlock[]; stopReason: string; diagnostic?: string }>
+  result: Promise<{ output: ContentBlock[]; stopReason: string; diagnostic?: string; structured?: unknown }>
   dispose(): Promise<void>
 }
 
@@ -114,6 +114,7 @@ export class DshOrbitHost implements OrbitHost {
       signal: controller.signal,
       agentOptions,
       ...(request.toolFilter ? { toolFilter: request.toolFilter } : {}),
+      ...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
     })) as unknown as SubagentRunLike
     this.registerChild(run.id, parent)
 
@@ -124,6 +125,7 @@ export class DshOrbitHost implements OrbitHost {
         interrupted: value.stopReason !== 'completed',
         ...(value.stopReason !== 'completed' ? { reason: value.stopReason } : {}),
         ...(value.diagnostic ? { testSummary: [value.diagnostic] } : {}),
+        ...(value.structured !== undefined ? { structured: value.structured } : {}),
       }))
       .catch((error: unknown) => ({
         childId: run.id,

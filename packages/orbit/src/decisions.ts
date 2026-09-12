@@ -1,3 +1,4 @@
+import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   MAX_PLAN_STEPS,
   MIN_PLAN_STEPS,
@@ -11,17 +12,141 @@ import {
   type GuardWatchdogDecision,
 } from './types.ts'
 
-export function parseJsonObject<T>(text: string, label: string): T {
-  const withoutFence = text.replace(/```(?:json)?/gi, '')
-  const start = withoutFence.indexOf('{')
-  const end = withoutFence.lastIndexOf('}')
-  if (start < 0 || end <= start) throw new Error(`${label}_OUTPUT_INVALID: no JSON object found`)
-  try {
-    return JSON.parse(withoutFence.slice(start, end + 1)) as T
-  } catch (error) {
-    throw new Error(`${label}_OUTPUT_INVALID: ${error instanceof Error ? error.message : String(error)}`)
-  }
+// ── DSH-native structured decision schemas ───────────────────────────────────
+//
+// The model submits its decision through the DSH structured-output protocol and
+// the provider validates it against one of these schemas. They are written in
+// the enforced JSON Schema subset (dsh-tools `assertObjectJsonSchema`), keep only
+// format-level rules (types, required fields, legal enums), and leave Orbit's
+// domain rules (plan size, correction depth, budget) to the checks below.
+
+const CAPABILITY_ENUM = ['browser', 'web-api-recon']
+
+/** Plan steps are object-rooted; capabilities stay optional per step. */
+export const COMMANDER_PLAN_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'steps'],
+  properties: {
+    summary: { type: 'string', description: 'One-sentence plan summary.' },
+    steps: {
+      type: 'array',
+      description: '2-5 logical engineering steps.',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['goal'],
+        properties: {
+          id: { type: 'string', description: 'Stable id such as P0.' },
+          goal: { type: 'string' },
+          capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+        },
+      },
+    },
+  },
 }
+
+export const COMMANDER_STEP_EVALUATE_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['PASS_CURRENT_STEP', 'CORRECT_CURRENT_STEP', 'NEEDS_USER'] },
+    reason: { type: 'string' },
+    next_step_goal: { type: 'string' },
+    next_step_capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+  },
+}
+
+export const COMMANDER_FINAL_EVALUATE_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['SUCCESS', 'APPEND', 'NEEDS_USER'] },
+    summary: { type: 'string' },
+    next_step_goal: { type: 'string' },
+    next_step_capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+    next_steps: {
+      type: 'array',
+      items: {
+        oneOf: [
+          { type: 'string' },
+          {
+            type: 'object',
+            additionalProperties: false,
+            required: ['goal'],
+            properties: {
+              goal: { type: 'string' },
+              capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+            },
+          },
+        ],
+      },
+    },
+  },
+}
+
+export const COMMANDER_STRATEGY_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['KEEP_APPROACH', 'REPLACE_CURRENT_STEP', 'NEEDS_USER'] },
+    reason: { type: 'string' },
+    replacement_goal: { type: 'string' },
+  },
+}
+
+export const WATCHDOG_RUNTIME_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['RESUME_CHILD', 'RESTART_STEP', 'NEEDS_USER', 'RUNTIME_BUG'] },
+    reason: { type: 'string' },
+  },
+}
+
+export const WATCHDOG_STRATEGY_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['question'],
+  properties: {
+    question: { type: 'string', description: 'The single strategy question to put to the Commander.' },
+  },
+}
+
+export const WATCHDOG_GUARD_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['RETRY_DIFFERENTLY', 'NEEDS_USER'] },
+    instruction: { type: 'string' },
+  },
+}
+
+export const WATCHDOG_TIMEOUT_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['EXTEND', 'INTERRUPT', 'NEEDS_USER'] },
+    reason: { type: 'string' },
+  },
+}
+
+export const ORBIT_DECISION_SCHEMAS = {
+  COMMANDER_PLAN_SCHEMA,
+  COMMANDER_STEP_EVALUATE_SCHEMA,
+  COMMANDER_FINAL_EVALUATE_SCHEMA,
+  COMMANDER_STRATEGY_SCHEMA,
+  WATCHDOG_RUNTIME_SCHEMA,
+  WATCHDOG_STRATEGY_SCHEMA,
+  WATCHDOG_GUARD_SCHEMA,
+  WATCHDOG_TIMEOUT_SCHEMA,
+} as const
 
 const STEP_CAPABILITIES = new Set<string>(['browser', 'web-api-recon'])
 

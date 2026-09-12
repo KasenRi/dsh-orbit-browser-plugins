@@ -29,18 +29,18 @@ function make(host: FakeHost, dir: string): OrbitSupervisor {
 }
 
 const plan = (steps: Array<{ id: string; goal: string; capabilities?: string[] }>, summary = 'plan') =>
-  JSON.stringify({ summary, steps })
+  ({ summary, steps })
 
-const commander = (decision: Record<string, unknown>) => JSON.stringify(decision)
+const commander = (decision: Record<string, unknown>) => decision
 
 test('PLAN -> EXECUTE -> EVALUATE -> SUCCESS', async () => {
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'do a' }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: plan([{ id: 'P1', goal: 'do a' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'did a', childId: 'e1' }])
   const result = await make(host, dir).bootstrap({ goal: 'ship feature', approved_loop_count: 5 })
@@ -54,7 +54,7 @@ test('STEP_EVALUATE rejects SUCCESS as a recoverable interruption', async () => 
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host
-    .script('commander', [{ output: plan([{ id: 'P1', goal: 'a' }]) }, { output: commander({ decision: 'SUCCESS' }) }])
+    .script('commander', [{ structured: plan([{ id: 'P1', goal: 'a' }]) }, { structured: commander({ decision: 'SUCCESS' }) }])
     .script('executor', [{ output: 'done', childId: 'e1' }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(result.ok, false)
@@ -68,9 +68,9 @@ test('FINAL_EVALUATE rejects PASS_CURRENT_STEP as a recoverable interruption', a
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -84,14 +84,14 @@ test('bounded corrections reach CORRECTION_LIMIT_REACHED', async () => {
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
-      { output: commander({ decision: 'KEEP_APPROACH' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix3' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+      { structured: commander({ decision: 'KEEP_APPROACH' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix3' }) },
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }, { output: 'e', childId: 'e3' }])
-    .script('watchdog', [{ output: commander({ question: 'simpler route?' }) }])
+    .script('watchdog', [{ structured: commander({ question: 'simpler route?' }) }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 10 })
   assert.equal(result.phase, 'NEEDS_USER')
   assert.equal(result.data?.['last_error'], 'CORRECTION_LIMIT_REACHED')
@@ -107,9 +107,9 @@ test('loop budget reservation protects later steps', async () => {
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }, { id: 'P2', goal: 'b' }, { id: 'P3', goal: 'c' }, { id: 'P4', goal: 'd' }]) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }, { id: 'P2', goal: 'b' }, { id: 'P3', goal: 'c' }, { id: 'P4', goal: 'd' }]) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -122,14 +122,14 @@ test('strategy REPLACE_CURRENT_STEP replaces goal', async () => {
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
-      { output: commander({ decision: 'REPLACE_CURRENT_STEP', replacement_goal: 'alt route' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix3' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+      { structured: commander({ decision: 'REPLACE_CURRENT_STEP', replacement_goal: 'alt route' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix3' }) },
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }, { output: 'e', childId: 'e3' }])
-    .script('watchdog', [{ output: commander({ question: 'is this tunnel vision?' }) }])
+    .script('watchdog', [{ structured: commander({ question: 'is this tunnel vision?' }) }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 10 })
   const steps = (result.data?.['plan'] as { steps: Array<{ id: string; goal: string }> }).steps
   assert.equal(steps.find((step) => step.id === 'P1-3')?.goal, 'alt route')
@@ -141,15 +141,15 @@ test('runtime watchdog RESUME_CHILD resumes the same child', async () => {
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [
       { output: '', interrupted: true, reason: 'timed-out', childId: 'exec-1' },
       { output: 'recovered', childId: 'exec-1' },
     ])
-    .script('watchdog', [{ output: commander({ decision: 'RESUME_CHILD' }) }])
+    .script('watchdog', [{ structured: commander({ decision: 'RESUME_CHILD' }) }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   const executors = host.scriptsFor('executor')
   assert.equal(executors.length, 2)
@@ -163,15 +163,15 @@ test('runtime watchdog RESTART_STEP interrupts the old child first', async () =>
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [
       { output: '', interrupted: true, reason: 'child anomaly', childId: 'exec-1' },
       { output: 'fresh', childId: 'exec-2' },
     ])
-    .script('watchdog', [{ output: commander({ decision: 'RESTART_STEP' }) }])
+    .script('watchdog', [{ structured: commander({ decision: 'RESTART_STEP' }) }])
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.ok(host.interruptCalls.some((call) => call.childId === 'exec-1' && call.reason === 'ORBIT_RESTART_STEP'))
   const executors = host.scriptsFor('executor')
@@ -183,13 +183,13 @@ test('runtime watchdog caps at two calls per step', async () => {
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host
-    .script('commander', [{ output: plan([{ id: 'P1', goal: 'a' }]) }])
+    .script('commander', [{ structured: plan([{ id: 'P1', goal: 'a' }]) }])
     .script('executor', [
       { output: '', interrupted: true, reason: 'r1' },
       { output: '', interrupted: true, reason: 'r2' },
       { output: '', interrupted: true, reason: 'r3' },
     ])
-    .script('watchdog', [{ output: commander({ decision: 'RESUME_CHILD' }) }, { output: commander({ decision: 'RESUME_CHILD' }) }])
+    .script('watchdog', [{ structured: commander({ decision: 'RESUME_CHILD' }) }, { structured: commander({ decision: 'RESUME_CHILD' }) }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(result.phase, 'NEEDS_USER')
   assert.equal(host.scriptsFor('watchdog').length, 2)
@@ -202,15 +202,15 @@ test('commander adaptive timeout reviews then hard ceiling cancels the same chil
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
       { pending: true, childId: 'cmd-1' },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
     .script('watchdog', [
-      { output: commander({ decision: 'EXTEND' }) },
-      { output: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
     ])
   const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -233,10 +233,10 @@ test('commander timeout watchdog unavailable: EXTEND then INTERRUPT', async () =
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
       { pending: true, childId: 'cmd-1' },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
   const supervisor = new OrbitSupervisor(store, host, config)
@@ -266,8 +266,8 @@ test('recoverable guard escalation: block_continue -> watchdog -> needs_user', a
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host.script('watchdog', [
-    { output: commander({ decision: 'RETRY_DIFFERENTLY', instruction: 'try another way' }) },
-    { output: commander({ decision: 'NEEDS_USER' }) },
+    { structured: commander({ decision: 'RETRY_DIFFERENTLY', instruction: 'try another way' }) },
+    { structured: commander({ decision: 'NEEDS_USER' }) },
   ])
   const supervisor = make(host, dir)
   const state = supervisor.createState({ goal: 'x', approved_loop_count: 5 })
@@ -304,10 +304,10 @@ test('browser capability scopes the executor tool filter', async () => {
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'code' }, { id: 'P2', goal: 'verify page', capabilities: ['browser'] }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: plan([{ id: 'P1', goal: 'code' }, { id: 'P2', goal: 'verify page', capabilities: ['browser'] }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'a', childId: 'e1' }, { output: 'b', childId: 'e2' }])
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -327,8 +327,8 @@ test('browser capability unavailable routes to Commander without executing', asy
   host.tools.delete('agent_browser')
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'verify page', capabilities: ['browser'] }]) },
-      { output: commander({ decision: 'NEEDS_USER' }) },
+      { structured: plan([{ id: 'P1', goal: 'verify page', capabilities: ['browser'] }]) },
+      { structured: commander({ decision: 'NEEDS_USER' }) },
     ])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(result.phase, 'NEEDS_USER')
@@ -341,9 +341,9 @@ test('ordinary Executor scope excludes driver and browser tools, allows writers'
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'code' }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { output: commander({ decision: 'SUCCESS' }) },
+      { structured: plan([{ id: 'P1', goal: 'code' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'a', childId: 'e1' }])
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -365,8 +365,8 @@ test('PLAN also runs under the adaptive Commander timeout', async () => {
   host
     .script('commander', [{ pending: true, childId: 'cmd-plan' }])
     .script('watchdog', [
-      { output: commander({ decision: 'EXTEND' }) },
-      { output: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
     ])
   const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -383,14 +383,14 @@ test('FINAL_EVALUATE also runs under the adaptive Commander timeout', async () =
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
       { pending: true, childId: 'cmd-final' },
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
     .script('watchdog', [
-      { output: commander({ decision: 'EXTEND' }) },
-      { output: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
     ])
   const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
@@ -408,16 +408,16 @@ test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays re
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
       { pending: true, childId: 'cmd-strategy' },
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }])
     .script('watchdog', [
-      { output: commander({ question: 'simpler route?' }) },
-      { output: commander({ decision: 'EXTEND' }) },
-      { output: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ question: 'simpler route?' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
+      { structured: commander({ decision: 'EXTEND' }) },
     ])
   const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 10 })
@@ -429,15 +429,28 @@ test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays re
   cleanup()
 })
 
+test('a completed Commander without a structured capture fails loud', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  // A text-only completion is not a substitute for the requested capture.
+  host.script('commander', [{ output: '{"summary":"plan","steps":[]}' }])
+  const supervisor = new OrbitSupervisor(store, host, config)
+  const result = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  assert.equal(result.ok, false)
+  assert.match(String(store.readState()?.last_error), /PLAN_STRUCTURED_OUTPUT_MISSING/)
+  cleanup()
+})
+
 test('temporary strategy watchdog failure does not consume the challenge', async () => {
   const { dir, cleanup } = project()
   const store = new OrbitStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
-      { output: plan([{ id: 'P1', goal: 'a' }]) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
-      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
     ])
     .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }])
   // No watchdog script: the strategy challenge is temporarily unavailable.

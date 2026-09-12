@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   assertCommanderDecision,
   assertStrategyDecision,
@@ -7,11 +8,18 @@ import {
   assertWatchdogDecision,
   assertGuardWatchdogDecision,
   baseStepIdOf,
+  COMMANDER_FINAL_EVALUATE_SCHEMA,
+  COMMANDER_PLAN_SCHEMA,
+  COMMANDER_STEP_EVALUATE_SCHEMA,
+  COMMANDER_STRATEGY_SCHEMA,
   correctionDepthOf,
   isBaseStepId,
   normalizeCapabilities,
   normalizePlan,
-  parseJsonObject,
+  WATCHDOG_GUARD_SCHEMA,
+  WATCHDOG_RUNTIME_SCHEMA,
+  WATCHDOG_STRATEGY_SCHEMA,
+  WATCHDOG_TIMEOUT_SCHEMA,
   type EvaluationMode,
 } from './decisions.ts'
 import type { OrbitHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
@@ -76,7 +84,7 @@ export interface GuardBlockOutcome {
 }
 
 type SupervisedResult =
-  | { kind: 'output'; output: string }
+  | { kind: 'output'; output: string; structured: unknown }
   | { kind: 'interrupted'; reason: string }
   | { kind: 'needs_user'; reason: string }
 
@@ -92,11 +100,13 @@ interface AuxRoleRequest {
   prompt: string
   signal?: AbortSignal
   timeoutMs?: number
+  /** One-shot decision roles submit their answer through this DSH schema. */
+  outputSchema?: ObjectJsonSchema
 }
 
 const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[]) => `You are the Orbit Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
-Return ONLY JSON: {"summary":"...","steps":[{"id":"P0","goal":"...","capabilities":[]}]}
 Rules: ordinary engineering steps must omit capabilities. Add capability "browser" only when the step must drive a real web page, and "web-api-recon" when it must analyze captured network/API traffic. Keep it minimal.
+Submit your final plan through the structured result protocol.
 Goal: ${goal}
 Hard constraints: ${constraints.join('; ') || 'none'}`
 
@@ -105,33 +115,33 @@ const COMMANDER_STEP_PROMPT = (
   step: OrbitPlanStep,
   evidence: string,
   state: OrbitState,
-) => `You are the Orbit Commander doing STEP_EVALUATE. Verify the real project state; do not trust the Executor summary blindly.
+) => `You are the Orbit Commander doing STEP_EVALUATE. Verify the real project state; do not trust the Executor claim alone. Treat verified execution evidence as authoritative.
 Allowed decisions ONLY: PASS_CURRENT_STEP | CORRECT_CURRENT_STEP | NEEDS_USER.
-- CORRECT_CURRENT_STEP requires next_step_goal (optional next_step_capabilities).
-Return ONLY JSON: {"decision":"...","reason":"...","next_step_goal":"...","next_step_capabilities":[]}
+- CORRECT_CURRENT_STEP requires a concrete next step goal (optional capabilities).
+Submit your final judgment through the structured result protocol.
 Original goal: ${goal}
 Current step ${step.id}: ${step.goal}
 Iteration counters: loop ${state.loop.used}/${state.loop.max}
-Executor evidence:
+Executor claim:
 ${evidence}`
 
 const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence: string, state: OrbitState) =>
   `You are the Orbit Commander doing FINAL_EVALUATE. All planned steps are done. Decide whether the original goal is truly satisfied against the real project state.
 Allowed decisions ONLY: SUCCESS | APPEND | NEEDS_USER.
-- APPEND requires next_steps (array) or next_step_goal; appends are bounded by the remaining loop budget.
-Return ONLY JSON: {"decision":"...","summary":"...","next_steps":[{"goal":"...","capabilities":[]}]}
+- APPEND requires next steps or a next step goal; appends are bounded by the remaining loop budget.
+Submit your final judgment through the structured result protocol.
 Original goal: ${goal}
 Plan summary: ${plan.summary}
 Steps: ${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}]`).join('; ')}
 Loop: ${state.loop.used}/${state.loop.max}
-Evidence:
+Executor claim:
 ${evidence}`
 
 const COMMANDER_STRATEGY_PROMPT = (goal: string, base: string, challenge: string, state: OrbitState) =>
   `You are the Orbit Commander reconsidering strategy after a repeated correction on ${base} (STRATEGY_RECONSIDER).
 Allowed decisions ONLY: KEEP_APPROACH | REPLACE_CURRENT_STEP | NEEDS_USER.
-- REPLACE_CURRENT_STEP requires replacement_goal.
-Return ONLY JSON: {"decision":"...","reason":"...","replacement_goal":"..."}
+- REPLACE_CURRENT_STEP requires a replacement goal.
+Submit your final judgment through the structured result protocol.
 Goal: ${goal}
 Loop: ${state.loop.used}/${state.loop.max}
 Watchdog challenge: ${challenge}`
@@ -139,14 +149,14 @@ Watchdog challenge: ${challenge}`
 const WATCHDOG_RUNTIME_PROMPT = (step: OrbitPlanStep, reason: string, telemetry: OrbitTelemetry | undefined) =>
   `You are the Orbit Smart Watchdog doing RUNTIME_DIAGNOSE. Diagnose only the current runtime anomaly. Do not review code quality.
 Allowed decisions ONLY: RESUME_CHILD | RESTART_STEP | NEEDS_USER | RUNTIME_BUG.
-Return ONLY JSON: {"decision":"...","reason":"..."}
+Submit your final judgment through the structured result protocol.
 Failed step ${step.id}: ${step.goal}
 Runtime anomaly: ${reason}
 Telemetry: ${JSON.stringify(telemetry ?? {})}`
 
 const WATCHDOG_STRATEGY_PROMPT = (step: OrbitPlanStep, reason: string, state: OrbitState) =>
   `You are the Orbit Smart Watchdog doing STRATEGY_CHALLENGE. Ask: is the current approach tunnel vision? Is this blocker truly required? Is there a simpler route?
-Return ONLY JSON: {"question":"..."}
+Submit one focused challenge question through the structured result protocol.
 Step ${step.id}: ${step.goal}
 Repeated correction: ${reason}
 Loop: ${state.loop.used}/${state.loop.max}`
@@ -154,14 +164,14 @@ Loop: ${state.loop.used}/${state.loop.max}`
 const WATCHDOG_GUARD_PROMPT = (code: GuardCode, count: number, stepId: string) =>
   `You are the Orbit Smart Watchdog doing GUARD_ESCALATION. A safety guard blocked a tool ${count} times.
 Allowed decisions ONLY: RETRY_DIFFERENTLY | NEEDS_USER.
-Return ONLY JSON: {"decision":"...","instruction":"..."}
+Submit your final judgment through the structured result protocol.
 Guard code: ${code}
 Step: ${stepId}`
 
 const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extensions: number, telemetry: OrbitTelemetry | undefined) =>
   `You are the Orbit Smart Watchdog doing COMMANDER_TIMEOUT_REVIEW. The Commander has run ${elapsed}ms with ${extensions} extension(s).
 Allowed decisions ONLY: EXTEND | INTERRUPT | NEEDS_USER.
-Return ONLY JSON: {"decision":"...","reason":"..."}
+Submit your final judgment through the structured result protocol.
 Mode: ${mode}
 Telemetry: ${JSON.stringify(telemetry ?? {})}`
 
@@ -366,6 +376,7 @@ export class OrbitSupervisor {
       state,
       'PLAN',
       COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints),
+      COMMANDER_PLAN_SCHEMA,
       signal,
     )
     if (outcome.kind === 'needs_user') return this.setNeedsUser(state, outcome.reason)
@@ -377,7 +388,7 @@ export class OrbitSupervisor {
       return this.result(state, false, outcome.reason)
     }
     try {
-      const plan = normalizePlan(parseJsonObject<{ summary?: unknown; steps?: unknown }>(outcome.output, 'COMMANDER_PLAN'))
+      const plan = normalizePlan(outcome.structured as { summary?: unknown; steps?: unknown })
       state.plan = plan
       state.phase = 'EXECUTE'
       state.status = 'running'
@@ -404,12 +415,18 @@ export class OrbitSupervisor {
     const prompt = final
       ? COMMANDER_FINAL_PROMPT(state.goal, state.plan, evidence, state)
       : COMMANDER_STEP_PROMPT(state.goal, step as OrbitPlanStep, evidence, state)
-    const outcome = await this.runCommander(state, mode, prompt, signal)
+    const outcome = await this.runCommander(
+      state,
+      mode,
+      prompt,
+      final ? COMMANDER_FINAL_EVALUATE_SCHEMA : COMMANDER_STEP_EVALUATE_SCHEMA,
+      signal,
+    )
     if (outcome.kind === 'needs_user') return { kind: 'needs_user', reason: outcome.reason }
     if (outcome.kind === 'interrupted') return { kind: 'interrupted', reason: outcome.reason }
     try {
-      const decision = parseJsonObject<CommanderDecision>(outcome.output, 'COMMANDER_EVALUATION')
-      return { kind: 'decision', decision: assertCommanderDecision(decision, mode) }
+      const decision = assertCommanderDecision(outcome.structured as CommanderDecision, mode)
+      return { kind: 'decision', decision }
     } catch (error) {
       // Invalid/temporary output is recoverable; it must not become NEEDS_USER.
       return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
@@ -419,12 +436,14 @@ export class OrbitSupervisor {
   /**
    * The single adaptive Commander runner for PLAN, STEP_EVALUATE, FINAL_EVALUATE
    * and STRATEGY_RECONSIDER. 360s/600s soft reviews, 840s deterministic ceiling;
-   * EXTEND always keeps the same child.
+   * EXTEND always keeps the same child. Decisions arrive as DSH-native
+   * structured results; a requested schema without a capture is a failure.
    */
   private async runCommander(
     state: OrbitState,
     mode: CommanderMode,
     prompt: string,
+    outputSchema: ObjectJsonSchema,
     signal?: AbortSignal,
   ): Promise<SupervisedResult> {
     const startedAt = this.now()
@@ -436,6 +455,7 @@ export class OrbitSupervisor {
         prompt,
         route: state.routes.commander,
         toolFilter: this.toolAllow(this.config.commanderReadOnlyTools, `commander ${mode}`),
+        outputSchema,
         ...(signal ? { signal } : {}),
       })
     } catch (error) {
@@ -454,7 +474,10 @@ export class OrbitSupervisor {
         const raced = await this.raceWithSleep(handle.result, remaining, signal)
         if (raced.kind === 'work') {
           if (raced.value.interrupted) return { kind: 'interrupted', reason: raced.value.reason ?? `${mode}_INTERRUPTED` }
-          return { kind: 'output', output: raced.value.output }
+          if (raced.value.structured === undefined) {
+            return { kind: 'interrupted', reason: `${mode}_STRUCTURED_OUTPUT_MISSING` }
+          }
+          return { kind: 'output', output: raced.value.output, structured: raced.value.structured }
         }
         if (raced.kind === 'aborted' || signal?.aborted) {
           await this.cancelHandle(handle, 'ORBIT_ABORTED')
@@ -492,13 +515,14 @@ export class OrbitSupervisor {
       role: 'watchdog',
       label: 'watchdog-commander-timeout',
       prompt: WATCHDOG_TIMEOUT_PROMPT(mode, elapsed, extensions, telemetry),
+      outputSchema: WATCHDOG_TIMEOUT_SCHEMA,
       ...(signal ? { signal } : {}),
     })
     if (!result || result.interrupted) {
       return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog unavailable' }
     }
     try {
-      return assertTimeoutDecision(parseJsonObject<TimeoutDecision>(result.output, 'COMMANDER_TIMEOUT_WATCHDOG'))
+      return assertTimeoutDecision(result.structured as TimeoutDecision)
     } catch {
       return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog invalid output' }
     }
@@ -817,30 +841,30 @@ export class OrbitSupervisor {
       role: 'watchdog',
       label: 'watchdog-strategy',
       prompt: WATCHDOG_STRATEGY_PROMPT(step, reason, state),
+      outputSchema: WATCHDOG_STRATEGY_SCHEMA,
       ...(signal ? { signal } : {}),
     })
     if (!challengeResult || challengeResult.interrupted) {
       return { kind: 'interrupted', reason: 'SMART_WATCHDOG_UNAVAILABLE' }
     }
-    let challenge = ''
-    try {
-      const parsed = parseJsonObject<{ question?: unknown }>(challengeResult.output, 'SMART_WATCHDOG_STRATEGY')
-      challenge = String(parsed.question ?? '').trim()
-    } catch (error) {
-      return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+    if (challengeResult.structured === undefined) {
+      return { kind: 'interrupted', reason: 'SMART_WATCHDOG_STRATEGY_STRUCTURED_OUTPUT_MISSING' }
     }
+    const challengeValue = challengeResult.structured as { question?: unknown }
+    const challenge = typeof challengeValue.question === 'string' ? challengeValue.question.trim() : ''
     if (!challenge) return { kind: 'interrupted', reason: 'SMART_WATCHDOG_STRATEGY_OUTPUT_INVALID: question is required' }
 
     const outcome = await this.runCommander(
       state,
       'STRATEGY_RECONSIDER',
       COMMANDER_STRATEGY_PROMPT(state.goal, base, challenge, state),
+      COMMANDER_STRATEGY_SCHEMA,
       signal,
     )
     if (outcome.kind === 'needs_user') return { kind: 'needs_user', reason: outcome.reason }
     if (outcome.kind === 'interrupted') return { kind: 'interrupted', reason: outcome.reason }
     try {
-      const decision = assertStrategyDecision(parseJsonObject<StrategyDecision>(outcome.output, 'COMMANDER_STRATEGY'))
+      const decision = assertStrategyDecision(outcome.structured as StrategyDecision)
       if (decision.decision === 'NEEDS_USER') return { kind: 'needs_user', reason: decision.reason ?? 'COMMANDER_STRATEGY_NEEDS_USER' }
       state.strategy_challenge = { base_step_id: base, used: true }
       if (decision.decision === 'REPLACE_CURRENT_STEP') return { kind: 'replace', replacementGoal: decision.replacement_goal as string }
@@ -875,6 +899,7 @@ export class OrbitSupervisor {
       role: 'watchdog',
       label: 'watchdog-runtime',
       prompt: WATCHDOG_RUNTIME_PROMPT(step, result.reason ?? 'runtime failure', result.telemetry),
+      outputSchema: WATCHDOG_RUNTIME_SCHEMA,
       ...(signal ? { signal } : {}),
     })
     if (!watchdogResult || watchdogResult.interrupted) {
@@ -885,7 +910,7 @@ export class OrbitSupervisor {
 
     let diagnosis: WatchdogDecision
     try {
-      diagnosis = assertWatchdogDecision(parseJsonObject<WatchdogDecision>(watchdogResult.output, 'SMART_WATCHDOG_RUNTIME'))
+      diagnosis = assertWatchdogDecision(watchdogResult.structured as WatchdogDecision)
     } catch {
       state.smart_watchdog.last_decision = 'UNAVAILABLE'
       this.store.writeState(state)
@@ -935,10 +960,11 @@ export class OrbitSupervisor {
       role: 'watchdog',
       label: 'watchdog-guard',
       prompt: WATCHDOG_GUARD_PROMPT(code, count, state.current_step?.id ?? ''),
+      outputSchema: WATCHDOG_GUARD_SCHEMA,
     })
     if (!result || result.interrupted) return this.guardWatchdogFallback(count)
     try {
-      return assertGuardWatchdogDecision(parseJsonObject<GuardWatchdogDecision>(result.output, 'SMART_WATCHDOG_GUARD'))
+      return assertGuardWatchdogDecision(result.structured as GuardWatchdogDecision)
     } catch {
       return this.guardWatchdogFallback(count)
     }
@@ -974,6 +1000,7 @@ export class OrbitSupervisor {
         prompt: request.prompt,
         route: state.routes[request.role],
         toolFilter: this.toolAllow(names, request.role),
+        ...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
         ...(request.signal ? { signal: request.signal } : {}),
       })
       const timeoutMs = request.timeoutMs ?? this.config.watchdogTimeoutMs ?? WATCHDOG_TIMEOUT_MS

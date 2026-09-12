@@ -3,6 +3,7 @@ import type { OrbitTelemetry } from '../../src/types.ts'
 
 export interface RoleScript {
   output?: string
+  structured?: unknown
   interrupted?: boolean
   reason?: string
   childId?: string
@@ -75,6 +76,7 @@ export class FakeHost implements OrbitHost {
             childId,
             output: script.output ?? '',
             interrupted: script.interrupted === true,
+            ...(script.structured !== undefined ? { structured: script.structured } : {}),
             ...(script.reason ? { reason: script.reason } : {}),
             ...(script.changedFiles ? { changedFiles: script.changedFiles } : {}),
             ...(script.testSummary ? { testSummary: script.testSummary } : {}),

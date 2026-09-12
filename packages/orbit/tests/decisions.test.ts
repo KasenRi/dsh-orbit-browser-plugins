@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   assertCommanderDecision,
   assertGuardWatchdogDecision,
@@ -10,16 +11,13 @@ import {
   correctionDepthOf,
   normalizeCapabilities,
   normalizePlan,
-  parseJsonObject,
+  ORBIT_DECISION_SCHEMAS,
 } from '../src/decisions.ts'
 
-test('parses JSON inside code fences', () => {
-  const parsed = parseJsonObject<{ a: number }>('here\n```json\n{"a":1}\n```\ntrailing', 'X')
-  assert.equal(parsed.a, 1)
-})
-
-test('rejects non-JSON output with a labeled error', () => {
-  assert.throws(() => parseJsonObject('no json', 'COMMANDER_PLAN'), /COMMANDER_PLAN_OUTPUT_INVALID/)
+test('every decision schema is inside the enforced DSH subset', () => {
+  for (const [name, schema] of Object.entries(ORBIT_DECISION_SCHEMAS)) {
+    assert.doesNotThrow(() => assertObjectJsonSchema(schema), `${name} must be a valid ObjectJsonSchema`)
+  }
 })
 
 test('normalizes plan steps and capabilities', () => {
