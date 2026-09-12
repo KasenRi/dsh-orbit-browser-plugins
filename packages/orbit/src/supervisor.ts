@@ -20,16 +20,34 @@ import {
 } from './decisions.ts'
 import type { OrbitHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
 import {
+  applyCommanderNeedsUser,
+  applyCorrectionStep,
+  applyExecutorCapabilityUnavailable,
+  applyExecutorInterrupted,
+  applyExecutorResume,
+  applyExecutorSuccess,
+  applyFinalAppend,
+  applyFinalSuccess,
+  applyPlan,
+  applyStepPass,
   baseStepIdOf,
+  beginStep,
+  clearExecutorChild,
+  clearGuardRecovery,
   correctionBlockCode,
   correctionDepthOf,
-  estimateLoopCount,
-  explicitLoopBudget,
-  hashGoal,
-  isBaseStepId,
-  normalizeAppend,
-  normalizeCapabilities,
+  createInitialState,
+  enterBudgetExhausted,
+  enterNeedsUser,
+  markStrategyChallengeUsed,
   normalizePlan,
+  openWatchdogAttempt,
+  recordGuardRecovery,
+  recordPlanFailure,
+  recordWatchdogDecision,
+  restoreEvaluationState,
+  resumeFromNeedsUser,
+  stopRun,
 } from './kernel.ts'
 import { truncateSafe } from './sanitize.ts'
 import { OrbitStateStore } from './state-store.ts'
@@ -205,34 +223,17 @@ export class OrbitSupervisor {
   }
 
   createState(input: OrbitRunInput): OrbitState {
-    const runId = typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID()
-    const max = explicitLoopBudget(input) ?? estimateLoopCount(input.goal ?? '')
-    const goal = (input.goal ?? '').trim()
-    return {
-      schema_version: 2,
-      active_run_id: runId,
-      run_id: runId,
-      phase: 'PLAN',
-      status: 'running',
-      driver_ownership: 'ACTIVE',
-      state_revision: 0,
-      updated_at: new Date(this.now()).toISOString(),
-      goal,
-      goal_hash: hashGoal(goal),
-      preset: input.preset ?? 'orbit-lite',
+    return createInitialState({
+      runId: typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID(),
+      now: this.now(),
+      goal: (input.goal ?? '').trim(),
+      ...(input.preset !== undefined ? { preset: input.preset } : {}),
       routes: this.config.defaultRoutes,
-      loop: { used: 0, max },
-      approved_loop_count: max,
-      remaining_budget: max,
-      loop_count: 0,
-      plan: { summary: '', steps: [] },
-      changed_files: [],
-      test_summary: [],
-      last_error: null,
-      user_hard_constraints: input.user_hard_constraints ? [...input.user_hard_constraints] : [],
-      github_allowed: input.github_allowed === true,
-      interruption_retries: 0,
-    }
+      ...(input.approved_loop_count !== undefined ? { approvedLoopCount: input.approved_loop_count } : {}),
+      ...(input.max_loops !== undefined ? { maxLoops: input.max_loops } : {}),
+      ...(input.user_hard_constraints ? { userHardConstraints: input.user_hard_constraints } : {}),
+      githubAllowed: input.github_allowed === true,
+    })
   }
 
   async bootstrap(input: OrbitRunInput, signal?: AbortSignal): Promise<OrbitActionResult> {
@@ -262,8 +263,7 @@ export class OrbitSupervisor {
       }
     }
     if (state.phase === 'NEEDS_USER' && requestedGoal) {
-      state.status = 'running'
-      state.phase = 'EXECUTE'
+      resumeFromNeedsUser(state)
       this.store.writeState(state)
     }
     return this.run(state, signal)
@@ -297,9 +297,7 @@ export class OrbitSupervisor {
     if (state.phase === 'EVALUATE' && state.child?.status === 'completed' && state.current_step) {
       const step = state.plan.steps.find((candidate) => candidate.id === state.current_step?.id)
       if (!step) {
-        state.phase = 'NEEDS_USER'
-        state.status = 'needs_user'
-        state.last_error = 'EVALUATE_STEP_MISSING'
+        enterNeedsUser(state, 'EVALUATE_STEP_MISSING')
         this.store.writeState(state)
         return this.result(state, false)
       }
@@ -321,17 +319,12 @@ export class OrbitSupervisor {
     }
 
     if (state.loop.used >= state.loop.max) {
-      state.phase = 'BUDGET_EXHAUSTED'
-      state.status = 'budget_exhausted'
-      state.last_error = 'LOOP_BUDGET_EXHAUSTED'
+      enterBudgetExhausted(state, 'LOOP_BUDGET_EXHAUSTED')
       this.store.writeState(state)
       return this.result(state, false)
     }
 
-    step.status = 'running'
-    state.current_step = { id: step.id, attempt: state.current_step?.id === step.id ? state.current_step.attempt + 1 : 1 }
-    state.phase = 'EXECUTE'
-    state.status = 'running'
+    beginStep(state, step)
     this.store.writeState(state)
 
     const executed = await this.executeStep(state, step, signal)
@@ -365,24 +358,18 @@ export class OrbitSupervisor {
     )
     if (outcome.kind === 'needs_user') return this.setNeedsUser(state, outcome.reason)
     if (outcome.kind === 'interrupted') {
-      state.phase = 'PLAN'
-      state.status = 'running'
-      state.last_error = truncateSafe(outcome.reason, 500)
+      recordPlanFailure(state, truncateSafe(outcome.reason, 500))
       this.store.writeState(state)
       return this.result(state, false, outcome.reason)
     }
     try {
       const plan = normalizePlan(outcome.structured as { summary?: unknown; steps?: unknown })
-      state.plan = plan
-      state.phase = 'EXECUTE'
-      state.status = 'running'
+      applyPlan(state, plan)
       this.store.writeState(state)
       return undefined
     } catch (error) {
       const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
-      state.phase = 'PLAN'
-      state.status = 'running'
-      state.last_error = reason
+      recordPlanFailure(state, reason)
       this.store.writeState(state)
       return this.result(state, false, reason)
     }
@@ -533,13 +520,7 @@ export class OrbitSupervisor {
   ): Promise<{ done: boolean; ok: boolean; message?: string }> {
     const capabilities = step.capabilities ?? []
     if (capabilities.includes('browser') && !this.host.hasTool(this.config.browserTools[0] ?? 'agent_browser')) {
-      state.child = { status: 'completed' }
-      state.last_error = 'BROWSER_CAPABILITY_UNAVAILABLE'
-      state.commander = {
-        last_decision: state.commander?.last_decision,
-        summary: `Executor could not run step ${step.id}: BROWSER_CAPABILITY_UNAVAILABLE (agent_browser tool is not registered).`,
-      }
-      state.phase = 'EVALUATE'
+      applyExecutorCapabilityUnavailable(state, step.id)
       this.store.writeState(state)
       return { done: false, ok: false }
     }
@@ -550,9 +531,7 @@ export class OrbitSupervisor {
       toolFilter = this.toolAllow([...this.config.executorTools, ...capabilityTools], `executor ${step.id}`)
     } catch (error) {
       const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
-      state.last_error = reason
+      enterNeedsUser(state, reason)
       this.store.writeState(state)
       return { done: true, ok: false, message: reason }
     }
@@ -571,9 +550,7 @@ export class OrbitSupervisor {
       })
     } catch (error) {
       const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
-      state.last_error = reason
-      state.phase = 'NEEDS_USER'
-      state.status = 'needs_user'
+      enterNeedsUser(state, reason)
       this.store.writeState(state)
       return { done: true, ok: false, message: reason }
     }
@@ -581,63 +558,50 @@ export class OrbitSupervisor {
     const result = await this.awaitExecutor(handle, signal)
 
     if (result.interrupted) {
-      state.child = { ...(result.childId ? { id: result.childId } : {}), status: 'interrupted' }
-      state.last_error = truncateSafe(result.reason ?? 'EXECUTOR_INTERRUPTED', 500)
-      state.phase = 'EXECUTE'
-      state.status = 'running'
-      const retries = state.interruption_retries + 1
-      state.interruption_retries = retries
+      const retries = applyExecutorInterrupted(state, {
+        ...(result.childId ? { childId: result.childId } : {}),
+        lastError: truncateSafe(result.reason ?? 'EXECUTOR_INTERRUPTED', 500),
+      })
       this.store.writeState(state)
 
       if (signal?.aborted) return { done: true, ok: false, message: 'ORBIT_ABORTED' }
       if (result.reason === 'USER_HARD_SCOPE_VIOLATION') {
-        state.phase = 'NEEDS_USER'
-        state.status = 'needs_user'
+        enterNeedsUser(state)
         this.store.writeState(state)
         return { done: true, ok: false, message: 'USER_HARD_SCOPE_VIOLATION' }
       }
       const recovery = await this.runtimeWatchdog(state, step, result, retries, signal)
       if (recovery === 'needs_user') {
-        state.phase = 'NEEDS_USER'
-        state.status = 'needs_user'
+        enterNeedsUser(state)
         this.store.writeState(state)
         return { done: true, ok: false, message: state.last_error ?? undefined }
       }
       if (recovery === 'resume' && result.childId) {
-        state.child = { id: result.childId, status: 'interrupted' }
+        applyExecutorResume(state, result.childId)
         this.store.writeState(state)
         return { done: false, ok: false }
       }
       if (recovery === 'restart') {
         await this.cancelHandle(handle, 'ORBIT_RESTART_STEP')
         await this.disposeHandle(handle)
-        state.child = undefined
-        state.interruption_retries = 0
+        clearExecutorChild(state)
         this.store.writeState(state)
         return { done: false, ok: false }
       }
       if (retries >= MAX_EXECUTOR_INTERRUPT_RETRIES) {
-        state.phase = 'NEEDS_USER'
-        state.status = 'needs_user'
-        state.last_error = `EXECUTOR_INTERRUPTED: ${state.last_error ?? ''}`
+        enterNeedsUser(state, `EXECUTOR_INTERRUPTED: ${state.last_error ?? ''}`)
         this.store.writeState(state)
         return { done: true, ok: false, message: state.last_error ?? undefined }
       }
       return { done: false, ok: false }
     }
 
-    state.child = { ...(result.childId ? { id: result.childId } : {}), status: 'completed' }
-    state.interruption_retries = 0
-    state.loop = { used: state.loop.used + 1, max: state.loop.max }
-    state.loop_count = state.loop.used
-    state.remaining_budget = Math.max(0, state.loop.max - state.loop.used)
-    state.changed_files = result.changedFiles ?? this.host.changedFiles(join(this.store.stateDir, '..'))
-    state.test_summary = result.testSummary ?? []
-    state.last_error = null
-    state.commander = {
-      last_decision: state.commander?.last_decision,
+    applyExecutorSuccess(state, {
+      ...(result.childId ? { childId: result.childId } : {}),
       summary: truncateSafe(result.output, 2000),
-    }
+      changedFiles: result.changedFiles ?? this.host.changedFiles(join(this.store.stateDir, '..')),
+      testSummary: result.testSummary ?? [],
+    })
     this.stepEvidence = {
       stepId: step.id,
       bundle: buildEvidenceBundle({
@@ -648,8 +612,6 @@ export class OrbitSupervisor {
         telemetry: result.telemetry,
       }),
     }
-    state.phase = 'EVALUATE'
-    state.status = 'running'
     this.store.writeState(state)
     await this.disposeHandle(handle)
     return { done: false, ok: false }
@@ -691,7 +653,7 @@ export class OrbitSupervisor {
     final: boolean,
     signal?: AbortSignal,
   ): Promise<OrbitActionResult | undefined> {
-    state.guard_recovery = undefined
+    clearGuardRecovery(state)
 
     if (outcome.kind === 'interrupted') {
       // Recoverable: the run stops and a later resume retries the same phase.
@@ -703,23 +665,19 @@ export class OrbitSupervisor {
     const decision = outcome.decision
 
     if (decision.decision === 'NEEDS_USER') {
-      state.commander = { last_decision: decision.decision, summary: state.commander?.summary }
-      return this.setNeedsUser(state, decision.reason ?? 'COMMANDER_NEEDS_USER')
+      applyCommanderNeedsUser(state, decision.reason ?? 'COMMANDER_NEEDS_USER')
+      this.store.writeState(state)
+      return this.result(state, false)
     }
 
     if (decision.decision === 'SUCCESS') {
-      state.phase = 'SUCCESS'
-      state.status = 'success'
-      state.commander = { last_decision: decision.decision, summary: decision.summary ?? state.commander?.summary }
+      applyFinalSuccess(state, decision.summary)
       this.store.writeState(state)
       return this.result(state, true)
     }
 
     if (decision.decision === 'PASS_CURRENT_STEP') {
-      if (step) step.status = 'passed'
-      state.commander = { last_decision: decision.decision, summary: decision.summary ?? state.commander?.summary }
-      state.phase = 'EXECUTE'
-      state.status = 'running'
+      applyStepPass(state, step, decision.summary)
       this.store.writeState(state)
       return undefined
     }
@@ -729,23 +687,12 @@ export class OrbitSupervisor {
     }
 
     if (decision.decision === 'APPEND') {
-      const remaining = state.loop.max - state.loop.used
-      const appended = normalizeAppend(decision)
-      if (appended.length === 0) return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: append needs next_steps or next_step_goal')
-      if (remaining <= 0) {
-        state.phase = 'BUDGET_EXHAUSTED'
-        state.status = 'budget_exhausted'
-        this.store.writeState(state)
-        return this.result(state, false)
+      const append = applyFinalAppend(state, decision)
+      if (append === 'invalid') {
+        return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: append needs next_steps or next_step_goal')
       }
-      for (const item of appended.slice(0, remaining)) {
-        const index = state.plan.steps.filter((candidate) => isBaseStepId(candidate.id)).length
-        state.plan.steps.push({ id: `P${index}`, goal: item.goal, ...(item.capabilities ? { capabilities: item.capabilities } : {}), status: 'pending' })
-      }
-      state.commander = { last_decision: decision.decision, summary: decision.summary ?? state.commander?.summary }
-      state.phase = 'EXECUTE'
-      state.status = 'running'
       this.store.writeState(state)
+      if (append === 'budget_exhausted') return this.result(state, false)
       return undefined
     }
 
@@ -754,9 +701,7 @@ export class OrbitSupervisor {
   }
 
   private setNeedsUser(state: OrbitState, reason: string): OrbitActionResult {
-    state.phase = 'NEEDS_USER'
-    state.status = 'needs_user'
-    state.last_error = truncateSafe(reason, 500)
+    enterNeedsUser(state, truncateSafe(reason, 500))
     this.store.writeState(state)
     return this.result(state, false)
   }
@@ -773,10 +718,7 @@ export class OrbitSupervisor {
     const base = baseStepIdOf(step.id)
     const correctionDepth = correctionDepthOf(step.id)
     const blocked = correctionBlockCode(state, step)
-    if (blocked) {
-      state.last_error = blocked
-      return this.setNeedsUser(state, blocked)
-    }
+    if (blocked) return this.setNeedsUser(state, blocked)
 
     let nextGoal = decision.next_step_goal
     if (correctionDepth === 1 && state.strategy_challenge?.base_step_id !== base) {
@@ -784,27 +726,17 @@ export class OrbitSupervisor {
       if (reconsider.kind === 'needs_user') return this.setNeedsUser(state, reconsider.reason)
       if (reconsider.kind === 'interrupted') {
         // Temporary failure: keep the run resumable and do NOT consume the challenge.
-        state.phase = 'EVALUATE'
-        state.status = 'running'
-        state.last_error = truncateSafe(reconsider.reason, 500)
+        restoreEvaluationState(state, truncateSafe(reconsider.reason, 500))
         this.store.writeState(state)
         return this.result(state, false, reconsider.reason)
       }
       if (reconsider.kind === 'replace') nextGoal = reconsider.replacementGoal
     }
 
-    step.status = 'needs_correction'
-    const number = correctionDepth + 2
-    const insertAt = state.plan.steps.indexOf(step) + 1
-    const correctionCapabilities = normalizeCapabilities(decision.next_step_capabilities) ?? step.capabilities
-    state.plan.steps.splice(insertAt, 0, {
-      id: `${base}-${number}`,
-      goal: nextGoal,
-      ...(correctionCapabilities ? { capabilities: correctionCapabilities } : {}),
-      status: 'pending',
+    applyCorrectionStep(state, step, {
+      nextGoal,
+      capabilities: decision.next_step_capabilities,
     })
-    state.phase = 'EXECUTE'
-    state.status = 'running'
     this.store.writeState(state)
     return undefined
   }
@@ -845,7 +777,7 @@ export class OrbitSupervisor {
     try {
       const decision = assertStrategyDecision(outcome.structured as StrategyDecision)
       if (decision.decision === 'NEEDS_USER') return { kind: 'needs_user', reason: decision.reason ?? 'COMMANDER_STRATEGY_NEEDS_USER' }
-      state.strategy_challenge = { base_step_id: base, used: true }
+      markStrategyChallengeUsed(state, base)
       if (decision.decision === 'REPLACE_CURRENT_STEP') return { kind: 'replace', replacementGoal: decision.replacement_goal as string }
       return { kind: 'keep' }
     } catch (error) {
@@ -860,17 +792,13 @@ export class OrbitSupervisor {
     retries: number,
     signal?: AbortSignal,
   ): Promise<'resume' | 'restart' | 'needs_user' | 'fallback'> {
-    const previous = state.smart_watchdog?.step_id === step.id ? state.smart_watchdog : undefined
-    const calls = previous?.calls ?? 0
-    if (calls >= MAX_WATCHDOG_CALLS_PER_STEP) {
-      state.smart_watchdog = { step_id: step.id, calls, last_decision: 'CAP_REACHED', last_reason: state.last_error?.slice(0, 500) }
+    const capReached = openWatchdogAttempt(state, step.id, {
+      atCap: state.last_error?.slice(0, 500),
+      attempt: truncateSafe(result.reason ?? state.last_error ?? '', 500),
+    })
+    if (capReached) {
       this.store.writeState(state)
       return 'needs_user'
-    }
-    state.smart_watchdog = {
-      step_id: step.id,
-      calls: calls + 1,
-      last_reason: truncateSafe(result.reason ?? state.last_error ?? '', 500),
     }
     this.store.writeState(state)
 
@@ -882,7 +810,7 @@ export class OrbitSupervisor {
       ...(signal ? { signal } : {}),
     })
     if (!watchdogResult || watchdogResult.interrupted) {
-      state.smart_watchdog.last_decision = 'UNAVAILABLE'
+      recordWatchdogDecision(state, 'UNAVAILABLE')
       this.store.writeState(state)
       return 'fallback'
     }
@@ -891,12 +819,12 @@ export class OrbitSupervisor {
     try {
       diagnosis = assertWatchdogDecision(watchdogResult.structured as WatchdogDecision)
     } catch {
-      state.smart_watchdog.last_decision = 'UNAVAILABLE'
+      recordWatchdogDecision(state, 'UNAVAILABLE')
       this.store.writeState(state)
       return 'fallback'
     }
 
-    state.smart_watchdog.last_decision = diagnosis.decision
+    recordWatchdogDecision(state, diagnosis.decision)
     this.store.writeState(state)
 
     if (diagnosis.decision === 'NEEDS_USER' || diagnosis.decision === 'RUNTIME_BUG') return 'needs_user'
@@ -912,10 +840,7 @@ export class OrbitSupervisor {
     const state = this.store.readState()
     if (!state) return { disposition: 'block_continue', code, count: 0, watchdog_calls: 0, instruction: GUARD_FIRST_INSTRUCTION }
     const stepId = state.current_step?.id ?? state.plan.steps.find((candidate) => candidate.status === 'running')?.id ?? ''
-    const previous = state.guard_recovery
-    const same = previous?.step_id === stepId && previous?.code === code
-    const count = (same ? previous.count : 0) + 1
-    state.guard_recovery = { step_id: stepId, code, count }
+    const count = recordGuardRecovery(state, stepId, code)
     this.store.writeState(state)
 
     if (count < GUARD_ESCALATION_THRESHOLD) {
@@ -956,9 +881,7 @@ export class OrbitSupervisor {
   }
 
   private guardNeedsUser(state: OrbitState, code: GuardCode, reason: string, count: number, instruction?: string): GuardBlockOutcome {
-    state.phase = 'NEEDS_USER'
-    state.status = 'needs_user'
-    state.last_error = `ORBIT_GUARD_ESCALATION: ${reason.slice(0, 300)}`
+    enterNeedsUser(state, `ORBIT_GUARD_ESCALATION: ${reason.slice(0, 300)}`)
     this.store.writeState(state)
     return { disposition: 'block_needs_user', code, count, watchdog_calls: 0, instruction: instruction ?? GUARD_NEEDS_USER_INSTRUCTION }
   }
@@ -1050,8 +973,7 @@ export class OrbitSupervisor {
     const state = this.store.readState()
     if (!state) return { ok: false, action, message: 'ORBIT_RUN_NOT_FOUND: no active run.' }
     if (runId && runId !== state.run_id) return { ok: false, action, message: `ORBIT_RUN_NOT_FOUND: ${runId}` }
-    state.phase = 'STOPPED'
-    state.status = 'stopped'
+    stopRun(state)
     this.store.writeState(state)
     return this.result(state, true)
   }
