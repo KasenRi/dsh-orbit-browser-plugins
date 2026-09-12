@@ -46,3 +46,32 @@ test('guard is inert when no CX run owns the project', async () => {
   assert.deepEqual(decision, { kind: 'allow' })
   assert.equal(recorded, 0)
 })
+
+test('CX blocks other top-level mutation drivers while it owns the workspace', async () => {
+  const handler = createCxPreExecuteHandler(stubService(true, () => undefined))
+  for (const name of ['create_goal', 'ralph', 'workflow']) {
+    const decision = await handler({ name, arguments: {} }, async () => ({ kind: 'allow' }))
+    assert.equal(decision.kind, 'deny')
+    if (decision.kind === 'deny') assert.match(decision.reason, /CX_MUTATION_DRIVER_CONFLICT/)
+  }
+  // Read-only delegation stays available.
+  assert.deepEqual(await handler({ name: 'subagent', arguments: {} }, async () => ({ kind: 'allow' })), { kind: 'allow' })
+  assert.deepEqual(await handler({ name: 'read', arguments: {} }, async () => ({ kind: 'allow' })), { kind: 'allow' })
+})
+
+test('cx_controller run is denied while another mutation driver is active', async () => {
+  let driverChecks = 0
+  const handler = createCxPreExecuteHandler(stubService(false, () => undefined), {
+    competingDriver: () => {
+      driverChecks += 1
+      return 'goal'
+    },
+  })
+  const denied = await handler({ name: 'cx_controller', arguments: { action: 'run' } }, async () => ({ kind: 'allow' }))
+  assert.equal(denied.kind, 'deny')
+  if (denied.kind === 'deny') assert.match(denied.reason, /goal/)
+
+  const status = await handler({ name: 'cx_controller', arguments: { action: 'status' } }, async () => ({ kind: 'allow' }))
+  assert.deepEqual(status, { kind: 'allow' })
+  assert.equal(driverChecks, 1)
+})

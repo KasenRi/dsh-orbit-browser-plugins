@@ -31,6 +31,7 @@ const config: CxSupervisorConfig = {
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch'],
   watchdogTools: ['read', 'read_image', 'glob', 'grep'],
+  executorTools: ['read', 'glob', 'grep', 'bash', 'write', 'edit'],
 }
 
 const FIXTURE =
@@ -71,7 +72,9 @@ class CapabilityHost implements CxHost {
       return { childId: `wd-${this.events.length}`, result: Promise.resolve<RoleRunResult>({ output: '{"question":"q"}', interrupted: false }) }
     }
 
-    const browserStep = request.capabilities?.includes('browser') === true && request.toolFilter === undefined
+    const browserStep =
+      request.capabilities?.includes('browser') === true &&
+      (!request.toolFilter || (request.toolFilter.allow ?? []).includes('agent_browser'))
     const childId = `exec-${this.events.length}`
     if (!browserStep) {
       this.events.push('browser-unavailable')
@@ -145,7 +148,7 @@ test('CX browser integration smoke: P1 no browser, P2 browser, commander/watchdo
   assert.deepEqual(host.events, ['browser-unavailable', 'browser-available'])
 
   const p1 = host.toolFilters.find((entry) => entry.role === 'executor')
-  assert.ok(p1?.deny?.includes('agent_browser'), 'P1 executor must deny agent_browser')
+  assert.ok(!(p1?.allow ?? []).includes('agent_browser'), 'P1 executor must not allow agent_browser')
 
   const commanderFilters = host.toolFilters.filter((entry) => entry.role === 'commander')
   assert.ok(commanderFilters.length > 0)

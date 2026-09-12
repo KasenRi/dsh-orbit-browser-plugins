@@ -16,6 +16,7 @@ const config: CxSupervisorConfig = {
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read'],
   watchdogTools: ['read'],
+  executorTools: ['read', 'bash', 'write'],
 }
 
 test('atomic write increments revision and leaves no lock or temp files', () => {

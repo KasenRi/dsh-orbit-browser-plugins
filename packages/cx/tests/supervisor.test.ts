@@ -16,6 +16,7 @@ const config: CxSupervisorConfig = {
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch'],
   watchdogTools: ['read', 'read_image', 'glob', 'grep'],
+  executorTools: ['read', 'glob', 'grep', 'bash', 'write', 'edit'],
 }
 
 function project(): { dir: string; cleanup: () => void } {
@@ -49,19 +50,20 @@ test('PLAN -> EXECUTE -> EVALUATE -> SUCCESS', async () => {
   cleanup()
 })
 
-test('STEP_EVALUATE rejects SUCCESS', async () => {
+test('STEP_EVALUATE rejects SUCCESS as a recoverable interruption', async () => {
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host
     .script('commander', [{ output: plan([{ id: 'P1', goal: 'a' }]) }, { output: commander({ decision: 'SUCCESS' }) }])
     .script('executor', [{ output: 'done', childId: 'e1' }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
-  assert.equal(result.phase, 'NEEDS_USER')
+  assert.equal(result.ok, false)
+  assert.equal(result.phase, 'EVALUATE')
   assert.match(String(result.data?.['last_error']), /COMMANDER_EVALUATION_DECISION_INVALID_FOR_MODE/)
   cleanup()
 })
 
-test('FINAL_EVALUATE rejects PASS_CURRENT_STEP', async () => {
+test('FINAL_EVALUATE rejects PASS_CURRENT_STEP as a recoverable interruption', async () => {
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host
@@ -72,7 +74,8 @@ test('FINAL_EVALUATE rejects PASS_CURRENT_STEP', async () => {
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
-  assert.equal(result.phase, 'NEEDS_USER')
+  assert.equal(result.ok, false)
+  assert.match(String(result.data?.['last_error']), /COMMANDER_EVALUATION_DECISION_INVALID_FOR_MODE/)
   cleanup()
 })
 
@@ -193,8 +196,9 @@ test('runtime watchdog caps at two calls per step', async () => {
   cleanup()
 })
 
-test('commander adaptive timeout reviews then hard ceiling interrupts same child', async () => {
+test('commander adaptive timeout reviews then hard ceiling cancels the same child', async () => {
   const { dir, cleanup } = project()
+  const store = new CxStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -208,15 +212,24 @@ test('commander adaptive timeout reviews then hard ceiling interrupts same child
       { output: commander({ decision: 'EXTEND' }) },
       { output: commander({ decision: 'EXTEND' }) },
     ])
-  const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
+  const supervisor = new CxSupervisor(store, host, config)
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  assert.equal(first.ok, false)
+  assert.equal(first.phase, 'EVALUATE')
   assert.deepEqual(host.sleepCalls.slice(0, 3), [360000, 240000, 240000])
-  assert.ok(host.interruptCalls.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-1'))
-  assert.equal(result.phase, 'SUCCESS')
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-1'))
+  assert.ok(host.disposed.includes('cmd-1'))
+  // timeout telemetry is bound to the current Commander child, not the Executor
+  assert.equal(host.snapshots[0]?.childId, 'cmd-1')
+
+  const resumed = await supervisor.run(store.readState()!)
+  assert.equal(resumed.phase, 'SUCCESS')
   cleanup()
 })
 
 test('commander timeout watchdog unavailable: EXTEND then INTERRUPT', async () => {
   const { dir, cleanup } = project()
+  const store = new CxStateStore(dir)
   const host = new FakeHost()
   host
     .script('commander', [
@@ -226,9 +239,15 @@ test('commander timeout watchdog unavailable: EXTEND then INTERRUPT', async () =
       { output: commander({ decision: 'SUCCESS' }) },
     ])
     .script('executor', [{ output: 'done', childId: 'e1' }])
-  const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
+  const supervisor = new CxSupervisor(store, host, config)
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  assert.equal(first.ok, false)
   assert.deepEqual(host.sleepCalls.slice(0, 2), [360000, 240000])
   assert.equal(host.scriptsFor('watchdog').length, 0)
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_TIMEOUT_INTERRUPTED' && call.childId === 'cmd-1'))
+
+  const resumed = await supervisor.run(store.readState()!)
+  assert.equal(resumed.phase, 'SUCCESS')
   cleanup()
 })
 
@@ -293,8 +312,9 @@ test('browser capability scopes the executor tool filter', async () => {
     .script('executor', [{ output: 'a', childId: 'e1' }, { output: 'b', childId: 'e2' }])
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   const executors = host.scriptsFor('executor')
-  assert.ok(executors[0]?.request.toolFilter?.deny?.includes('agent_browser'))
-  assert.equal(executors[1]?.request.toolFilter, undefined)
+  assert.ok(executors[0]?.toolFilter?.allow?.includes('read'))
+  assert.ok(!(executors[0]?.toolFilter?.allow ?? []).includes('agent_browser'))
+  assert.ok(executors[1]?.toolFilter?.allow?.includes('agent_browser'))
   assert.ok(executors[1]?.request.capabilities?.includes('browser'))
   const commanders = host.scriptsFor('commander')
   assert.ok(!(commanders[1]?.request.toolFilter?.allow ?? []).includes('agent_browser'))
@@ -313,5 +333,119 @@ test('browser capability unavailable routes to Commander without executing', asy
   const result = await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(result.phase, 'NEEDS_USER')
   assert.equal(host.scriptsFor('executor').length, 0)
+  cleanup()
+})
+
+test('ordinary Executor scope excludes driver and browser tools, allows writers', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { output: plan([{ id: 'P1', goal: 'code' }]) },
+      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { output: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [{ output: 'a', childId: 'e1' }])
+  await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
+  const allow = host.scriptsFor('executor')[0]?.toolFilter?.allow ?? []
+  assert.ok(allow.includes('read'))
+  assert.ok(allow.includes('bash'))
+  assert.ok(allow.includes('write'))
+  assert.ok(!allow.includes('agent_browser'))
+  assert.ok(!allow.includes('create_goal'))
+  assert.ok(!allow.includes('ralph'))
+  assert.ok(!allow.includes('workflow'))
+  cleanup()
+})
+
+test('PLAN also runs under the adaptive Commander timeout', async () => {
+  const { dir, cleanup } = project()
+  const store = new CxStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [{ pending: true, childId: 'cmd-plan' }])
+    .script('watchdog', [
+      { output: commander({ decision: 'EXTEND' }) },
+      { output: commander({ decision: 'EXTEND' }) },
+    ])
+  const supervisor = new CxSupervisor(store, host, config)
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  assert.equal(first.ok, false)
+  assert.equal(first.phase, 'PLAN')
+  assert.deepEqual(host.sleepCalls, [360000, 240000, 240000])
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-plan'))
+  cleanup()
+})
+
+test('FINAL_EVALUATE also runs under the adaptive Commander timeout', async () => {
+  const { dir, cleanup } = project()
+  const store = new CxStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { output: plan([{ id: 'P1', goal: 'a' }]) },
+      { output: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { pending: true, childId: 'cmd-final' },
+    ])
+    .script('executor', [{ output: 'done', childId: 'e1' }])
+    .script('watchdog', [
+      { output: commander({ decision: 'EXTEND' }) },
+      { output: commander({ decision: 'EXTEND' }) },
+    ])
+  const supervisor = new CxSupervisor(store, host, config)
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  assert.equal(first.ok, false)
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-final'))
+  const finalStart = host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')
+  assert.ok(finalStart)
+  assert.equal(host.snapshots.at(-1)?.childId, 'cmd-final')
+  cleanup()
+})
+
+test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays resumable', async () => {
+  const { dir, cleanup } = project()
+  const store = new CxStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { output: plan([{ id: 'P1', goal: 'a' }]) },
+      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+      { pending: true, childId: 'cmd-strategy' },
+    ])
+    .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }])
+    .script('watchdog', [
+      { output: commander({ question: 'simpler route?' }) },
+      { output: commander({ decision: 'EXTEND' }) },
+      { output: commander({ decision: 'EXTEND' }) },
+    ])
+  const supervisor = new CxSupervisor(store, host, config)
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 10 })
+  assert.equal(first.ok, false)
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-strategy'))
+  // Temporary failure must NOT consume the strategy challenge.
+  assert.equal(store.readState()?.strategy_challenge, undefined)
+  assert.equal(store.readState()?.phase, 'EVALUATE')
+  cleanup()
+})
+
+test('temporary strategy watchdog failure does not consume the challenge', async () => {
+  const { dir, cleanup } = project()
+  const store = new CxStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { output: plan([{ id: 'P1', goal: 'a' }]) },
+      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix1' }) },
+      { output: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix2' }) },
+    ])
+    .script('executor', [{ output: 'e', childId: 'e1' }, { output: 'e', childId: 'e2' }])
+  // No watchdog script: the strategy challenge is temporarily unavailable.
+  const supervisor = new CxSupervisor(store, host, config)
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 10 })
+  assert.equal(first.ok, false)
+  assert.equal(store.readState()?.strategy_challenge, undefined)
+  assert.equal(store.readState()?.phase, 'EVALUATE')
+  assert.ok(!(host.scriptsFor('executor').some((entry) => entry.label === 'executor-P1-3')))
   cleanup()
 })
