@@ -7,10 +7,6 @@ import {
   assertStrategyDecision,
   assertTimeoutDecision,
   assertWatchdogDecision,
-  baseStepIdOf,
-  correctionDepthOf,
-  normalizeCapabilities,
-  normalizePlan,
   ORBIT_DECISION_SCHEMAS,
 } from '../src/decisions.ts'
 
@@ -18,36 +14,6 @@ test('every decision schema is inside the enforced DSH subset', () => {
   for (const [name, schema] of Object.entries(ORBIT_DECISION_SCHEMAS)) {
     assert.doesNotThrow(() => assertObjectJsonSchema(schema), `${name} must be a valid ObjectJsonSchema`)
   }
-})
-
-test('normalizes plan steps and capabilities', () => {
-  const plan = normalizePlan({
-    summary: 's',
-    steps: [
-      { id: 'P0', goal: 'a' },
-      { id: 'bad', goal: 'b', capabilities: ['web-api-recon'] },
-    ],
-  })
-  assert.equal(plan.steps[0]?.id, 'P0')
-  assert.equal(plan.steps[1]?.id, 'P1')
-  assert.deepEqual(plan.steps[1]?.capabilities, ['browser', 'web-api-recon'])
-})
-
-test('rejects plan with too many steps', () => {
-  assert.throws(
-    () => normalizePlan({ steps: Array.from({ length: 6 }, (_, index) => ({ id: `P${index}`, goal: 'g' })) }),
-    /COMMANDER_PLAN_OUTPUT_INVALID/,
-  )
-})
-
-test('rejects plan step without a goal', () => {
-  assert.throws(() => normalizePlan({ steps: [{ id: 'P0', goal: '' }] }), /every step needs a goal/)
-})
-
-test('capability normalization drops unknown entries', () => {
-  assert.deepEqual(normalizeCapabilities(['browser', 'nonsense', 'browser']), ['browser'])
-  assert.equal(normalizeCapabilities([]), undefined)
-  assert.equal(normalizeCapabilities('browser'), undefined)
 })
 
 test('enforces step and final decision boundaries', () => {
@@ -62,11 +28,4 @@ test('enforces strategy / timeout / watchdog boundaries', () => {
   assert.throws(() => assertTimeoutDecision({ decision: 'SUCCESS' as never }), /COMMANDER_TIMEOUT_WATCHDOG_DECISION_INVALID/)
   assert.throws(() => assertWatchdogDecision({ decision: 'BAD' as never }), /SMART_WATCHDOG_RUNTIME_DECISION_INVALID/)
   assert.throws(() => assertGuardWatchdogDecision({ decision: 'BAD' as never }), /SMART_WATCHDOG_GUARD_DECISION_INVALID/)
-})
-
-test('correction depth and base id helpers', () => {
-  assert.equal(correctionDepthOf('P1'), 0)
-  assert.equal(correctionDepthOf('P1-2'), 1)
-  assert.equal(correctionDepthOf('P1-3'), 2)
-  assert.equal(baseStepIdOf('P1-3'), 'P1')
 })

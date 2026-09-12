@@ -8,15 +8,10 @@ import {
   assertTimeoutDecision,
   assertWatchdogDecision,
   assertGuardWatchdogDecision,
-  baseStepIdOf,
   COMMANDER_FINAL_EVALUATE_SCHEMA,
   COMMANDER_PLAN_SCHEMA,
   COMMANDER_STEP_EVALUATE_SCHEMA,
   COMMANDER_STRATEGY_SCHEMA,
-  correctionDepthOf,
-  isBaseStepId,
-  normalizeCapabilities,
-  normalizePlan,
   WATCHDOG_GUARD_SCHEMA,
   WATCHDOG_RUNTIME_SCHEMA,
   WATCHDOG_STRATEGY_SCHEMA,
@@ -24,6 +19,18 @@ import {
   type EvaluationMode,
 } from './decisions.ts'
 import type { OrbitHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
+import {
+  baseStepIdOf,
+  correctionBlockCode,
+  correctionDepthOf,
+  estimateLoopCount,
+  explicitLoopBudget,
+  hashGoal,
+  isBaseStepId,
+  normalizeAppend,
+  normalizeCapabilities,
+  normalizePlan,
+} from './kernel.ts'
 import { truncateSafe } from './sanitize.ts'
 import { OrbitStateStore } from './state-store.ts'
 import {
@@ -38,7 +45,6 @@ import {
   GUARD_RECOVERY_CAP,
   GUARD_REPEAT_INSTRUCTION,
   GUARD_RETRY_INSTRUCTION,
-  MAX_CORRECTION_DEPTH,
   MAX_EXECUTOR_INTERRUPT_RETRIES,
   MAX_WATCHDOG_CALLS_PER_STEP,
   WATCHDOG_TIMEOUT_MS,
@@ -200,7 +206,7 @@ export class OrbitSupervisor {
 
   createState(input: OrbitRunInput): OrbitState {
     const runId = typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID()
-    const max = this.explicitLoopBudget(input) ?? this.estimateLoopCount(input.goal ?? '')
+    const max = explicitLoopBudget(input) ?? estimateLoopCount(input.goal ?? '')
     const goal = (input.goal ?? '').trim()
     return {
       schema_version: 2,
@@ -227,31 +233,6 @@ export class OrbitSupervisor {
       github_allowed: input.github_allowed === true,
       interruption_retries: 0,
     }
-  }
-
-  private explicitLoopBudget(input: OrbitRunInput): number | undefined {
-    const raw = input.approved_loop_count ?? input.max_loops
-    if (raw === undefined) return undefined
-    if (!Number.isSafeInteger(raw) || raw <= 0) throw new Error('ORBIT_LOOP_BUDGET_INVALID: approved_loop_count must be a positive integer')
-    if (raw > 10) throw new Error('ORBIT_LOOP_BUDGET_INVALID: approved_loop_count above 10 requires an explicit execution request')
-    return raw
-  }
-
-  estimateLoopCount(goal: string): number {
-    const text = goal.toLowerCase()
-    if (/critical|migrate|migration|production|架构|重构/.test(text)) return 6
-    if (/integration|联调|ui|high/.test(text)) return 4
-    if (/feature|多文件|multi-file/.test(goal)) return 3
-    if (/bug|fix|test/.test(text)) return 2
-    return 1
-  }
-
-  private updateLoopBudget(state: OrbitState, budget: number): void {
-    if (budget < state.loop.used) throw new Error(`ORBIT_LOOP_BUDGET_BELOW_USED: requested ${budget}, already used ${state.loop.used}`)
-    state.approved_loop_count = budget
-    state.loop = { used: state.loop.used, max: budget }
-    state.loop_count = state.loop.used
-    state.remaining_budget = Math.max(0, budget - state.loop.used)
   }
 
   async bootstrap(input: OrbitRunInput, signal?: AbortSignal): Promise<OrbitActionResult> {
@@ -749,7 +730,7 @@ export class OrbitSupervisor {
 
     if (decision.decision === 'APPEND') {
       const remaining = state.loop.max - state.loop.used
-      const appended = this.normalizeAppend(decision)
+      const appended = normalizeAppend(decision)
       if (appended.length === 0) return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: append needs next_steps or next_step_goal')
       if (remaining <= 0) {
         state.phase = 'BUDGET_EXHAUSTED'
@@ -780,27 +761,6 @@ export class OrbitSupervisor {
     return this.result(state, false)
   }
 
-  private normalizeAppend(decision: CommanderDecision): Array<{ goal: string; capabilities?: OrbitPlanStep['capabilities'] }> {
-    const items: Array<{ goal: string; capabilities?: OrbitPlanStep['capabilities'] }> = []
-    if (Array.isArray(decision.next_steps)) {
-      for (const entry of decision.next_steps) {
-        if (typeof entry === 'string' && entry.trim()) items.push({ goal: entry.trim() })
-        else if (entry && typeof entry === 'object') {
-          const goal = String((entry as { goal?: unknown }).goal ?? '').trim()
-          if (goal) {
-            const capabilities = normalizeCapabilities((entry as { capabilities?: unknown }).capabilities)
-            items.push({ goal, ...(capabilities ? { capabilities } : {}) })
-          }
-        }
-      }
-    }
-    if (items.length === 0 && decision.next_step_goal?.trim()) {
-      const capabilities = normalizeCapabilities(decision.next_step_capabilities)
-      items.push({ goal: decision.next_step_goal.trim(), ...(capabilities ? { capabilities } : {}) })
-    }
-    return items
-  }
-
   private async applyCorrection(
     state: OrbitState,
     step: OrbitPlanStep,
@@ -812,16 +772,10 @@ export class OrbitSupervisor {
     }
     const base = baseStepIdOf(step.id)
     const correctionDepth = correctionDepthOf(step.id)
-    const remaining = Math.max(0, state.loop.max - state.loop.used)
-    const reservedForLaterStages = state.plan.steps.filter((candidate) => isBaseStepId(candidate.id) && candidate.status === 'pending').length
-
-    if (correctionDepth >= MAX_CORRECTION_DEPTH) {
-      state.last_error = 'CORRECTION_LIMIT_REACHED'
-      return this.setNeedsUser(state, 'CORRECTION_LIMIT_REACHED')
-    }
-    if (remaining <= reservedForLaterStages) {
-      state.last_error = 'LOOP_BUDGET_RESERVED_FOR_LATER_STEPS'
-      return this.setNeedsUser(state, 'LOOP_BUDGET_RESERVED_FOR_LATER_STEPS')
+    const blocked = correctionBlockCode(state, step)
+    if (blocked) {
+      state.last_error = blocked
+      return this.setNeedsUser(state, blocked)
     }
 
     let nextGoal = decision.next_step_goal
@@ -1139,14 +1093,6 @@ export class OrbitSupervisor {
       data: Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)),
     }
   }
-}
-
-function hashGoal(goal: string): string {
-  let hash = 0
-  for (let index = 0; index < goal.length; index += 1) {
-    hash = (hash * 31 + goal.charCodeAt(index)) | 0
-  }
-  return `g${(hash >>> 0).toString(16)}`
 }
 
 export { DEFAULT_CAPABILITIES }

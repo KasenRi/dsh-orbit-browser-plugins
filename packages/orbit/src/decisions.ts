@@ -1,9 +1,6 @@
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
+import { ORBIT_CAPABILITIES } from './kernel.ts'
 import {
-  MAX_PLAN_STEPS,
-  MIN_PLAN_STEPS,
-  type OrbitCapability,
-  type OrbitPlanStep,
   type CommanderDecision,
   type CommanderDecisionKind,
   type StrategyDecision,
@@ -20,7 +17,7 @@ import {
 // format-level rules (types, required fields, legal enums), and leave Orbit's
 // domain rules (plan size, correction depth, budget) to the checks below.
 
-const CAPABILITY_ENUM = ['browser', 'web-api-recon']
+const CAPABILITY_ENUM = [...ORBIT_CAPABILITIES]
 
 /** Plan steps are object-rooted; capabilities stay optional per step. */
 export const COMMANDER_PLAN_SCHEMA: ObjectJsonSchema = {
@@ -148,48 +145,6 @@ export const ORBIT_DECISION_SCHEMAS = {
   WATCHDOG_TIMEOUT_SCHEMA,
 } as const
 
-const STEP_CAPABILITIES = new Set<string>(['browser', 'web-api-recon'])
-
-export function normalizeCapabilities(value: unknown): OrbitCapability[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  const result: OrbitCapability[] = []
-  for (const item of value) {
-    if (typeof item !== 'string' || !STEP_CAPABILITIES.has(item)) continue
-    if (!result.includes(item as OrbitCapability)) result.push(item as OrbitCapability)
-  }
-  if (result.length === 0) return undefined
-  if (result.includes('web-api-recon') && !result.includes('browser')) result.unshift('browser')
-  return result
-}
-
-export interface CommanderPlan {
-  summary?: unknown
-  steps?: unknown
-}
-
-export function normalizePlan(plan: CommanderPlan): { summary: string; steps: OrbitPlanStep[] } {
-  if (!Array.isArray(plan.steps) || plan.steps.length < MIN_PLAN_STEPS || plan.steps.length > MAX_PLAN_STEPS) {
-    throw new Error(`COMMANDER_PLAN_OUTPUT_INVALID: steps must contain ${MIN_PLAN_STEPS}-${MAX_PLAN_STEPS} entries`)
-  }
-  const steps: OrbitPlanStep[] = plan.steps.map((item, index) => {
-    const record = (item ?? {}) as Record<string, unknown>
-    const rawId = typeof record.id === 'string' ? record.id : ''
-    const id = /^P\d+$/u.test(rawId) ? rawId : `P${index}`
-    const goal = String(record.goal ?? '').trim()
-    const capabilities = normalizeCapabilities(record.capabilities)
-    return {
-      id,
-      goal,
-      ...(capabilities ? { capabilities } : {}),
-      status: 'pending' as const,
-    }
-  })
-  if (steps.some((step) => !step.goal)) {
-    throw new Error('COMMANDER_PLAN_OUTPUT_INVALID: every step needs a goal')
-  }
-  return { summary: String(plan.summary ?? '').slice(0, 1000), steps }
-}
-
 export type EvaluationMode = 'STEP_EVALUATE' | 'FINAL_EVALUATE'
 
 const STEP_DECISIONS: readonly CommanderDecisionKind[] = ['PASS_CURRENT_STEP', 'CORRECT_CURRENT_STEP', 'NEEDS_USER']
@@ -236,17 +191,4 @@ export function assertGuardWatchdogDecision(decision: GuardWatchdogDecision): Gu
     throw new Error(`SMART_WATCHDOG_GUARD_DECISION_INVALID: ${decision.decision}`)
   }
   return decision
-}
-
-export function correctionDepthOf(stepId: string): number {
-  const suffix = stepId.split('-', 2)[1]
-  return suffix ? Number(suffix) - 1 : 0
-}
-
-export function baseStepIdOf(stepId: string): string {
-  return stepId.split('-', 2)[0] ?? stepId
-}
-
-export function isBaseStepId(stepId: string): boolean {
-  return /^P\d+$/u.test(stepId)
 }
