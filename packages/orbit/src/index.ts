@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { installOrbitGestureBoundary, registerOrbitCommand } from './activation.ts'
 import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
@@ -36,6 +37,7 @@ export const Config = z.object({
   executorTimeoutMs: z.natural().default(480_000),
   registerTool: z.boolean().default(true),
   registerGuards: z.boolean().default(true),
+  slashCommand: z.boolean().default(true),
 })
 
 export interface OrbitConfigShape {
@@ -48,6 +50,7 @@ export interface OrbitConfigShape {
   executorTimeoutMs: number
   registerTool: boolean
   registerGuards: boolean
+  slashCommand: boolean
 }
 
 interface GoalsLike {
@@ -73,6 +76,23 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
   if (config.registerTool) {
     ctx.tools.register(createOrbitTool(ctx))
     ctx.tools.register(createOrbitTool(ctx, { legacy: true }))
+  }
+
+  // Deterministic activation surfaces: the closed-namespace `/agent-orbit`
+  // host command (surfaces in the Web GUI slash menu through the Harness
+  // commands client) and the genuine-user-message gesture boundary for
+  // surfaces without command adjudication (headless CLI). Both default on.
+  //
+  // `commands` is registered lazily, not a required inject: every standard
+  // profile mounts it, but a minimal composition that omits the command
+  // registry keeps Orbit fully functional — the fiber never pends on it and
+  // simply never gains the slash command, while the gesture boundary still
+  // works.
+  if (config.slashCommand) {
+    ctx.inject(['commands'], (commandCtx) => {
+      registerOrbitCommand(commandCtx)
+    })
+    installOrbitGestureBoundary(ctx)
   }
 
   if (config.registerGuards) {

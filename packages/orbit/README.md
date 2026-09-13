@@ -80,10 +80,22 @@ The `orbit_controller` tool drives the run:
 }
 ```
 
-## Natural-language triggers
+## Activation
 
-- Recommended: `orbit模式` — e.g. “用 orbit模式完成这个项目”.
-- Legacy compatibility: `cx模式` still works and resolves to Orbit.
+Orbit supports three activation styles:
+
+1. `/agent-orbit <goal>` — deterministic slash-command activation. In the Web
+   GUI it appears in the `/` menu (`Run a goal with Orbit deterministic
+   engineering orchestration`); on headless/CLI surfaces a genuine user message
+   that starts with `/agent-orbit` activates Orbit directly. The original
+   command line stays visible in the conversation, the goal is passed through
+   without rewriting, and no goal asks for one instead of starting an empty run.
+2. `orbit模式` — recommended natural-language activation, e.g.
+   “用 orbit模式完成这个项目”.
+3. `cx模式` — legacy compatibility; still resolves to Orbit.
+
+All three routes converge on the existing `orbit_controller` tool and
+`OrbitService`; the activation layer never starts a run of its own.
 
 ## State machine
 
@@ -138,6 +150,7 @@ PLAN → EXECUTE → EVALUATE → SUCCESS
 | `executorTimeoutMs` | `480000` | Deterministic executor runtime timeout. |
 | `registerTool` | `true` | Register the `orbit_controller` tool and the legacy `cx_controller` alias. |
 | `registerGuards` | `true` | Register recoverable tool guards. |
+| `slashCommand` | `true` | Register the `/agent-orbit` host command and the gesture boundary. |
 
 Routes are normal DSH model routes; configure them for your own provider and
 model identifiers. No credentials are included in this package.

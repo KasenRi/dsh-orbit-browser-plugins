@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -13,6 +13,7 @@ import SystemPromptPlugin from '@deepseek-ai/dsh-system-prompt'
 import ToolsPlugin, { defineTool } from '@deepseek-ai/dsh-tools'
 import AgentPlugin from '@deepseek-ai/dsh-agent'
 import AgentLoopPlugin from '@deepseek-ai/dsh-agent-loop'
+import CommandsPlugin from '@deepseek-ai/dsh-commands'
 import SubagentPlugin from '@deepseek-ai/dsh-subagent'
 import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as OrbitPlugin from '../../src/index.ts'
@@ -171,6 +172,7 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
     [SystemPromptPlugin, { includeHarnessIdentity: false, includeRuntimeContext: false, personaPrefix: 'test' }],
     [ToolsPlugin, { mode: 'native' }],
     [AgentPlugin, {}],
+    [CommandsPlugin, {}],
     [SubagentPlugin, {}],
     [SpawnPlugin, { providerName: 'spawn' }],
     [AgentLoopPlugin, { agents: [] }],
@@ -426,6 +428,116 @@ test('real Cordis tool pipeline: agent_browser tool -> BrowserAutomationService 
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
+  }
+})
+
+interface SessionMessageLike {
+  source: { kind?: string; goal?: string }
+  content: Array<{ type?: string; text?: string }>
+}
+
+function userMessagesOf(agent: {
+  session?: { snapshotEvents?: () => readonly { type?: string; data?: unknown }[] }
+}): SessionMessageLike[] {
+  const events = agent.session?.snapshotEvents?.() ?? []
+  return events
+    .filter((event) => event.type === 'user/message')
+    .map((event) => event.data as SessionMessageLike)
+}
+
+function textOf(message: SessionMessageLike): string {
+  return message.content
+    .filter((block) => block.type === 'text')
+    .map((block) => block.text ?? '')
+    .join('\n')
+}
+
+test('real host command: /agent-orbit is registered, preserved in history, and activates once', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-command')
+  try {
+    // The Web GUI slash menu reads this exact descriptor list.
+    const descriptors = root.commands.list(parent.agent)
+    const descriptor = descriptors.find((entry) => entry.name === 'agent-orbit')
+    assert.ok(descriptor, `agent-orbit must be listed (got: ${descriptors.map((entry) => entry.name).join(', ') || '(none)'})`)
+    assert.equal(descriptor.description, 'Run a goal with Orbit deterministic engineering orchestration')
+    assert.equal(descriptor.input?.hint, 'Describe the engineering goal for Orbit')
+
+    const commandLine = '/agent-orbit implement the deterministic fix'
+    const execution = await root.commands.execute(parent.agent, commandLine, [], new AbortController().signal)
+    assert.ok(execution)
+    assert.equal(execution.result.kind, 'success')
+    await parent.agent.whenIdle()
+
+    const messages = userMessagesOf(parent.agent)
+    const userTexts = messages.filter((message) => message.source.kind === 'user').map(textOf)
+    assert.ok(userTexts.includes(commandLine), 'the user command must stay visible in conversation history')
+    assert.equal(userTexts.filter((text) => text.startsWith('/agent-orbit')).length, 1, 'exactly one preserved user command message')
+
+    const directives = messages.filter((message) => message.source.kind === 'orbit-command')
+    assert.equal(directives.length, 1, 'host command + preserved message must activate exactly once')
+    assert.equal(directives[0]?.source.goal, 'implement the deterministic fix')
+    assert.match(textOf(directives[0] as SessionMessageLike), /orbit_controller/)
+    assert.match(textOf(directives[0] as SessionMessageLike), /Goal: implement the deterministic fix/)
+
+    // The existing tool is still the only business entry: the activation layer
+    // must not start a durable run by itself.
+    assert.equal(existsSync(join(project.dir, '.cx', 'state.json')), false)
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host command: empty /agent-orbit is rejected without starting a run', { timeout: 60_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-empty')
+  try {
+    const execution = await root.commands.execute(parent.agent, '/agent-orbit', [], new AbortController().signal)
+    assert.ok(execution)
+    assert.ok(execution.result.kind === 'error', 'an empty goal must be rejected')
+    assert.match(execution.result.text, /Usage: \/agent-orbit/)
+    await parent.agent.whenIdle()
+
+    assert.equal(userMessagesOf(parent.agent).length, 0, 'an empty goal must post no user message')
+    assert.equal(adapter.seen.length, 0, 'an empty goal must not reach the model')
+    assert.equal(existsSync(join(project.dir, '.cx', 'state.json')), false)
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host gesture fallback: genuine /agent-orbit activates once; ordinary chat does not', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-gesture')
+  try {
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'please inspect this file' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    assert.equal(
+      userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
+      0,
+      'ordinary chat must not activate Orbit',
+    )
+
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit headless fallback goal' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
+    assert.equal(directives.length, 1, 'the headless gesture must activate exactly once')
+    assert.equal(directives[0]?.source.goal, 'headless fallback goal')
+    assert.match(textOf(directives[0] as SessionMessageLike), /Goal: headless fallback goal/)
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
   }
 })
 

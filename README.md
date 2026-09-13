@@ -81,8 +81,20 @@ configuration:
 
 ## Quick start
 
+The most deterministic way to start Orbit is the slash command:
+
 ```text
-# Orbit
+/agent-orbit 修复当前项目的 TypeScript 错误并运行测试
+```
+
+Orbit supports three activation styles:
+
+1. `/agent-orbit <goal>` — deterministic slash-command activation (Web GUI slash menu, or a genuine user message gesture on headless/CLI surfaces).
+2. `orbit模式` — recommended natural-language activation.
+3. `cx模式` — legacy compatibility; still resolves to Orbit.
+
+```text
+# Orbit (typed tool, the same entry the slash command activates)
 orbit_controller { "action": "run", "goal": "…", "approved_loop_count": 4 }
 orbit_controller { "action": "status" }
 
@@ -92,9 +104,6 @@ agent_browser { "args": ["snapshot", "-i"] }
 agent_browser { "args": ["click", "@e2"] }
 agent_browser { "args": ["snapshot", "-i"] }
 ```
-
-Natural-language triggers: `orbit模式` is the recommended form; legacy `cx模式`
-still resolves to Orbit.
 
 ## Safety
 
