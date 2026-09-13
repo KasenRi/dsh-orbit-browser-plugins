@@ -34,7 +34,8 @@
     "test:cx": "npm run test:orbit",
     "test:e2e": "node --test packages/orbit/tests/integration/orbit-real-context.e2e.test.ts",
     "test:smoke": "node --test packages/browser/tests/integration/*.test.ts packages/orbit/tests/integration/*.test.ts",
-    "smoke:deepseek": "node packages/orbit/tests/e2e/deepseek-smoke.ts"
+    "smoke:deepseek": "node packages/orbit/tests/e2e/deepseek-smoke.ts",
+    "sync:distribution": "node scripts/sync-distribution-repos.mjs"
   },
   "engines": {
     "node": ">=22.19.0"

@@ -34,16 +34,22 @@ versions above, not with every future DSH release.
 
 ## Install
 
-Distributed only as a GitHub Release asset; this project does not use the npm
-Registry as a publication source:
+The stable install source is the dedicated GitHub distribution repository. This
+project does not use the npm Registry as a publication source:
 
 ```bash
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
+dsh plugin --profile web add github:KasenRi/dsh-browser
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a
 profile layer automatically. Restart the profile (or start a new session) after
 installing.
+
+The canonical source is maintained in the
+[source monorepo](https://github.com/KasenRi/dsh-orbit-browser-plugins/tree/main/packages/browser).
+The source monorepo's versioned Release tarballs remain available for manual or
+offline fallback, but the Market uses this dedicated Git repository so updates
+can compare the locked commit with `HEAD`.
 
 If `agent-browser` is not on `PATH`, point the plugin at an executable with the
 `command` config key, the `executablePath` config key, or the

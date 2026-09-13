@@ -49,15 +49,21 @@ Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
 
 ## Install
 
-Distributed only as a GitHub Release asset; this project does not use the npm
-Registry as a publication source:
+The stable install source is the dedicated GitHub distribution repository. This
+project does not use the npm Registry as a publication source:
 
 ```bash
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
+dsh plugin --profile web add github:KasenRi/dsh-orbit
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a
 profile layer automatically.
+
+The canonical source is maintained in the
+[source monorepo](https://github.com/KasenRi/dsh-orbit-browser-plugins/tree/main/packages/orbit).
+The source monorepo's versioned Release tarballs remain available for manual or
+offline fallback, but the Market uses this dedicated Git repository so updates
+can compare the locked commit with `HEAD`.
 
 ## Usage
 
@@ -164,8 +170,8 @@ the browser plugin; otherwise Orbit reports `BROWSER_CAPABILITY_UNAVAILABLE` and
 lets the Commander decide what to do. Install both packages to use that path:
 
 ```bash
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
+dsh plugin --profile web add github:KasenRi/dsh-browser
+dsh plugin --profile web add github:KasenRi/dsh-orbit
 ```
 
 ## Migrating from dsh-cx

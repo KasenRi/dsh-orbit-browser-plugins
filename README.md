@@ -56,26 +56,30 @@ not with every future DSH release.
 
 ## Install
 
-Packages are distributed only as GitHub Release assets; this project does not
-use the npm Registry as a publication source. `dsh plugin add` forwards to pnpm,
-which installs the tarball URL and registers the bundle layer automatically.
-`pnpm` must be on `PATH`.
+The stable install source is the dedicated GitHub distribution repository for
+each plugin. DSH can lock the resolved Git commit and the market can compare it
+with repository `HEAD`; this project does not use the npm Registry as a
+publication source. `pnpm` must be on `PATH`.
 
 ```bash
-# Orbit plugin only
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
+# Orbit plugin only (Git source, tracks repository HEAD)
+dsh plugin --profile web add github:KasenRi/dsh-orbit
 
-# Browser plugin only
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
+# Browser plugin only (Git source, tracks repository HEAD)
+dsh plugin --profile web add github:KasenRi/dsh-browser
 
 # Both (Orbit browser-capability steps may then use the browser plugin)
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
+dsh plugin --profile web add github:KasenRi/dsh-orbit
+dsh plugin --profile web add github:KasenRi/dsh-browser
 ```
 
 Each package declares a `dsh.bundle` manifest, so `dsh plugin add` installs it
 and registers it as a profile layer automatically. See the package READMEs for
 configuration:
+
+The source monorepo's versioned GitHub Release tarballs remain available for
+manual, offline, or fallback installation. They are not the Market's primary
+source because a fixed Release asset has no Git `HEAD` to compare for updates.
 
 - [Orbit configuration](packages/orbit/README.md#configuration)
 - [Browser configuration](packages/browser/README.md#configuration)
@@ -139,6 +143,24 @@ npm run build       # emit lib/ for both packages
 The test suite covers unit, runner-integration, real-Cordis-host end-to-end and
 real-Chromium smoke levels. The DeepSeek Orbit smoke (`npm run smoke:deepseek`)
 requires real model credentials and is not part of the default suite.
+
+## Distribution mirrors
+
+This repository is the canonical source monorepo. The installable Git sources
+are the generated release mirrors [`KasenRi/dsh-orbit`](https://github.com/KasenRi/dsh-orbit)
+and [`KasenRi/dsh-browser`](https://github.com/KasenRi/dsh-browser). Do not develop
+features in the mirrors. After the release tests and `npm run build` pass, sync
+an explicit stable version with:
+
+```bash
+npm run sync:distribution -- 0.4.0 --push
+```
+
+The script copies only each package's `package.json`, `cordis.patch.yml`,
+`README.md`, `LICENSE`, and prebuilt `lib/`. It updates mirror `main` and creates
+a missing package-version tag; ordinary development commits never publish to a
+mirror automatically. Versioned tarballs in this repository's GitHub Releases
+remain available for manual or offline fallback.
 
 ## License
 
