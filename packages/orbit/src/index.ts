@@ -1,10 +1,13 @@
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { installOrbitGestureBoundary, registerOrbitCommand } from './activation.ts'
 import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
+import { resolveEffectiveRoutes, sessionSelectionOf, type OrbitRouteSettings } from './routes.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
-import type { OrbitRoute } from './types.ts'
+import type { OrbitRoute, OrbitRoutes } from './types.ts'
 
 export const name = 'dsh-orbit'
 export const inject = ['tools', 'agents', 'subagents']
@@ -13,6 +16,18 @@ const Route = z.object({
   provider: z.string(),
   model: z.string(),
   reasoningEffort: z.string(),
+})
+
+const RoleRoute = z.object({
+  provider: z.string().default(''),
+  model: z.string().default(''),
+  reasoningEffort: z.string().default(''),
+})
+
+/** `orbit` settings namespace: the two role routes Orbit persists itself. */
+export const OrbitRouteSettingsSchema = z.object({
+  commander: RoleRoute,
+  watchdog: RoleRoute,
 })
 
 export const Config = z.object({
@@ -58,8 +73,47 @@ interface GoalsLike {
 }
 
 export function apply(ctx: Context, config: OrbitConfigShape): void {
+  // Orbit settings bridge: register the `orbit` namespace with the composition
+  // routes as its base/default, so a user who never opens the model UI keeps
+  // today's behavior exactly. Lazily injected: minimal/headless compositions
+  // without a settings provider keep running from `config.routes`.
+  let routeSettings: OrbitRouteSettings | undefined
+  ctx.inject(['settings'], (settingsCtx) => {
+    const baseRoute = (route: OrbitRoute): { provider: string; model: string; reasoningEffort: string } => ({
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort ?? '',
+    })
+    const scope = settingsCtx.settings.register('orbit', OrbitRouteSettingsSchema, {
+      base: {
+        commander: baseRoute(config.routes.commander),
+        watchdog: baseRoute(config.routes.watchdog),
+      },
+    })
+    const sync = (): void => {
+      routeSettings = scope.get()
+    }
+    sync()
+    scope.watch(() => {
+      sync()
+    })
+  })
+
+  // A NEW run resolves its three routes exactly once: Commander/Watchdog from
+  // the Orbit settings (base = config), Executor from the initiating Session's
+  // current model selection (public request-header seam) with the config route
+  // as the fallback for surfaces without one. Existing runs resume from their
+  // frozen `state.routes`.
+  const resolveRoutes = (): OrbitRoutes =>
+    resolveEffectiveRoutes({
+      configRoutes: config.routes,
+      settings: routeSettings,
+      sessionSelection: sessionSelectionOf(ctx.agents.currentInitiator()),
+    })
+
   const serviceConfig: OrbitPluginConfig = {
     routes: config.routes,
+    resolveRoutes,
     browserTools: config.browserTools,
     commanderReadOnlyTools: config.commanderReadOnlyTools,
     watchdogTools: config.watchdogTools,

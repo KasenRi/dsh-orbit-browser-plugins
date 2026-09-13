@@ -81,6 +81,12 @@ import {
 
 export interface OrbitSupervisorConfig {
   defaultRoutes: OrbitState['routes']
+  /**
+   * Resolve the role routes for a NEW run (settings + session selection).
+   * Absent or unused falls back to `defaultRoutes`; an existing run always
+   * resumes from its frozen `state.routes` and never calls this.
+   */
+  resolveRoutes?: () => OrbitState['routes']
   browserTools: readonly string[]
   commanderReadOnlyTools: readonly string[]
   watchdogTools: readonly string[]
@@ -228,7 +234,7 @@ export class OrbitSupervisor {
       now: this.now(),
       goal: (input.goal ?? '').trim(),
       ...(input.preset !== undefined ? { preset: input.preset } : {}),
-      routes: this.config.defaultRoutes,
+      routes: this.config.resolveRoutes?.() ?? this.config.defaultRoutes,
       ...(input.approved_loop_count !== undefined ? { approvedLoopCount: input.approved_loop_count } : {}),
       ...(input.max_loops !== undefined ? { maxLoops: input.max_loops } : {}),
       ...(input.user_hard_constraints ? { userHardConstraints: input.user_hard_constraints } : {}),

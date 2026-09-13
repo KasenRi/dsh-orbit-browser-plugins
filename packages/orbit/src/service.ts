@@ -19,6 +19,11 @@ declare module '@deepseek-ai/cordis' {
 export interface OrbitPluginConfig {
   projectDir?: string
   routes: OrbitRoutes
+  /**
+   * Resolve the role routes for a NEW run (settings + session selection).
+   * Optional so minimal/headless compositions keep using `routes` unchanged.
+   */
+  resolveRoutes?: () => OrbitRoutes
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
@@ -45,6 +50,7 @@ export class OrbitService extends Service {
   supervisorFor(projectDir: string): OrbitSupervisor {
     return new OrbitSupervisor(new OrbitStateStore(projectDir), this.host, {
       defaultRoutes: this.config.routes,
+      ...(this.config.resolveRoutes ? { resolveRoutes: this.config.resolveRoutes } : {}),
       browserTools: this.config.browserTools,
       commanderReadOnlyTools: this.config.commanderReadOnlyTools,
       watchdogTools: this.config.watchdogTools,
