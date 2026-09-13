@@ -362,7 +362,11 @@ export class DshOrbitHost implements OrbitHost {
   }
 
   hasTool(name: string): boolean {
-    return this.ctx.tools.get(name) !== undefined
+    // Standard profiles mount their tool composition on the agent plane
+    // (agent presets), so the visible set must resolve against the initiating
+    // agent's scope. Without an initiator this falls back to the global view.
+    const agent = this.ctx.agents.currentInitiator()
+    return this.ctx.tools.get(name, agent) !== undefined
   }
 
   /**
