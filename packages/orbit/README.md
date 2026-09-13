@@ -49,10 +49,11 @@ Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
 
 ## Install
 
-Distributed as a GitHub Release asset (npm registry publishing is pending):
+Distributed only as a GitHub Release asset; this project does not use the npm
+Registry as a publication source:
 
 ```bash
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-orbit-0.3.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a
@@ -163,8 +164,8 @@ the browser plugin; otherwise Orbit reports `BROWSER_CAPABILITY_UNAVAILABLE` and
 lets the Commander decide what to do. Install both packages to use that path:
 
 ```bash
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-browser-0.1.0.tgz
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-orbit-0.3.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
 ```
 
 ## Migrating from dsh-cx

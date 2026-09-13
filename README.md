@@ -56,20 +56,21 @@ not with every future DSH release.
 
 ## Install
 
-Packages are distributed as GitHub Release assets (npm registry publishing is
-pending). `dsh plugin add` forwards to pnpm, which installs the tarball URL and
-registers the bundle layer automatically. `pnpm` must be on `PATH`.
+Packages are distributed only as GitHub Release assets; this project does not
+use the npm Registry as a publication source. `dsh plugin add` forwards to pnpm,
+which installs the tarball URL and registers the bundle layer automatically.
+`pnpm` must be on `PATH`.
 
 ```bash
 # Orbit plugin only
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-orbit-0.3.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
 
 # Browser plugin only
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-browser-0.1.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
 
 # Both (Orbit browser-capability steps may then use the browser plugin)
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-orbit-0.3.0.tgz
-dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.3.0/kasenri-dsh-browser-0.1.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-orbit-v0.4.0.tgz
+dsh plugin --profile web add https://github.com/KasenRi/dsh-orbit-browser-plugins/releases/download/v0.4.0/dsh-browser-v0.1.0.tgz
 ```
 
 Each package declares a `dsh.bundle` manifest, so `dsh plugin add` installs it
