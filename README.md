@@ -98,6 +98,11 @@ Orbit supports three activation styles:
 2. `orbit模式` — recommended natural-language activation.
 3. `cx模式` — legacy compatibility; still resolves to Orbit.
 
+In the Web GUI an Orbit model control sits immediately left of the native model
+seat: Commander/Watchdog persist into DSH settings, and the Executor follows the
+current session model through the same shared model directory. Each new run
+snapshots the three effective routes; resumes keep their frozen routes.
+
 ```text
 # Orbit (typed tool, the same entry the slash command activates)
 orbit_controller { "action": "run", "goal": "…", "approved_loop_count": 4 }

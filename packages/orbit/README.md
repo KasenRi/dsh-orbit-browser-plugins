@@ -104,6 +104,28 @@ Orbit supports three activation styles:
 All three routes converge on the existing `orbit_controller` tool and
 `OrbitService`; the activation layer never starts a run of its own.
 
+## Model configuration (Web)
+
+The Orbit model control sits immediately left of the native composer model
+seat (`conversation.input.right` renders before `conversation.input.model`).
+Its button names the Commander's model; the menu edits three roles:
+
+- **Commander** and **Watchdog** pick from the same native model catalog and
+  persist into the DSH `orbit` settings namespace (`settings.yaml`), with the
+  composition `config.routes` as the base/default. Switching a model uses that
+  model's own default reasoning effort — a previous model's effort is never
+  inherited.
+- **Executor** follows the current session model ("Follows current session
+  model"). Both the Orbit row and the native seat read and write the SAME
+  per-session `ModelDirectory`, so a change in either place updates the other.
+
+A new run resolves its routes exactly once — Commander/Watchdog from `orbit`
+settings, Executor from the initiating session's current selection, each
+falling back to `config.routes` — and freezes them into `state.routes`.
+Changes made while a run is active apply to the next run; resumed runs keep
+their frozen routes. Headless/CLI profiles without a settings provider keep
+running from `config.routes` unchanged.
+
 ## State machine
 
 ```text
