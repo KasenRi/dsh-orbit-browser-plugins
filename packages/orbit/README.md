@@ -49,11 +49,13 @@ Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
 
 ## Install
 
-The stable install source is the dedicated GitHub distribution repository. This
-project does not use the npm Registry as a publication source:
+The package is published to the npm Registry; the dedicated Git distribution
+mirror remains available when a Git source is preferred:
 
 ```bash
-dsh plugin --profile web add github:KasenRi/dsh-orbit
+dsh plugin --profile web add @kasenri/dsh-orbit
+# Git source alternative, tracks the mirror repository HEAD:
+# dsh plugin --profile web add github:KasenRi/dsh-orbit
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a

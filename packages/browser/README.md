@@ -34,11 +34,13 @@ versions above, not with every future DSH release.
 
 ## Install
 
-The stable install source is the dedicated GitHub distribution repository. This
-project does not use the npm Registry as a publication source:
+The package is published to the npm Registry; the dedicated Git distribution
+mirror remains available when a Git source is preferred:
 
 ```bash
-dsh plugin --profile web add github:KasenRi/dsh-browser
+dsh plugin --profile web add @kasenri/dsh-browser
+# Git source alternative, tracks the mirror repository HEAD:
+# dsh plugin --profile web add github:KasenRi/dsh-browser
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a

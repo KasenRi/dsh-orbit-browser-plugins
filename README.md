@@ -56,30 +56,28 @@ not with every future DSH release.
 
 ## Install
 
-The stable install source is the dedicated GitHub distribution repository for
-each plugin. DSH can lock the resolved Git commit and the market can compare it
-with repository `HEAD`; this project does not use the npm Registry as a
-publication source. `pnpm` must be on `PATH`.
+Both packages are published to the npm Registry. `pnpm` must be on `PATH`.
 
 ```bash
-# Orbit plugin only (Git source, tracks repository HEAD)
-dsh plugin --profile web add github:KasenRi/dsh-orbit
+# Orbit plugin only
+dsh plugin --profile web add @kasenri/dsh-orbit
 
-# Browser plugin only (Git source, tracks repository HEAD)
-dsh plugin --profile web add github:KasenRi/dsh-browser
+# Browser plugin only
+dsh plugin --profile web add @kasenri/dsh-browser
 
 # Both (Orbit browser-capability steps may then use the browser plugin)
-dsh plugin --profile web add github:KasenRi/dsh-orbit
-dsh plugin --profile web add github:KasenRi/dsh-browser
+dsh plugin --profile web add @kasenri/dsh-orbit
+dsh plugin --profile web add @kasenri/dsh-browser
 ```
+
+The dedicated Git distribution mirrors (`github:KasenRi/dsh-orbit` and
+`github:KasenRi/dsh-browser`) track the mirror repository `HEAD` and remain
+available when a Git source is preferred; the source monorepo's versioned
+GitHub Release tarballs remain for manual or offline installation.
 
 Each package declares a `dsh.bundle` manifest, so `dsh plugin add` installs it
 and registers it as a profile layer automatically. See the package READMEs for
 configuration:
-
-The source monorepo's versioned GitHub Release tarballs remain available for
-manual, offline, or fallback installation. They are not the Market's primary
-source because a fixed Release asset has no Git `HEAD` to compare for updates.
 
 - [Orbit configuration](packages/orbit/README.md#configuration)
 - [Browser configuration](packages/browser/README.md#configuration)
@@ -151,14 +149,15 @@ requires real model credentials and is not part of the default suite.
 
 ## Distribution mirrors
 
-This repository is the canonical source monorepo. The installable Git sources
-are the generated release mirrors [`KasenRi/dsh-orbit`](https://github.com/KasenRi/dsh-orbit)
-and [`KasenRi/dsh-browser`](https://github.com/KasenRi/dsh-browser). Do not develop
+This repository is the canonical source monorepo. The npm Registry carries the
+primary release; the installable Git sources are the generated release mirrors
+[`KasenRi/dsh-orbit`](https://github.com/KasenRi/dsh-orbit) and
+[`KasenRi/dsh-browser`](https://github.com/KasenRi/dsh-browser). Do not develop
 features in the mirrors. After the release tests and `npm run build` pass, sync
 an explicit stable version with:
 
 ```bash
-npm run sync:distribution -- 0.5.0 --push
+npm run sync:distribution -- 0.5.1 --push
 ```
 
 The script copies only each package's `package.json`, `cordis.patch.yml`,
