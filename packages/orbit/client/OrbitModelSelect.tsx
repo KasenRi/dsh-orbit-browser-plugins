@@ -32,8 +32,9 @@ export interface OrbitModelSelectProps extends OrbitModelInjected {
 
 type Pane =
   | { kind: 'root' }
+  | { kind: 'role'; role: OrbitRoleName }
   | { kind: 'models'; role: OrbitRoleName }
-  | { kind: 'efforts'; role: OrbitRoleName; provider: string; modelId: string; effort: string | undefined }
+  | { kind: 'efforts'; role: OrbitRoleName }
 
 const CHEVRON = '\u203A'
 const CARET = '\u25BE'
@@ -123,10 +124,28 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   const currentRouteOf = (role: OrbitRoleName): OrbitRouteValue | undefined =>
     role === 'commander' ? config.commander : role === 'watchdog' ? config.watchdog : executorRoute
 
+  const roleLabelOf = (role: OrbitRoleName): string | undefined =>
+    role === 'commander' ? commanderLabel : role === 'watchdog' ? watchdogLabel : executorLabel
+
+  const roleEffortLabelOf = (role: OrbitRoleName): string | undefined =>
+    role === 'commander' ? commanderEffort : role === 'watchdog' ? watchdogEffort : executorEffort
+
+  const commitEffort = async (role: OrbitRoleName, route: OrbitRouteValue, effort: string | undefined): Promise<void> => {
+    const next: OrbitRouteValue = {
+      provider: route.provider,
+      model: route.model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    }
+    if (role === 'executor') {
+      await commitExecutor(next)
+      return
+    }
+    await commitRole(role, next)
+  }
+
   const modelRow = (role: OrbitRoleName, provider: string, providerName: string, model: (typeof dir.groups)[number]['models'][number]): ReactNode => {
     const current = currentRouteOf(role)
     const active = current?.provider === provider && current.model === model.id
-    const reasoning = model.reasoning
     return (
       <button
         key={`${provider}/${model.id}`}
@@ -135,11 +154,8 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
         className={css.row}
         disabled={busy}
         onClick={() => {
-          if (reasoning !== undefined && reasoning.efforts.length > 0) {
-            const effort = active
-              ? current?.reasoningEffort ?? reasoning.defaultEffort
-              : reasoning.defaultEffort
-            setPane({ kind: 'efforts', role, provider, modelId: model.id, effort })
+          if (active) {
+            setOpen(false)
             return
           }
           if (role === 'executor') {
@@ -158,31 +174,9 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
     )
   }
 
-  const effortRow = (role: OrbitRoleName, provider: string, modelId: string, id: string, label: string, effort: string | undefined, currentEffort: string | undefined): ReactNode => {
-    const healthy = pane.kind === 'efforts' ? pane.effort : currentEffort
-    const active = id === 'provider-default'
-      ? healthy === undefined
-      : healthy === effort
-    return (
-      <button
-        key={id}
-        type="button"
-        role="menuitem"
-        className={css.row}
-        disabled={busy}
-        onClick={() => {
-          if (role === 'executor') {
-            void commitExecutor({ provider, model: modelId, ...(effort === undefined ? {} : { reasoningEffort: effort }) })
-            return
-          }
-          void commitRole(role, { provider, model: modelId, ...(effort === undefined ? {} : { reasoningEffort: effort }) })
-        }}
-      >
-        <span className={css.rowLabel}>{label}</span>
-        {active ? <span className={css.check}>{'\u2713'}</span> : null}
-      </button>
-    )
-  }
+  const effortPaneRoute = pane.kind === 'efforts' ? currentRouteOf(pane.role) : undefined
+  const effortPaneModel = modelOf(dir, effortPaneRoute)
+  const effortPaneChoices = pane.kind === 'efforts' ? effortChoicesOf(effortPaneModel, t('providerDefault')) : []
 
   const settingsError = config.error
   const modelError = dir.status === 'error' ? dir.error ?? t('loadFailed') : undefined
@@ -214,18 +208,18 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
             style={{ ...(position ?? MEASURE_STYLE), maxHeight }}
             role="menu"
           >
-            {pane.kind !== 'root' ? (
+            {pane.kind === 'root' ? (
+              <div className={css.title}>{t('title')}</div>
+            ) : (
               <button
                 type="button"
                 className={css.back}
                 onClick={() => {
-                  setPane({ kind: 'root' })
+                  setPane(pane.kind === 'role' ? { kind: 'root' } : { kind: 'role', role: pane.role })
                 }}
               >
-                {`${BACK} ${t('back')}`}
+                {`${BACK} ${pane.kind === 'role' ? t('back') : t(pane.role)}`}
               </button>
-            ) : (
-              <div className={css.title}>{t('title')}</div>
             )}
 
             {settingsError === undefined ? null : (
@@ -266,7 +260,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   className={css.row}
                   disabled={busy}
                   onClick={() => {
-                    setPane({ kind: 'models', role: 'commander' })
+                    setPane({ kind: 'role', role: 'commander' })
                   }}
                 >
                   <span className={css.rowLabel}>{t('commander')}</span>
@@ -282,7 +276,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   className={css.row}
                   disabled={busy}
                   onClick={() => {
-                    setPane({ kind: 'models', role: 'executor' })
+                    setPane({ kind: 'role', role: 'executor' })
                   }}
                 >
                   <span className={css.rowLabel}>{t('executor')}</span>
@@ -299,7 +293,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   className={css.row}
                   disabled={busy}
                   onClick={() => {
-                    setPane({ kind: 'models', role: 'watchdog' })
+                    setPane({ kind: 'role', role: 'watchdog' })
                   }}
                 >
                   <span className={css.rowLabel}>{t('watchdog')}</span>
@@ -312,10 +306,43 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
               </>
             ) : null}
 
+            {pane.kind === 'role' ? (
+              <>
+                <div className={css.group}>{t(pane.role)}</div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={css.row}
+                  disabled={busy}
+                  onClick={() => {
+                    setPane({ kind: 'models', role: pane.role })
+                  }}
+                >
+                  <span className={css.rowLabel}>{t('models')}</span>
+                  <span className={css.rowValue}>{roleLabelOf(pane.role) ?? t('triggerFallback')}</span>
+                  <span className={css.chevron}>{CHEVRON}</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className={css.row}
+                  disabled={busy}
+                  onClick={() => {
+                    setPane({ kind: 'efforts', role: pane.role })
+                  }}
+                >
+                  <span className={css.rowLabel}>{t('effort')}</span>
+                  <span className={css.rowValue}>{roleEffortLabelOf(pane.role) ?? t('providerDefault')}</span>
+                  <span className={css.chevron}>{CHEVRON}</span>
+                </button>
+                {pane.role === 'executor' ? <div className={css.hint}>{t('followsSession')}</div> : null}
+              </>
+            ) : null}
+
             {pane.kind === 'models'
               ? (
                 <>
-                  <div className={css.group}>{`${t(pane.role)} · ${t('models')}`}</div>
+                  <div className={css.group}>{t('models')}</div>
                   {dir.groups.map((group) => (
                     <Fragment key={group.id}>
                       <div className={css.group}>{group.name}</div>
@@ -331,21 +358,25 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
               )
               : null}
 
-            {pane.kind === 'efforts'
+            {pane.kind === 'efforts' && effortPaneRoute !== undefined
               ? (
                 <>
-                  <div className={css.group}>{`${t(pane.role)} · ${t('effort')}`}</div>
-                  {effortChoicesOf(
-                    (() => {
-                      for (const group of dir.groups) {
-                        if (group.id !== pane.provider) continue
-                        for (const model of group.models) if (model.id === pane.modelId) return model
-                      }
-                      return undefined
-                    })(),
-                    t('providerDefault'),
-                  ).map((choice) =>
-                    effortRow(pane.role, pane.provider, pane.modelId, choice.id, choice.label, choice.effort, pane.effort))}
+                  <div className={css.group}>{t('effort')}</div>
+                  {effortPaneChoices.map((choice) => (
+                    <button
+                      key={choice.id}
+                      type="button"
+                      role="menuitem"
+                      className={css.row}
+                      disabled={busy}
+                      onClick={() => {
+                        void commitEffort(pane.role, effortPaneRoute, choice.effort)
+                      }}
+                    >
+                      <span className={css.rowLabel}>{choice.label}</span>
+                      {effortPaneRoute.reasoningEffort === choice.effort ? <span className={css.check}>{'\u2713'}</span> : null}
+                    </button>
+                  ))}
                 </>
               )
               : null}

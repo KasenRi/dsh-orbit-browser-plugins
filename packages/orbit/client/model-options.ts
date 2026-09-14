@@ -59,10 +59,44 @@ export function modelOf(state: ModelDirectoryState, route: OrbitRouteValue | und
   return undefined
 }
 
+/**
+ * UI-only fallback ladder for models whose catalog entry declares no reasoning
+ * metadata. The DSH catalog is never modified: this only fills the Orbit
+ * picker, and a provider that rejects an effort still fails through the normal
+ * selection error path.
+ */
+export const FALLBACK_REASONING_EFFORTS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max']
+
+const FALLBACK_EFFORT_LABELS: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+  max: 'Max',
+}
+
+/** One effort option as the Orbit picker shows it. */
+export interface OrbitEffortOption {
+  id: string
+  name: string
+}
+
+/**
+ * Effort options for one model: the adapter's explicit list when the catalog
+ * declares one, otherwise the Orbit UI fallback ladder.
+ */
+export function effortsOf(model: ModelEntry | undefined): OrbitEffortOption[] {
+  const explicit = model?.reasoning?.efforts ?? []
+  if (explicit.length > 0) return explicit.map((effort) => ({ id: effort.id, name: effort.name }))
+  return FALLBACK_REASONING_EFFORTS.map((id) => ({ id, name: FALLBACK_EFFORT_LABELS[id] ?? id }))
+}
+
 /** Human effort label for a stored effort id; falls back to the raw id. */
 export function effortLabelOf(model: ModelEntry | undefined, effort: string | undefined): string | undefined {
   if (effort === undefined || effort === '') return undefined
-  return model?.reasoning?.efforts.find((entry) => entry.id === effort)?.name ?? effort
+  const explicit = model?.reasoning?.efforts.find((entry) => entry.id === effort)
+  if (explicit !== undefined) return explicit.name
+  return FALLBACK_EFFORT_LABELS[effort] ?? effort
 }
 
 /** Display name for a stored route: catalog name, then its model id. */
@@ -107,18 +141,15 @@ export interface OrbitEffortChoice {
   effort?: string
 }
 
-/** Effort rows for one model; empty when the adapter publishes none. */
+/**
+ * Effort rows for one model: Provider default (an undefined effort) first,
+ * then the model's explicit ladder or the Orbit UI fallback.
+ */
 export function effortChoicesOf(model: ModelEntry | undefined, providerDefaultLabel: string): OrbitEffortChoice[] {
-  const reasoning = model?.reasoning
-  if (reasoning === undefined) return []
-  const choices: OrbitEffortChoice[] = []
-  if (reasoning.defaultEffort !== undefined) {
-    choices.push({ id: 'provider-default', label: providerDefaultLabel, effort: undefined })
-  }
-  for (const effort of reasoning.efforts) {
-    choices.push({ id: `effort:${effort.id}`, label: effort.name, effort: effort.id })
-  }
-  return choices
+  return [
+    { id: 'provider-default', label: providerDefaultLabel, effort: undefined },
+    ...effortsOf(model).map((effort) => ({ id: `effort:${effort.id}`, label: effort.name, effort: effort.id })),
+  ]
 }
 
 /** Normalize one settings wire value into a complete route. */
