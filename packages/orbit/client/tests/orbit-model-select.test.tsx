@@ -8,6 +8,7 @@ import type { ComponentProps } from 'react'
 import { OrbitModelSelect } from '../OrbitModelSelect.tsx'
 import { zh } from '../locales.ts'
 import type { OrbitRouteValue, OrbitSettingsState } from '../model-options.ts'
+import { lastAnchoredMaxHeight, lastAnchoredPosition } from './helpers/primitives-stub.tsx'
 
 const t: ComponentProps<typeof OrbitModelSelect>['t'] = (key) => (zh as Record<string, string>)[key] ?? key
 
@@ -90,6 +91,16 @@ function renderControl(parts: Harness) {
 }
 
 afterEach(cleanup)
+
+describe('Orbit panel placement', () => {
+  it('anchors the panel above the trigger and fits it to the viewport', () => {
+    const parts = harness()
+    renderControl(parts)
+    expect(lastAnchoredPosition.side).toBe('top')
+    expect(lastAnchoredPosition.gap).toBeGreaterThan(0)
+    expect(lastAnchoredMaxHeight.cap).toBeGreaterThan(0)
+  })
+})
 
 describe('Orbit executor shares the session model directory', () => {
   it('renders the current session model and submits an executor pick through the same store', async () => {

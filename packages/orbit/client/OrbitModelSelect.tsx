@@ -8,9 +8,9 @@
  * native seat uses, so the two controls are one state.
  */
 
-import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { Button, useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, useAnchoredMaxHeight, useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import {
@@ -39,6 +39,15 @@ const CHEVRON = '\u203A'
 const CARET = '\u25BE'
 const BACK = '\u2039'
 
+/** Design cap for the panel; the anchored clamp only ever lowers it. */
+const PANEL_MAX_HEIGHT = 420
+/**
+ * Hidden but laid-out first paint: the panel must be measurable before the
+ * anchored position is known, otherwise it would be placed with height 0 and
+ * grow downward off the trigger.
+ */
+const MEASURE_STYLE: CSSProperties = { visibility: 'hidden', left: 0, top: 0 }
+
 /**
  * Render the Orbit model control.
  * @param props - injected directory/settings faces plus the locale seat.
@@ -59,6 +68,9 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   const triggerRef = useRef<HTMLSpanElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
   const position = useAnchoredPosition({ open, anchorRef: triggerRef, panelRef, side: 'top', gap: 8, margin: 12 })
+  // Bottom-anchored fit: after placement the panel's bottom edge sits at the
+  // trigger top, so this clamps the design cap to the space above it.
+  const maxHeight = useAnchoredMaxHeight(panelRef, PANEL_MAX_HEIGHT, position)
   useDismissOnOutsidePointer(triggerRef, open, setOpen, panelRef)
 
   useEffect(() => {
@@ -194,9 +206,14 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
           <span className={css.chevron}>{CARET}</span>
         </Button>
       </span>
-      {open && position !== null
+      {open
         ? createPortal(
-          <div ref={panelRef} className={css.panel} style={position} role="menu">
+          <div
+            ref={panelRef}
+            className={css.panel}
+            style={{ ...(position ?? MEASURE_STYLE), maxHeight }}
+            role="menu"
+          >
             {pane.kind !== 'root' ? (
               <button
                 type="button"

@@ -25,7 +25,10 @@ export function Button({ icon, children, ...rest }: {
   )
 }
 
-export function useAnchoredPosition(_options: {
+/** Last placement options the control requested (placement assertions). */
+export const lastAnchoredPosition: { side?: 'top' | 'bottom'; gap?: number; margin?: number } = {}
+
+export function useAnchoredPosition(options: {
   open: boolean
   anchorRef: RefObject<HTMLElement | null>
   panelRef: RefObject<HTMLElement | null>
@@ -33,7 +36,20 @@ export function useAnchoredPosition(_options: {
   gap: number
   margin: number
 }): CSSProperties | null {
+  lastAnchoredPosition.side = options.side
+  lastAnchoredPosition.gap = options.gap
+  lastAnchoredPosition.margin = options.margin
   return { position: 'fixed', left: 0, top: 0 }
+}
+
+/** Last design cap the control requested (fit assertions). */
+export const lastAnchoredMaxHeight: { cap?: number } = {}
+
+export function useAnchoredMaxHeight(ref: RefObject<HTMLElement | null>, cap: number, signal: unknown): number {
+  void ref
+  void signal
+  lastAnchoredMaxHeight.cap = cap
+  return cap
 }
 
 export function useDismissOnOutsidePointer(
