@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useSyncExternalStore, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest'
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
+import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { ModelDirectoryState } from '@deepseek-ai/dsh-client-ui-model-selection/client'
-import type { ComponentProps } from 'react'
 import { OrbitModelSelect } from '../OrbitModelSelect.tsx'
 import { zh } from '../locales.ts'
-import type { OrbitRouteValue, OrbitSettingsState } from '../model-options.ts'
+import type { OrbitRouteValue, OrbitSessionState, OrbitSettingsState } from '../model-options.ts'
 import { lastAnchoredMaxHeight, lastAnchoredPosition } from './helpers/primitives-stub.tsx'
 
 const t: ComponentProps<typeof OrbitModelSelect>['t'] = (key) => (zh as Record<string, string>)[key] ?? key
@@ -55,17 +56,23 @@ function settingsState(overrides: Partial<OrbitSettingsState> = {}): OrbitSettin
 interface Harness {
   directory: SnapshotStore<ModelDirectoryState>
   settings: SnapshotStore<OrbitSettingsState>
+  projection: SnapshotStore<OrbitSessionState | undefined>
   selectModel: Mock<(selection: ModelSelection) => Promise<boolean>>
   writeRole: Mock<(role: 'commander' | 'watchdog', route: OrbitRouteValue) => Promise<boolean>>
+  setOrbitEnabled: Mock<(enabled: boolean) => Promise<boolean>>
   loadModels: Mock<() => void>
 }
 
 function harness(
   directoryInit: ModelDirectoryState = directoryState(),
   settingsInit: OrbitSettingsState = settingsState(),
+  enabledInit?: boolean,
 ): Harness {
   const directory = createSnapshotStore<ModelDirectoryState>(directoryInit)
   const settings = createSnapshotStore<OrbitSettingsState>(settingsInit)
+  const projection = createSnapshotStore<OrbitSessionState | undefined>(
+    enabledInit === undefined ? undefined : { enabled: enabledInit },
+  )
   const selectModel = vi.fn(async (selection: ModelSelection) => {
     // The real directory commits through `session.selectModel` and replays the
     // durable projection: mirror that by updating the SAME store.
@@ -73,22 +80,42 @@ function harness(
     return true
   })
   const writeRole = vi.fn(async (_role: 'commander' | 'watchdog', _route: OrbitRouteValue) => true)
-  return { directory, settings, selectModel, writeRole, loadModels: vi.fn() }
+  const setOrbitEnabled = vi.fn(async (enabled: boolean) => {
+    // The real command logs a `command/run` record the host projection folds;
+    // mirror that by updating the same store the control reads.
+    projection.set({ enabled })
+    return true
+  })
+  return { directory, settings, projection, selectModel, writeRole, setOrbitEnabled, loadModels: vi.fn() }
+}
+
+/** The session slot's projection hook, bound to one harness's store. */
+function useTestProjection(store: SnapshotStore<OrbitSessionState | undefined>): UseProjection {
+  return (() => useSyncExternalStore(
+    (listener) => store.subscribe(listener),
+    () => store.getSnapshot(),
+  )) as UseProjection
 }
 
 function renderControl(parts: Harness) {
-  return render(
-    <OrbitModelSelect
-      available
-      directory={parts.directory}
-      settings={parts.settings}
-      loadModels={parts.loadModels}
-      selectModel={parts.selectModel}
-      writeRole={parts.writeRole}
-      reloadSettings={vi.fn()}
-      t={t}
-    />,
-  )
+  function HarnessControl() {
+    const useProjection = useTestProjection(parts.projection)
+    return (
+      <OrbitModelSelect
+        available
+        directory={parts.directory}
+        settings={parts.settings}
+        loadModels={parts.loadModels}
+        selectModel={parts.selectModel}
+        writeRole={parts.writeRole}
+        setOrbitEnabled={parts.setOrbitEnabled}
+        reloadSettings={vi.fn()}
+        useProjection={useProjection}
+        t={t}
+      />
+    )
+  }
+  return render(<HarnessControl />)
 }
 
 afterEach(cleanup)
@@ -391,10 +418,99 @@ describe('Orbit model control failure surfaces', () => {
         loadModels={parts.loadModels}
         selectModel={parts.selectModel}
         writeRole={parts.writeRole}
+        setOrbitEnabled={parts.setOrbitEnabled}
         reloadSettings={vi.fn()}
+        useProjection={useTestProjection(parts.projection)}
         t={t}
       />,
     )
     expect(screen.queryByRole('button')).toBeNull()
+  })
+})
+
+describe('Orbit per-Session enable toggle', () => {
+  it('defaults to OFF and shows Orbit Off on the trigger', () => {
+    const parts = harness()
+    renderControl(parts)
+    const trigger = screen.getByTitle('Orbit 模型配置')
+    expect(trigger.textContent).toContain('Orbit Off')
+    expect(trigger.textContent).not.toContain('DeepSeek-V4-Pro')
+  })
+
+  it('shows the Commander model and effort once the Session is enabled', () => {
+    const parts = harness(directoryState(), settingsState(), true)
+    renderControl(parts)
+    const trigger = screen.getByTitle('Orbit 模型配置')
+    expect(trigger.textContent).toContain('DeepSeek-V4-Pro')
+    expect(trigger.textContent).toContain('High')
+    expect(trigger.textContent).not.toContain('Orbit Off')
+  })
+
+  it('renders the switch in the root menu and turns the Session on', async () => {
+    const parts = harness()
+    renderControl(parts)
+    openRoot()
+
+    const switchControl = screen.getByRole('switch', { name: '本会话 Orbit 开关' })
+    expect(switchControl.getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(switchControl)
+
+    await waitFor(() => {
+      expect(parts.setOrbitEnabled).toHaveBeenCalledWith(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('DeepSeek-V4-Pro')
+    })
+  })
+
+  it('turns the Session back off from the switch', async () => {
+    const parts = harness(directoryState(), settingsState(), true)
+    renderControl(parts)
+    openRoot()
+
+    fireEvent.click(screen.getByRole('switch', { name: '本会话 Orbit 开关' }))
+
+    await waitFor(() => {
+      expect(parts.setOrbitEnabled).toHaveBeenCalledWith(false)
+    })
+    await waitFor(() => {
+      expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('Orbit Off')
+    })
+  })
+
+  it('restores the stored state on a fresh mount', () => {
+    const parts = harness(directoryState(), settingsState(), true)
+    renderControl(parts)
+    expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('DeepSeek-V4-Pro')
+  })
+
+  it('keeps Sessions isolated: toggling one control leaves the other unchanged', async () => {
+    const a = harness()
+    const b = harness()
+    renderControl(a)
+    renderControl(b)
+    const triggers = screen.getAllByTitle('Orbit 模型配置')
+    expect(triggers[0]?.textContent).toContain('Orbit Off')
+    expect(triggers[1]?.textContent).toContain('Orbit Off')
+
+    fireEvent.click(triggers[0] as HTMLElement)
+    // Only the first Session's panel is open, so its switch is the only one.
+    fireEvent.click(screen.getByRole('switch', { name: '本会话 Orbit 开关' }))
+
+    await waitFor(() => {
+      expect(a.setOrbitEnabled).toHaveBeenCalledWith(true)
+      expect(b.setOrbitEnabled).not.toHaveBeenCalled()
+    })
+    const after = screen.getAllByTitle('Orbit 模型配置')
+    expect(after[0]?.textContent).toContain('DeepSeek-V4-Pro')
+    expect(after[1]?.textContent).toContain('Orbit Off')
+  })
+
+  it('still lets role pages be configured while OFF', () => {
+    const parts = harness()
+    renderControl(parts)
+    openRole('指挥官')
+    expect(screen.getByRole('menuitem', { name: /^模型/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /^推理等级/ })).toBeTruthy()
   })
 })

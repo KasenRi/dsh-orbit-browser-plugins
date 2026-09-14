@@ -15,7 +15,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
+import type { Session } from '@deepseek-ai/dsh-session'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { ORBIT_TOGGLE_COMMAND, parseOrbitToggle } from './session-state.ts'
 
 export const AGENT_ORBIT_COMMAND = 'agent-orbit'
 
@@ -58,6 +60,21 @@ export function invokedOrbitActivation(messages: readonly UserMessage[]): OrbitA
   return undefined
 }
 
+/** The newest genuine user message text, as the implicit activation's goal. */
+export function invokedOrbitMessage(messages: readonly UserMessage[]): OrbitActivation | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message === undefined || message.source.kind !== 'user') continue
+    const text = message.content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n')
+      .trim()
+    if (text !== '') return { goal: text }
+  }
+  return undefined
+}
+
 /**
  * The one deterministic directive injected for an explicit activation. It only
  * states the activation and carries the goal verbatim; every Orbit rule still
@@ -74,6 +91,18 @@ export function buildOrbitActivationDirective(goal: string): string {
       : `Goal: ${goal}`,
   )
   return lines.join('\n')
+}
+
+/**
+ * The directive for a Session whose toggle is ON: an ordinary user message
+ * becomes the Orbit goal without changing the activation machinery.
+ */
+export function buildOrbitSessionDirective(goal: string): string {
+  return [
+    'Orbit is enabled for this chat, so treat this ordinary user message as the requested goal. Start or resume Orbit through the existing orbit_controller tool; do not ask the user to confirm the mode.',
+    'Use the message as the goal, without summarizing or rewriting it.',
+    `Goal: ${goal}`,
+  ].join('\n')
 }
 
 /**
@@ -110,25 +139,74 @@ export function registerOrbitCommand(ctx: Context): void {
 }
 
 /**
+ * Register the `/orbit-toggle on|off` host command.
+ *
+ * The command writes nothing itself: the commands runtime logs its own
+ * `command/run` record, and the `orbitSession` projection folds that record
+ * into the per-Session state the toggle UI reads. Registering it also gives
+ * CLI surfaces the same switch.
+ */
+export function registerOrbitToggleCommand(ctx: Context): void {
+  ctx.effect(
+    () =>
+      ctx.commands.register({
+        name: ORBIT_TOGGLE_COMMAND,
+        description: 'Turn the per-chat Orbit default on or off without starting a run',
+        input: { hint: 'on or off' },
+        handler(invocation: CommandInvocation): CommandResult {
+          const enabled = parseOrbitToggle(invocation.rawInput)
+          if (enabled === undefined) {
+            return { kind: 'error', text: `Usage: /${ORBIT_TOGGLE_COMMAND} on|off — 请输入 on 或 off。` }
+          }
+          return {
+            kind: 'success',
+            text: enabled
+              ? 'Orbit is on for this chat — ordinary messages will enter Orbit.'
+              : 'Orbit is off for this chat — ordinary messages stay native.',
+          }
+        },
+      }),
+    'dsh-orbit: /orbit-toggle host command',
+  )
+}
+
+export interface OrbitGestureBoundaryOptions {
+  /** Whether the current Session defaults ordinary messages into Orbit. */
+  sessionEnabled?: (session: Session) => boolean
+}
+
+/**
  * Install the gesture boundary. It runs for every proposed step and injects
  * the activation directive once, for the step that carries the genuine user
  * message. The in-step guard keeps a step that already holds an Orbit
  * directive from gaining a second one, without any durable state.
+ *
+ * An explicit `/agent-orbit` always wins and always activates, whatever the
+ * Session toggle says. Only when no explicit activation is present does the
+ * Session toggle (when the composition provides it) promote an ordinary user
+ * message into an Orbit goal.
  */
-export function installOrbitGestureBoundary(ctx: Context): void {
-  ctx.on('agent/pre-step', async ({ messages, signal }, next): Promise<PreStepDecision> => {
+export function installOrbitGestureBoundary(ctx: Context, options: OrbitGestureBoundaryOptions = {}): void {
+  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
     if (decision.messages.some((message) => message.source.kind === 'orbit-command')) return decision
-    const activation = invokedOrbitActivation(messages)
-    if (activation === undefined) return decision
+    const explicit = invokedOrbitActivation(messages)
+    const implicit = explicit === undefined && options.sessionEnabled?.(agent.session) === true
+      ? invokedOrbitMessage(messages)
+      : undefined
+    if (explicit === undefined && implicit === undefined) return decision
     signal.throwIfAborted()
+    const activation: OrbitActivation = explicit ?? implicit ?? { goal: '' }
+    const directive = explicit === undefined
+      ? buildOrbitSessionDirective(activation.goal)
+      : buildOrbitActivationDirective(activation.goal)
     return {
       kind: 'enter',
       messages: [
         ...decision.messages,
         createUserMessage({
-          content: [{ type: 'text', text: buildOrbitActivationDirective(activation.goal) }],
+          content: [{ type: 'text', text: directive }],
           source: { kind: 'orbit-command', ...(activation.goal === '' ? {} : { goal: activation.goal }) },
         }),
       ],

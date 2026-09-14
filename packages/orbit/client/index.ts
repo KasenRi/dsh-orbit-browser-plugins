@@ -140,6 +140,16 @@ export function apply(ctx: Context): void {
           ? directory.select(selection).then(() => true, () => false)
           : Promise.resolve(false),
         writeRole,
+        setOrbitEnabled: async (enabled) => {
+          const session = sessions.binding(sessionId)?.session
+          if (session === undefined) return false
+          try {
+            const result = await session.command(`/orbit-toggle ${enabled ? 'on' : 'off'}`)
+            return result.ok && result.value.matched
+          } catch {
+            return false
+          }
+        },
         reloadSettings,
       }
     }

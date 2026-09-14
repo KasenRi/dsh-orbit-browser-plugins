@@ -10,8 +10,9 @@
 
 import { Fragment, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { Button, useAnchoredMaxHeight, useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Switch, useAnchoredMaxHeight, useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
+import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   effortChoicesOf,
@@ -28,6 +29,8 @@ import css from './OrbitModelSelect.module.css'
 
 export interface OrbitModelSelectProps extends OrbitModelInjected {
   t: TranslateNS<'orbit-model'>
+  /** Host-computed projection values (session-scoped slot standard props). */
+  useProjection: UseProjection
 }
 
 type Pane =
@@ -54,7 +57,7 @@ const MEASURE_STYLE: CSSProperties = { visibility: 'hidden', left: 0, top: 0 }
  * @param props - injected directory/settings faces plus the locale seat.
  * @returns the trigger and, while open, the panel.
  */
-export function OrbitModelSelect({ t, available, directory, settings, loadModels, selectModel, writeRole, reloadSettings }: OrbitModelSelectProps) {
+export function OrbitModelSelect({ t, available, directory, settings, loadModels, selectModel, writeRole, setOrbitEnabled, reloadSettings, useProjection }: OrbitModelSelectProps) {
   const dir = useSyncExternalStore(
     (listener) => directory.subscribe(listener),
     () => directory.getSnapshot(),
@@ -63,6 +66,22 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
     (listener) => settings.subscribe(listener),
     () => settings.getSnapshot(),
   )
+  // Canonical enable state comes from the Session's own projection; the local
+  // value only bridges the click-to-projection round trip (never the source).
+  const orbitSession = useProjection('orbitSession')
+  const [orbitOverride, setOrbitOverride] = useState<boolean | null>(null)
+  const [orbitPending, setOrbitPending] = useState(false)
+  const orbitEnabled = orbitOverride ?? orbitSession?.enabled === true
+  useEffect(() => {
+    if (orbitOverride !== null && orbitSession?.enabled === orbitOverride) setOrbitOverride(null)
+  }, [orbitOverride, orbitSession?.enabled])
+  const toggleOrbit = async (next: boolean): Promise<void> => {
+    setOrbitOverride(next)
+    setOrbitPending(true)
+    const ok = await setOrbitEnabled(next)
+    setOrbitPending(false)
+    if (!ok) setOrbitOverride(null)
+  }
   const [open, setOpen] = useState(false)
   const [pane, setPane] = useState<Pane>({ kind: 'root' })
   const [busy, setBusy] = useState(false)
@@ -193,10 +212,10 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
             setOpen((value) => !value)
           }}
         >
-          {commanderLabel}
-          {commanderEffort === undefined ? null : (
+          {orbitEnabled ? commanderLabel : t('orbitOff')}
+          {orbitEnabled && commanderEffort !== undefined ? (
             <span style={{ color: 'var(--dsw-alias-label-tertiary)' }}>{` ${commanderEffort}`}</span>
-          )}
+          ) : null}
           <span className={css.chevron}>{CARET}</span>
         </Button>
       </span>
@@ -254,6 +273,19 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
 
             {pane.kind === 'root' ? (
               <>
+                <div className={css.switchRow}>
+                  <span className={css.rowLabel}>{t('orbit')}</span>
+                  <Switch
+                    className={css.switchControl}
+                    checked={orbitEnabled}
+                    disabled={orbitPending}
+                    label={t('orbitSwitchLabel')}
+                    onChange={(next) => {
+                      void toggleOrbit(next)
+                    }}
+                  />
+                </div>
+                <div className={css.separator} />
                 <button
                   type="button"
                   role="menuitem"

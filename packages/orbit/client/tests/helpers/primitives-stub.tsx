@@ -28,6 +28,32 @@ export function Button({ icon, children, ...rest }: {
 /** Last placement options the control requested (placement assertions). */
 export const lastAnchoredPosition: { side?: 'top' | 'bottom'; gap?: number; margin?: number } = {}
 
+export function Switch({ checked, onChange, label, disabled, title, className }: {
+  checked: boolean
+  onChange: (next: boolean) => void
+  label: string
+  disabled?: boolean | undefined
+  title?: string | undefined
+  className?: string | undefined
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      className={className}
+      onClick={() => {
+        onChange(!checked)
+      }}
+    >
+      <span />
+    </button>
+  )
+}
+
 export function useAnchoredPosition(options: {
   open: boolean
   anchorRef: RefObject<HTMLElement | null>

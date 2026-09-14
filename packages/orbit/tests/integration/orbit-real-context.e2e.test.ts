@@ -555,3 +555,108 @@ test('real host agent loop: a normal user turn runs on the same real Context', {
     await root.fiber.dispose()
   }
 })
+
+function readRunState(dir: string): Record<string, unknown> | undefined {
+  const path = join(dir, '.cx', 'state.json')
+  if (!existsSync(path)) return undefined
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+  } catch {
+    return undefined
+  }
+}
+
+test('real session toggle: /orbit-toggle is durable and promotes ordinary messages', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-toggle')
+  try {
+    const descriptor = root.commands.list(parent.agent).find((entry) => entry.name === 'orbit-toggle')
+    assert.ok(descriptor, 'orbit-toggle must be listed for the slash menu')
+
+    // A new Session starts OFF.
+    assert.equal(root.sessionProjections.stateOf(parent.agent.session, 'orbitSession')?.enabled, false)
+
+    const on = await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal)
+    assert.ok(on)
+    assert.equal(on.result.kind, 'success')
+    const record = parent.agent.session
+      .snapshotEvents()
+      .find((event) => event.type === 'command/run' && (event.data as { name?: string }).name === 'orbit-toggle')
+    assert.ok(record, 'the toggle must be a durable command/run record')
+    assert.equal((record.data as { args?: string }).args?.trim(), 'on')
+    assert.equal(root.sessionProjections.stateOf(parent.agent.session, 'orbitSession')?.enabled, true)
+    assert.equal(existsSync(join(project.dir, '.cx', 'state.json')), false, 'toggling must not start a run')
+
+    // An ordinary message now activates through the existing boundary.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'fix the failing test' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    let directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
+    assert.equal(directives.length, 1, 'the enabled Session activates the ordinary message exactly once')
+    assert.equal(directives[0]?.source.goal, 'fix the failing test')
+    assert.match(textOf(directives[0] as SessionMessageLike), /Orbit is enabled for this chat/)
+
+    // Explicit /agent-orbit while ON must not double activate.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit explicit goal' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
+    assert.equal(directives.length, 2, 'explicit activation must not be doubled by the toggle')
+    assert.equal(directives[1]?.source.goal, 'explicit goal')
+    assert.match(textOf(directives[1] as SessionMessageLike), /Orbit activation is explicit/)
+
+    // OFF keeps ordinary chat native; the explicit command still works.
+    const off = await root.commands.execute(parent.agent, '/orbit-toggle off', [], new AbortController().signal)
+    assert.ok(off)
+    assert.equal(off.result.kind, 'success')
+    assert.equal(root.sessionProjections.stateOf(parent.agent.session, 'orbitSession')?.enabled, false)
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'just chat now' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    assert.equal(
+      userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
+      2,
+      'OFF must keep ordinary messages native',
+    )
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit still explicit' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
+    assert.equal(directives.length, 3, '/agent-orbit must work while OFF')
+    assert.equal(directives[2]?.source.goal, 'still explicit')
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real session toggle: turning OFF during an active run never stops or mutates it', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter({ hangFirstExecutor: true, runtimeDiagnose: '{"decision":"RESTART_STEP"}' })
+  const root = await boot(adapter, { executorTimeoutMs: 1500 })
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-toggle-run')
+  try {
+    const run = root.agents.withInitiator(parent.agent, () =>
+      root.orbit.run({ goal: 'toggle during run', approved_loop_count: 2 }, project.dir, new AbortController().signal),
+    )
+    await waitUntil(() => readRunState(project.dir)?.phase === 'EXECUTE', 20_000)
+    const before = readRunState(project.dir)
+    assert.ok(before, 'the run must have written its durable state')
+
+    const off = await root.commands.execute(parent.agent, '/orbit-toggle off', [], new AbortController().signal)
+    assert.ok(off)
+    assert.equal(off.result.kind, 'success')
+
+    const after = readRunState(project.dir)
+    assert.equal(after?.run_id, before.run_id, 'the toggle must not replace the run')
+    assert.deepEqual(after?.routes, before.routes, 'the toggle must not touch the frozen routes')
+    assert.notEqual(after?.driver_ownership, 'CLOSED', 'the toggle must not close the active driver')
+
+    const result = await run
+    assert.equal(result.ok, true, result.message)
+    assert.equal(result.phase, 'SUCCESS', 'the run must finish normally after the toggle')
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})

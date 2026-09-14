@@ -2,9 +2,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
-import { installOrbitGestureBoundary, registerOrbitCommand } from './activation.ts'
+import { installOrbitGestureBoundary, registerOrbitCommand, registerOrbitToggleCommand } from './activation.ts'
 import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
 import { resolveEffectiveRoutes, sessionSelectionOf, type OrbitRouteSettings } from './routes.ts'
+import { installOrbitSessionProjection, orbitEnabledOf } from './session-state.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
 import type { OrbitRoute, OrbitRoutes } from './types.ts'
@@ -145,9 +146,19 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
   if (config.slashCommand) {
     ctx.inject(['commands'], (commandCtx) => {
       registerOrbitCommand(commandCtx)
+      registerOrbitToggleCommand(commandCtx)
     })
-    installOrbitGestureBoundary(ctx)
+    installOrbitGestureBoundary(ctx, {
+      sessionEnabled: (session) => orbitEnabledOf(ctx, session),
+    })
   }
+
+  // Per-Session Orbit enable state: natively durable through the Session log
+  // and the projection registry. Minimal compositions without the registry
+  // keep the feature inert (OFF) while `/agent-orbit` keeps working.
+  ctx.inject(['sessionProjections'], (projectionCtx) => {
+    installOrbitSessionProjection(projectionCtx)
+  })
 
   if (config.registerGuards) {
     const handler = createOrbitPreExecuteHandler(service, {

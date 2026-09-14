@@ -52,6 +52,17 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
+.switchRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 6px;
+}
+
+.switchControl {
+  margin-left: auto;
+}
+
 .rowLabel {
   flex: none;
 }

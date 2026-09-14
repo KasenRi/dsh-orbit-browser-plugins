@@ -7,6 +7,7 @@
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { ModelDirectoryState } from '@deepseek-ai/dsh-client-ui-model-selection/client'
+import type {} from '@deepseek-ai/dsh-session-projection/types'
 
 /** One stored role route (`OrbitRoute` without transport-only fields). */
 export interface OrbitRouteValue {
@@ -19,6 +20,22 @@ export interface OrbitRouteValue {
 export type OrbitRoleName = 'commander' | 'executor' | 'watchdog'
 
 type ModelEntry = ModelDirectoryState['groups'][number]['models'][number]
+
+/** Per-Session Orbit enable state, folded by the host from `/orbit-toggle` records. */
+export interface OrbitSessionState {
+  readonly enabled: boolean
+}
+
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    /** Per-Session Orbit enable state folded from `/orbit-toggle` records. */
+    orbitSession: OrbitSessionState
+  }
+  interface SessionProjectionMap {
+    /** Per-Session Orbit enable state as this control reads it. */
+    orbitSession: OrbitSessionState
+  }
+}
 
 /** Mirror of the `orbit` settings namespace, React-free. */
 export interface OrbitSettingsState {
@@ -43,6 +60,8 @@ export interface OrbitModelInjected {
   selectModel: (selection: ModelSelection) => Promise<boolean>
   /** Persist one Commander/Watchdog route; never touches the Session model. */
   writeRole: (role: 'commander' | 'watchdog', route: OrbitRouteValue) => Promise<boolean>
+  /** Toggle the current Session's Orbit default (host command, durable record). */
+  setOrbitEnabled: (enabled: boolean) => Promise<boolean>
   /** Re-read the `orbit` settings namespace after a failure. */
   reloadSettings: () => void
 }
