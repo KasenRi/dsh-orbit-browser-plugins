@@ -146,6 +146,9 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   const roleLabelOf = (role: OrbitRoleName): string | undefined =>
     role === 'commander' ? commanderLabel : role === 'watchdog' ? watchdogLabel : executorLabel
 
+  const roleModelLabelOf = (role: OrbitRoleName): string =>
+    t(role === 'commander' ? 'commanderModel' : role === 'executor' ? 'executorModel' : 'watchdogModel')
+
   const roleEffortLabelOf = (role: OrbitRoleName): string | undefined =>
     role === 'commander' ? commanderEffort : role === 'watchdog' ? watchdogEffort : executorEffort
 
@@ -274,7 +277,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
             {pane.kind === 'root' ? (
               <>
                 <div className={css.switchRow}>
-                  <span className={css.rowLabel}>{t('orbit')}</span>
+                  <span className={css.rowLabel}>{t('enableLongRun')}</span>
                   <Switch
                     className={css.switchControl}
                     checked={orbitEnabled}
@@ -340,7 +343,6 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
 
             {pane.kind === 'role' ? (
               <>
-                <div className={css.group}>{t(pane.role)}</div>
                 <button
                   type="button"
                   role="menuitem"
@@ -350,7 +352,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                     setPane({ kind: 'models', role: pane.role })
                   }}
                 >
-                  <span className={css.rowLabel}>{t('models')}</span>
+                  <span className={css.rowLabel}>{roleModelLabelOf(pane.role)}</span>
                   <span className={css.rowValue}>{roleLabelOf(pane.role) ?? t('triggerFallback')}</span>
                   <span className={css.chevron}>{CHEVRON}</span>
                 </button>
@@ -414,7 +416,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
               : null}
 
             <div className={css.separator} />
-            <div className={css.hint}>{t('nextRunOnly')}</div>
+            <div className={css.hint}>{t('applyOnNextSend')}</div>
           </div>,
           document.body,
         )

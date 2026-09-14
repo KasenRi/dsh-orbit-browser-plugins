@@ -121,10 +121,16 @@ function renderControl(parts: Harness) {
 afterEach(cleanup)
 
 const ROLE_ROWS = [
-  ['指挥官', 'DeepSeek-V4-Pro', 'High'],
-  ['执行员', 'DeepSeek-V4-Flash', 'Low'],
-  ['监控模型', 'DeepSeek-V4-Flash', 'Low'],
+  ['指挥官', '指挥官模型', 'DeepSeek-V4-Pro', 'High'],
+  ['执行员', '执行员模型', 'DeepSeek-V4-Flash', 'Low'],
+  ['监控模型', '监控模型', 'DeepSeek-V4-Flash', 'Low'],
 ] as const
+
+const ROLE_MODEL_LABELS: Record<string, string> = {
+  指挥官: '指挥官模型',
+  执行员: '执行员模型',
+  监控模型: '监控模型',
+}
 
 /** Click the Orbit trigger (assumes the panel is closed). */
 function openRoot(): void {
@@ -140,7 +146,7 @@ function openRole(name: string): void {
 /** Open one role's model list from its role page. */
 function openRoleModels(name: string): void {
   openRole(name)
-  fireEvent.click(screen.getByRole('menuitem', { name: /^模型/ }))
+  fireEvent.click(screen.getByRole('menuitem', { name: new RegExp(`^${ROLE_MODEL_LABELS[name] ?? '模型'}`) }))
 }
 
 /** Open one role's effort list from its role page. */
@@ -160,14 +166,18 @@ describe('Orbit panel placement', () => {
 })
 
 describe('Orbit role pages offer model and reasoning effort as separate entries', () => {
-  it.each(ROLE_ROWS)('%s shows both rows with its current values', (role, modelName, effortName) => {
+  it.each(ROLE_ROWS)('%s shows the merged model row with no duplicate role title', (role, modelLabel, modelName, effortName) => {
     renderControl(harness())
     openRole(role)
 
-    const modelRow = screen.getByRole('menuitem', { name: /^模型/ })
+    const modelRow = screen.getByRole('menuitem', { name: new RegExp(`^${modelLabel}`) })
     expect(modelRow.textContent).toContain(modelName)
     const effortRow = screen.getByRole('menuitem', { name: /^推理等级/ })
     expect(effortRow.textContent).toContain(effortName)
+
+    // The old standalone role heading is gone: the label only lives inside a menuitem.
+    const headings = screen.queryAllByText(role).filter((element) => element.closest('[role="menuitem"]') === null)
+    expect(headings).toHaveLength(0)
   })
 
   it('shows Provider default for a role without a stored effort', () => {
@@ -368,7 +378,7 @@ describe('Orbit executor shares the session model directory', () => {
     expect(executorRow.textContent).toContain('跟随当前会话模型')
     fireEvent.click(executorRow)
 
-    fireEvent.click(screen.getByRole('menuitem', { name: /^模型/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /^执行员模型/ }))
     fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4-Pro/ }))
 
     await waitFor(() => {
@@ -510,7 +520,29 @@ describe('Orbit per-Session enable toggle', () => {
     const parts = harness()
     renderControl(parts)
     openRole('指挥官')
-    expect(screen.getByRole('menuitem', { name: /^模型/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /^指挥官模型/ })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /^推理等级/ })).toBeTruthy()
+  })
+})
+
+describe('Orbit menu copy and hierarchy', () => {
+  it('shows the refined root copy and drops the old footer', () => {
+    renderControl(harness())
+    openRoot()
+
+    expect(screen.getByText('Orbit 让AI自我审核连续执行')).toBeTruthy()
+    expect(screen.getByText('启用一键长执行')).toBeTruthy()
+    expect(screen.getByText('更改将会在下一次发送时生效')).toBeTruthy()
+    expect(screen.queryByText('更改应用于下一个新的 Orbit 运行')).toBeNull()
+    expect(screen.getByRole('menuitem', { name: /指挥官/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /执行员/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /监控模型/ })).toBeTruthy()
+  })
+
+  it('never renders a duplicated watchdog label', () => {
+    renderControl(harness())
+    openRole('监控模型')
+    expect(screen.queryByText('监控模型模型')).toBeNull()
+    expect(screen.getByRole('menuitem', { name: /^监控模型/ })).toBeTruthy()
   })
 })

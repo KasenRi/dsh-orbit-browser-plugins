@@ -7,13 +7,16 @@ export const NS = 'orbit-model'
 export const en = {
   triggerFallback: 'Orbit',
   tooltip: 'Orbit model configuration',
-  title: 'Orbit',
-  orbit: 'Orbit',
+  title: 'Orbit — Self-reviewing continuous execution',
+  enableLongRun: 'Enable long-running execution',
   orbitOff: 'Orbit Off',
   orbitSwitchLabel: 'Orbit for this chat',
   commander: 'Commander',
   executor: 'Executor',
   watchdog: 'Watchdog',
+  commanderModel: 'Commander model',
+  executorModel: 'Executor model',
+  watchdogModel: 'Watchdog model',
   followsSession: 'Follows current session model',
   models: 'Model',
   effort: 'Reasoning effort',
@@ -23,20 +26,23 @@ export const en = {
   loadFailed: 'Failed to load models',
   settingsFailed: 'Failed to load Orbit settings',
   saveFailed: 'Failed to save Orbit settings',
-  nextRunOnly: 'Changes apply to the next Orbit run',
+  applyOnNextSend: 'Changes apply to the next message',
 }
 
 /** Chinese strings. */
 export const zh: Record<keyof typeof en, string> = {
   triggerFallback: 'Orbit',
   tooltip: 'Orbit 模型配置',
-  title: 'Orbit',
-  orbit: 'Orbit',
+  title: 'Orbit 让AI自我审核连续执行',
+  enableLongRun: '启用一键长执行',
   orbitOff: 'Orbit Off',
   orbitSwitchLabel: '本会话 Orbit 开关',
   commander: '指挥官',
   executor: '执行员',
   watchdog: '监控模型',
+  commanderModel: '指挥官模型',
+  executorModel: '执行员模型',
+  watchdogModel: '监控模型',
   followsSession: '跟随当前会话模型',
   models: '模型',
   effort: '推理等级',
@@ -46,7 +52,7 @@ export const zh: Record<keyof typeof en, string> = {
   loadFailed: '模型列表加载失败',
   settingsFailed: 'Orbit 设置加载失败',
   saveFailed: 'Orbit 设置保存失败',
-  nextRunOnly: '更改应用于下一个新的 Orbit 运行',
+  applyOnNextSend: '更改将会在下一次发送时生效',
 }
 
 export type OrbitModelKey = keyof typeof en

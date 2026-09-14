@@ -21,10 +21,11 @@
 
 .title {
   padding: 6px 8px 2px;
+  overflow: hidden;
   color: var(--dsw-alias-label-tertiary);
   font-size: 11px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .group {
