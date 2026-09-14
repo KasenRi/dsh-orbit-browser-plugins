@@ -157,7 +157,7 @@ features in the mirrors. After the release tests and `npm run build` pass, sync
 an explicit stable version with:
 
 ```bash
-npm run sync:distribution -- 0.5.1 --push
+npm run sync:distribution -- 0.5.2 --push
 ```
 
 The script copies only each package's `package.json`, `cordis.patch.yml`,
