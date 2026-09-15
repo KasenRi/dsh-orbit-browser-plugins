@@ -74,6 +74,12 @@ export interface OrbitState extends Record<string, unknown> {
   changed_files: string[]
   test_summary: string[]
   last_error: string | null
+  /**
+   * Latest user reply that resumed a NEEDS_USER run. The original `goal` is
+   * never rewritten; this durable field is what the Commander and Executor
+   * read while the run continues. Absent on runs created before the field.
+   */
+  pending_user_reply?: string | null
   user_hard_constraints: string[]
   github_allowed: boolean
   smart_watchdog?: { step_id?: string; calls: number; last_decision?: string; last_reason?: string }

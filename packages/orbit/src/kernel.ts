@@ -202,16 +202,19 @@ export function createInitialState(input: InitialStateInput): OrbitState {
     changed_files: [],
     test_summary: [],
     last_error: null,
+    pending_user_reply: null,
     user_hard_constraints: input.userHardConstraints ? [...input.userHardConstraints] : [],
     github_allowed: input.githubAllowed === true,
     interruption_retries: 0,
   }
 }
 
-/** A user answers a NEEDS_USER run with the same goal: execution continues. */
-export function resumeFromNeedsUser(state: OrbitState): void {
+/** A user answers a NEEDS_USER run: execution continues with the reply kept durable. */
+export function resumeFromNeedsUser(state: OrbitState, userReply?: string): void {
   state.phase = 'EXECUTE'
   state.status = 'running'
+  const reply = (userReply ?? '').trim()
+  if (reply !== '') state.pending_user_reply = reply
 }
 
 /** Accept the Commander plan and move to execution. */

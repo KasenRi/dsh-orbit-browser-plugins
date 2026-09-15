@@ -135,11 +135,11 @@ interface AuxRoleRequest {
   outputSchema?: ObjectJsonSchema
 }
 
-const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[]) => `You are the Orbit Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
+const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string) => `You are the Orbit Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
 Rules: ordinary engineering steps must omit capabilities. Add capability "browser" only when the step must drive a real web page, and "web-api-recon" when it must analyze captured network/API traffic. Keep it minimal.
 Submit your final plan through the structured result protocol.
 Goal: ${goal}
-Hard constraints: ${constraints.join('; ') || 'none'}`
+Hard constraints: ${constraints.join('; ') || 'none'}${userReply}`
 
 const COMMANDER_STEP_PROMPT = (
   goal: string,
@@ -152,7 +152,7 @@ Allowed decisions ONLY: PASS_CURRENT_STEP | CORRECT_CURRENT_STEP | NEEDS_USER.
 Submit your final judgment through the structured result protocol.
 Original goal: ${goal}
 Current step ${step.id}: ${step.goal}
-Iteration counters: loop ${state.loop.used}/${state.loop.max}
+Iteration counters: loop ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
 Executor claim:
 ${evidence}`
 
@@ -164,9 +164,17 @@ Submit your final judgment through the structured result protocol.
 Original goal: ${goal}
 Plan summary: ${plan.summary}
 Steps: ${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}]`).join('; ')}
-Loop: ${state.loop.used}/${state.loop.max}
+Loop: ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
 Executor claim:
 ${evidence}`
+
+/**
+ * The durable user reply line for role prompts. The reply is the user's answer
+ * to a NEEDS_USER question and never replaces the original goal.
+ */
+function userReplyLine(state: OrbitState): string {
+  return state.pending_user_reply ? `\nUser reply (the user's answer to the previous question): ${state.pending_user_reply}` : ''
+}
 
 const COMMANDER_STRATEGY_PROMPT = (goal: string, base: string, challenge: string, state: OrbitState) =>
   `You are the Orbit Commander reconsidering strategy after a repeated correction on ${base} (STRATEGY_RECONSIDER).
@@ -260,17 +268,18 @@ export class OrbitSupervisor {
     if (['SUCCESS', 'STOPPED', 'BUDGET_EXHAUSTED'].includes(state.phase) && requestedGoal) {
       state = this.store.writeState(this.createState(input))
     }
-    if (!legacy && requestedGoal && state.goal && state.goal !== requestedGoal) {
+    if (state.phase === 'NEEDS_USER' && requestedGoal) {
+      // A reply to the Commander's question is not a new goal: keep the run,
+      // its original goal and its frozen routes, and carry the reply durably.
+      resumeFromNeedsUser(state, requestedGoal)
+      this.store.writeState(state)
+    } else if (!legacy && requestedGoal && state.goal && state.goal !== requestedGoal) {
       return {
         ok: false,
         action: 'run',
         run_id: state.run_id,
         message: 'ORBIT_ACTIVE_RUN_EXISTS: current Lite run owns this project; resume it or stop it before starting a different goal.',
       }
-    }
-    if (state.phase === 'NEEDS_USER' && requestedGoal) {
-      resumeFromNeedsUser(state)
-      this.store.writeState(state)
     }
     return this.run(state, signal)
   }
@@ -358,7 +367,7 @@ export class OrbitSupervisor {
     const outcome = await this.runCommander(
       state,
       'PLAN',
-      COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints),
+      COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints, userReplyLine(state)),
       COMMANDER_PLAN_SCHEMA,
       signal,
     )
@@ -645,6 +654,7 @@ export class OrbitSupervisor {
       `Working directory: ${join(this.store.stateDir, '..')}`,
       `Hard constraints: ${state.user_hard_constraints.join('; ') || 'none'}`,
     ]
+    if (state.pending_user_reply) lines.push(`User reply (the user's answer to the previous question): ${state.pending_user_reply}`)
     if ((step.capabilities ?? []).length > 0) lines.push(`Capabilities: ${(step.capabilities ?? []).join(', ')}`)
     lines.push('Return a compact evidence summary: what changed, commands/tests run, and residual risks.')
     return lines.join('\n')
@@ -1006,6 +1016,7 @@ export class OrbitSupervisor {
       strategy_challenge: state.strategy_challenge,
       guard_recovery: state.guard_recovery,
       last_error: state.last_error,
+      pending_user_reply: state.pending_user_reply,
       changed_files: state.changed_files,
       test_summary: state.test_summary,
       driver_ownership: state.driver_ownership,

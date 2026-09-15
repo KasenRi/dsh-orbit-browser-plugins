@@ -1,13 +1,14 @@
 /**
  * Deterministic Orbit activation.
  *
- * - `/agent-orbit` (host command or genuine-message gesture) keeps its explicit
- *   directive; the existing `orbit_controller` tool + `OrbitService` remain the
- *   runtime.
- * - A Session whose toggle is ON hands every ordinary user message straight to
- *   `OrbitService`: the pre-step boundary consumes the turn (no parent model
- *   call, no parent mutation) and the host starts or resumes the run. The model
- *   never decides whether Orbit runs.
+ * Both entry points hand control to the host runtime directly:
+ * - an explicit `/agent-orbit <goal>` statement (host command or genuine
+ *   message), whatever the Session toggle says, and
+ * - every ordinary user message in a Session whose toggle is ON.
+ *
+ * The pre-step boundary consumes the turn (no parent model call, no parent
+ * mutation) and starts or resumes the existing `OrbitService`; the same
+ * `orbit_controller` tool + Supervisor remain the only runtime.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -21,16 +22,6 @@ export const AGENT_ORBIT_COMMAND = 'agent-orbit'
 
 /** Strict gesture: the command must begin a genuine user message line. */
 const GESTURE = /^\/agent-orbit(?=$|[\t\n\r ])/u
-
-declare module '@deepseek-ai/dsh-llm' {
-  interface MessageSourceMap {
-    'orbit-command': {
-      readonly kind: 'orbit-command'
-      /** Goal exactly as extracted from the `/agent-orbit` message, when present. */
-      readonly goal?: string
-    }
-  }
-}
 
 export interface OrbitActivation {
   /** Raw goal text after the command prefix; `''` when the user sent no goal. */
@@ -74,30 +65,12 @@ export function invokedOrbitMessage(messages: readonly UserMessage[]): OrbitActi
 }
 
 /**
- * The one deterministic directive injected for an explicit activation. It only
- * states the activation and carries the goal verbatim; every Orbit rule still
- * comes from the existing tool, service and protocol.
- */
-export function buildOrbitActivationDirective(goal: string): string {
-  const lines = [
-    'Orbit activation is explicit for this turn. Start or resume Orbit through the existing orbit_controller tool; do not ask the user to confirm the mode.',
-    'Treat the text following /agent-orbit as the requested goal, without summarizing or rewriting it.',
-  ]
-  lines.push(
-    goal === ''
-      ? 'No goal was provided — ask the user what Orbit should accomplish; do not start an empty run.'
-      : `Goal: ${goal}`,
-  )
-  return lines.join('\n')
-}
-
-/**
  * Register the closed-namespace `/agent-orbit` host command.
  *
- * The handler never injects a directive itself. It reposts the original
- * command line as a genuine user message, so the gesture boundary stays the
- * only activation point and a command-registered surface cannot double
- * activate through both routes.
+ * The handler never runs Orbit itself. It reposts the original command line as
+ * a genuine user message, so the gesture boundary stays the only activation
+ * point and a command-registered surface cannot double activate through both
+ * routes.
  */
 export function registerOrbitCommand(ctx: Context): void {
   ctx.effect(
@@ -160,53 +133,40 @@ export interface OrbitGestureBoundaryOptions {
   /** Whether the current Session defaults ordinary messages into Orbit. */
   sessionEnabled?: (session: Session) => boolean
   /**
-   * Host-side activation for an enabled Session's ordinary message: start or
-   * resume the existing `OrbitService`. Returns only after the run settles, so
-   * the consumed turn owns exactly one mutation driver.
+   * Host-side activation: start or resume the existing `OrbitService`. Returns
+   * only after the run settles, so the consumed turn owns exactly one mutation
+   * driver.
    */
   activate?: (agent: Agent, goal: string, signal: AbortSignal) => Promise<void>
 }
 
 /**
- * Install the gesture boundary. It runs for every proposed step.
+ * Install the activation boundary. It runs for every proposed step.
  *
- * An explicit `/agent-orbit` always wins and always activates, whatever the
- * Session toggle says: it keeps the existing activation directive and the
- * `orbit_controller` tool. Otherwise, an enabled Session hands the ordinary
- * user message to Orbit directly — the step is consumed with no model call and
- * the message stays in the conversation as durable history.
+ * An explicit `/agent-orbit <goal>` always wins and always activates, whatever
+ * the Session toggle says. Otherwise, an enabled Session hands the ordinary
+ * user message to Orbit. Either way the step is consumed with no parent model
+ * call while the message stays in the conversation as durable history.
  */
 export function installOrbitGestureBoundary(ctx: Context, options: OrbitGestureBoundaryOptions = {}): void {
   ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
-    if (decision.messages.some((message) => message.source.kind === 'orbit-command')) return decision
 
     const explicit = invokedOrbitActivation(messages)
-    if (explicit !== undefined) {
-      signal.throwIfAborted()
-      return {
-        kind: 'enter',
-        messages: [
-          ...decision.messages,
-          createUserMessage({
-            content: [{ type: 'text', text: buildOrbitActivationDirective(explicit.goal) }],
-            source: { kind: 'orbit-command', ...(explicit.goal === '' ? {} : { goal: explicit.goal }) },
-          }),
-        ],
-      }
-    }
-
-    if (options.sessionEnabled?.(agent.session) !== true) return decision
-    const ordinary = invokedOrbitMessage(messages)
+    const goal = explicit !== undefined
+      ? explicit.goal
+      : options.sessionEnabled?.(agent.session) === true
+        ? invokedOrbitMessage(messages)?.goal
+        : undefined
     const activate = options.activate
-    if (ordinary === undefined || activate === undefined) return decision
+    if (goal === undefined || goal === '' || activate === undefined) return decision
 
     signal.throwIfAborted()
     // The claimed batch enters the conversation exactly once: the loop commits
     // `decision.messages`, which this path leaves empty.
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-    await activate(agent, ordinary.goal, signal)
+    await activate(agent, goal, signal)
     return { kind: 'enter', messages: [] }
   })
 }

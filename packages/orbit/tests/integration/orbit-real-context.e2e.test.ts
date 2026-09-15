@@ -27,6 +27,8 @@ const ROUTE = { provider: 'fake', model: 'fm', reasoningEffort: 'off' }
 interface AdapterScript {
   plan?: string
   stepEvaluate?: string
+  /** Successive STEP_EVALUATE replies; the last one repeats. */
+  stepEvaluates?: string[]
   finalEvaluate?: string
   strategyChallenge?: string
   strategyReconsider?: string
@@ -41,7 +43,10 @@ interface AdapterScript {
 
 class ScriptedAdapter extends LlmAdapter {
   readonly seen: string[] = []
+  /** Every full prompt the adapter answered, in order. */
+  readonly prompts: string[] = []
   executorCalls = 0
+  private stepEvaluateCalls = 0
   private readonly script: AdapterScript
 
   constructor(script: AdapterScript = {}) {
@@ -79,6 +84,7 @@ class ScriptedAdapter extends LlmAdapter {
       .map((block) => block.text)
       .join('\n')
     this.seen.push(prompt.slice(0, 80))
+    this.prompts.push(prompt)
 
     if (this.script.hangMarker && prompt.includes(this.script.hangMarker)) {
       await hangUntilAborted(options.signal)
@@ -98,7 +104,11 @@ class ScriptedAdapter extends LlmAdapter {
       }
       reply = 'executor done'
     } else if (prompt.includes('STEP_EVALUATE')) {
-      reply = this.script.stepEvaluate ?? '{"decision":"PASS_CURRENT_STEP"}'
+      const replies = this.script.stepEvaluates
+      reply = replies !== undefined && replies.length > 0
+        ? replies[Math.min(this.stepEvaluateCalls, replies.length - 1)] ?? '{"decision":"PASS_CURRENT_STEP"}'
+        : this.script.stepEvaluate ?? '{"decision":"PASS_CURRENT_STEP"}'
+      this.stepEvaluateCalls += 1
       structured = true
     } else if (prompt.includes('FINAL_EVALUATE')) {
       reply = this.script.finalEvaluate ?? '{"decision":"SUCCESS"}'
@@ -161,7 +171,7 @@ const ORBIT_CONFIG = {
   registerGuards: true,
 }
 
-async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number } = {}): Promise<Context> {
+async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number; slashCommand?: boolean } = {}): Promise<Context> {
   const root = new Context()
   const storage = mkdtempSync(join(tmpdir(), 'dsh-orbit-e2e-store-'))
   const plugins: Array<[unknown, unknown]> = [
@@ -183,6 +193,7 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
   await root.plugin(OrbitPlugin as never, {
     ...ORBIT_CONFIG,
     ...(options.executorTimeoutMs ? { executorTimeoutMs: options.executorTimeoutMs } : {}),
+    ...(options.slashCommand === undefined ? {} : { slashCommand: options.slashCommand }),
   } as never)
   return root
 }
@@ -452,7 +463,7 @@ function textOf(message: SessionMessageLike): string {
     .join('\n')
 }
 
-test('real host command: /agent-orbit is registered, preserved in history, and activates once', { timeout: 120_000 }, async () => {
+test('real host command: /agent-orbit is registered, preserved in history, and hard-activates once', { timeout: 120_000 }, async () => {
   const adapter = new ScriptedAdapter()
   const root = await boot(adapter)
   const project = tempProject()
@@ -475,16 +486,27 @@ test('real host command: /agent-orbit is registered, preserved in history, and a
     const userTexts = messages.filter((message) => message.source.kind === 'user').map(textOf)
     assert.ok(userTexts.includes(commandLine), 'the user command must stay visible in conversation history')
     assert.equal(userTexts.filter((text) => text.startsWith('/agent-orbit')).length, 1, 'exactly one preserved user command message')
+    assert.equal(
+      messages.filter((message) => message.source.kind === 'orbit-command').length,
+      0,
+      'the host activation must not inject a synthetic directive',
+    )
 
-    const directives = messages.filter((message) => message.source.kind === 'orbit-command')
-    assert.equal(directives.length, 1, 'host command + preserved message must activate exactly once')
-    assert.equal(directives[0]?.source.goal, 'implement the deterministic fix')
-    assert.match(textOf(directives[0] as SessionMessageLike), /orbit_controller/)
-    assert.match(textOf(directives[0] as SessionMessageLike), /Goal: implement the deterministic fix/)
-
-    // The existing tool is still the only business entry: the activation layer
-    // must not start a durable run by itself.
-    assert.equal(existsSync(join(project.dir, '.cx', 'state.json')), false)
+    // The host ran Orbit itself: durable state exists with the exact goal and
+    // the parent model never ran for this turn.
+    const state = readRunState(project.dir)
+    assert.equal(state?.goal, 'implement the deterministic fix')
+    assert.equal(state?.phase, 'SUCCESS')
+    assert.equal(
+      parent.agent.session.snapshotEvents().filter((event) => event.type === 'assistant/message').length,
+      0,
+      'the parent model must not run for an explicit /agent-orbit turn',
+    )
+    assert.equal(
+      parent.agent.session.snapshotEvents().filter((event) => event.type === 'tool/call').length,
+      0,
+      'the parent must not run tools for an explicit /agent-orbit turn',
+    )
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -514,26 +536,36 @@ test('real host command: empty /agent-orbit is rejected without starting a run',
   }
 })
 
-test('real host gesture fallback: genuine /agent-orbit activates once; ordinary chat does not', { timeout: 120_000 }, async () => {
+test('real host gesture: genuine /agent-orbit hard-activates while OFF; ordinary chat does not', { timeout: 120_000 }, async () => {
   const adapter = new ScriptedAdapter()
   const root = await boot(adapter)
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-gesture')
   try {
+    // Ordinary chat with the toggle OFF stays native.
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'please inspect this file' }], source: { kind: 'user' } }))
     await parent.agent.whenIdle()
+    assert.equal(existsSync(join(project.dir, '.cx', 'state.json')), false, 'ordinary chat must not activate Orbit')
+    assert.ok(adapter.seen.length >= 1, 'ordinary chat must reach the parent model')
+
+    // A genuine `/agent-orbit` message activates the host runtime itself.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit headless fallback goal' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const state = readRunState(project.dir)
+    assert.equal(state?.goal, 'headless fallback goal')
+    assert.equal(state?.phase, 'SUCCESS')
     assert.equal(
       userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
       0,
-      'ordinary chat must not activate Orbit',
+      'the host activation must not inject a synthetic directive',
     )
-
-    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit headless fallback goal' }], source: { kind: 'user' } }))
-    await parent.agent.whenIdle()
-    const directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
-    assert.equal(directives.length, 1, 'the headless gesture must activate exactly once')
-    assert.equal(directives[0]?.source.goal, 'headless fallback goal')
-    assert.match(textOf(directives[0] as SessionMessageLike), /Goal: headless fallback goal/)
+    // Only the ordinary turn reached the parent model: the /agent-orbit turn
+    // was consumed by the host.
+    assert.equal(
+      parent.agent.session.snapshotEvents().filter((event) => event.type === 'assistant/message').length,
+      1,
+      'exactly the ordinary chat turn must reach the parent model',
+    )
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -602,16 +634,20 @@ test('real session toggle: /orbit-toggle is durable and promotes ordinary messag
     assert.equal(run?.goal, 'fix the failing test')
     assert.equal(run?.phase, 'SUCCESS')
 
-    // Explicit /agent-orbit while ON keeps its own directive activation and
-    // must not start a second, hard-activated run.
+    // Explicit /agent-orbit while ON activates the host runtime itself and
+    // must not double-start through the enabled-Session path.
     const beforeExplicit = readRunState(project.dir)?.run_id
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit explicit goal' }], source: { kind: 'user' } }))
     await parent.agent.whenIdle()
-    const directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
-    assert.equal(directives.length, 1, 'explicit /agent-orbit activates exactly once')
-    assert.equal(directives[0]?.source.goal, 'explicit goal')
-    assert.match(textOf(directives[0] as SessionMessageLike), /Orbit activation is explicit/)
-    assert.equal(readRunState(project.dir)?.run_id, beforeExplicit, 'the explicit route must not start another run')
+    const explicitState = readRunState(project.dir)
+    assert.equal(explicitState?.goal, 'explicit goal')
+    assert.equal(explicitState?.phase, 'SUCCESS')
+    assert.notEqual(explicitState?.run_id, beforeExplicit, 'the explicit goal becomes its own run')
+    assert.equal(
+      userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
+      0,
+      'explicit /agent-orbit must not inject a synthetic directive',
+    )
 
     // OFF keeps ordinary chat native and starts nothing new.
     const off = await root.commands.execute(parent.agent, '/orbit-toggle off', [], new AbortController().signal)
@@ -622,12 +658,7 @@ test('real session toggle: /orbit-toggle is durable and promotes ordinary messag
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'just chat now' }], source: { kind: 'user' } }))
     await parent.agent.whenIdle()
     assert.ok(adapter.seen.length > seenBefore, 'OFF ordinary messages reach the parent model')
-    assert.equal(readRunState(project.dir)?.run_id, beforeExplicit, 'OFF must not start an Orbit run')
-    assert.equal(
-      userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
-      1,
-      'OFF ordinary messages stay native',
-    )
+    assert.equal(readRunState(project.dir)?.run_id, explicitState?.run_id, 'OFF must not start an Orbit run')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -716,6 +747,102 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     assert.equal(next?.goal, 'second hard activation goal')
     assert.equal(next?.phase, 'SUCCESS')
     assert.equal(adapter.executorCalls, 2, 'the second run must execute again')
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host NEEDS_USER: an arbitrary user reply resumes the same run with the reply durable', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter({
+    stepEvaluates: [
+      '{"decision":"NEEDS_USER","reason":"请提供目标端口号"}',
+      '{"decision":"PASS_CURRENT_STEP"}',
+    ],
+  })
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-needs-user')
+  try {
+    const on = await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal)
+    assert.ok(on)
+
+    // An ordinary message hard-activates the run; the Commander asks a question.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'deploy service' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const paused = readRunState(project.dir)
+    assert.equal(paused?.phase, 'NEEDS_USER')
+    assert.equal(paused?.goal, 'deploy service')
+    assert.ok(typeof paused?.run_id === 'string' && paused.run_id !== '')
+
+    // The question must be visible to the user: a durable host notice.
+    const notice = userMessagesOf(parent.agent).find((message) => (message.source as { form?: string }).form === 'notice')
+    assert.ok(notice, 'the NEEDS_USER question must surface as a notice')
+    assert.match(textOf(notice as SessionMessageLike), /请提供目标端口号/)
+
+    // A reply with completely different text resumes the SAME run.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '8080' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const done = readRunState(project.dir)
+    assert.equal(done?.run_id, paused?.run_id, 'the reply must continue the same run')
+    assert.equal(done?.goal, 'deploy service', 'the original goal is never rewritten')
+    assert.equal(done?.pending_user_reply, '8080', 'the reply stays in durable state')
+    assert.equal(done?.phase, 'SUCCESS')
+
+    // The Commander and Executor actually consumed the reply.
+    assert.ok(
+      adapter.prompts.some((prompt) => prompt.includes('You are the Orbit Executor') && prompt.includes('8080')),
+      'the Executor prompt must carry the user reply',
+    )
+    assert.ok(
+      adapter.prompts.some((prompt) => prompt.includes('STEP_EVALUATE') && prompt.includes('8080')),
+      'the Commander evaluation prompt must carry the user reply',
+    )
+
+    // The host stayed the only mutation driver.
+    const events = parent.agent.session.snapshotEvents()
+    assert.equal(events.filter((event) => event.type === 'assistant/message').length, 0)
+    assert.equal(events.filter((event) => event.type === 'tool/call').length, 0)
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host: slashCommand=false keeps enabled-Session hard activation', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter, { slashCommand: false })
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-slash-off')
+  try {
+    // The slash command is gone; the per-chat toggle command stays for the UI.
+    const names = root.commands.list(parent.agent).map((entry) => entry.name)
+    assert.equal(names.includes('agent-orbit'), false, 'slashCommand=false must not register the /agent-orbit command')
+    assert.equal(names.includes('orbit-toggle'), true, 'the per-chat toggle command stays for the UI')
+
+    const on = await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal)
+    assert.ok(on)
+
+    // An ordinary message still hard-activates.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'create the disabled-slash proof' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const state = readRunState(project.dir)
+    assert.equal(state?.goal, 'create the disabled-slash proof')
+    assert.equal(state?.phase, 'SUCCESS')
+    assert.equal(
+      parent.agent.session.snapshotEvents().filter((event) => event.type === 'assistant/message').length,
+      0,
+      'the parent model must not run with slashCommand=false',
+    )
+
+    // A genuine `/agent-orbit` message still activates without the command.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit second explicit goal' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const next = readRunState(project.dir)
+    assert.equal(next?.goal, 'second explicit goal')
+    assert.equal(next?.phase, 'SUCCESS')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()

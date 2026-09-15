@@ -548,3 +548,45 @@ test('a same-goal reply resumes the NEEDS_USER run instead of starting a new one
   assert.equal(after?.goal, 'x')
   cleanup()
 })
+
+test('an arbitrary user reply resumes the NEEDS_USER run and stays durable', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P1', goal: 'collect the port' }]) },
+      { structured: commander({ decision: 'NEEDS_USER', reason: 'which port?' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { output: 'need the port', childId: 'e1' },
+      { output: 'deployed on 8080', childId: 'e2' },
+    ])
+  const supervisor = make(host, dir)
+
+  const first = await supervisor.bootstrap({ goal: 'deploy service', approved_loop_count: 5 })
+  assert.equal(first.phase, 'NEEDS_USER')
+  const paused = store.readState()
+  assert.ok(paused)
+
+  // The reply text is nothing like the original goal: it must still continue
+  // the same run instead of starting a new one or failing the goal check.
+  const resumed = await supervisor.bootstrap({ goal: '8080', approved_loop_count: 5 })
+  const after = store.readState()
+  assert.equal(resumed.phase, 'SUCCESS')
+  assert.equal(after?.run_id, paused.run_id, 'the same durable run must continue')
+  assert.equal(after?.goal, 'deploy service', 'the original goal is never rewritten')
+  assert.equal(after?.pending_user_reply, '8080', 'the reply stays durable')
+  assert.deepEqual(after?.routes, paused.routes, 'the frozen routes must be reused')
+
+  // The roles consumed the reply.
+  const executorPrompt = host.scriptsFor('executor')[1]?.request.prompt ?? ''
+  assert.match(executorPrompt, /8080/)
+  const stepPrompt = host
+    .scriptsFor('commander')
+    .find((entry) => entry.label === 'commander-step_evaluate' && entry.request.prompt.includes('8080'))?.request.prompt
+  assert.ok(stepPrompt, 'the Commander step evaluation must read the reply')
+  cleanup()
+})

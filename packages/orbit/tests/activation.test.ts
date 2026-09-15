@@ -6,7 +6,6 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import {
   AGENT_ORBIT_COMMAND,
-  buildOrbitActivationDirective,
   installOrbitGestureBoundary,
   invokedOrbitActivation,
   invokedOrbitMessage,
@@ -17,12 +16,6 @@ import { ORBIT_TOGGLE_COMMAND } from '../src/session-state.ts'
 
 const userMessage = (text: string) =>
   createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
-
-const textOf = (message: { content: readonly { type: string; text?: string }[] }): string =>
-  message.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text ?? '')
-    .join('\n')
 
 type PreStepListener = (payload: {
   agent: { session: Session }
@@ -106,12 +99,6 @@ test('only genuine user messages activate', () => {
     source: { kind: 'plugin', plugin: 'dsh-orbit' },
   })
   assert.equal(invokedOrbitActivation([pluginMessage]), undefined)
-
-  const directive = createUserMessage({
-    content: [{ type: 'text', text: 'Orbit activation is explicit for this turn.' }],
-    source: { kind: 'orbit-command', goal: 'x' },
-  })
-  assert.equal(invokedOrbitActivation([directive]), undefined)
 })
 
 test('the newest matching user message wins', () => {
@@ -121,19 +108,6 @@ test('the newest matching user message wins', () => {
     userMessage('/agent-orbit newer'),
   ])
   assert.deepEqual(invocation, { goal: 'newer' })
-})
-
-test('activation directive states activation and carries the goal', () => {
-  const directive = buildOrbitActivationDirective('ship the fix')
-  assert.match(directive, /orbit_controller/)
-  assert.match(directive, /Goal: ship the fix/)
-  assert.doesNotMatch(directive, /ask the user what Orbit should accomplish/)
-})
-
-test('empty-goal directive asks for a goal instead of starting an empty run', () => {
-  const directive = buildOrbitActivationDirective('')
-  assert.match(directive, /ask the user what Orbit should accomplish/)
-  assert.doesNotMatch(directive, /^Goal:/m)
 })
 
 test('the newest genuine user message becomes the implicit goal', () => {
@@ -185,26 +159,40 @@ test('plugin messages never hard-activate', async () => {
   assert.deepEqual(enterMessages(on.decision), [pluginMessage])
 })
 
-test('an explicit /agent-orbit always wins and never doubles', async () => {
+test('an explicit /agent-orbit hard-activates exactly once, whatever the toggle says', async () => {
   const message = userMessage('/agent-orbit explicit goal')
 
   const off = await fireBoundary(false, [message])
-  const offEntered = enterMessages(off.decision)
-  assert.equal(offEntered.length, 2)
-  assert.match(textOf(offEntered[1] as UserMessage), /Orbit activation is explicit/)
-  assert.equal(off.activations.length, 0, 'the explicit route must not hard-activate as well')
+  assert.deepEqual(enterMessages(off.decision), [], 'the host consumes the explicit turn')
+  assert.deepEqual(off.activations, [{ goal: 'explicit goal' }], 'explicit /agent-orbit starts the run itself')
+  assert.deepEqual(off.appended, [message], 'the command message stays in history')
 
   const on = await fireBoundary(true, [message])
-  const onEntered = enterMessages(on.decision)
-  assert.equal(onEntered.length, 2, 'the Session toggle must not add a directive beside the explicit one')
-  assert.match(textOf(onEntered[1] as UserMessage), /Orbit activation is explicit/)
-  assert.equal((onEntered[1]?.source as { goal?: string }).goal, 'explicit goal')
-  assert.equal(on.activations.length, 0, 'explicit /agent-orbit must not double-start through the toggle')
+  assert.deepEqual(enterMessages(on.decision), [])
+  assert.deepEqual(on.activations, [{ goal: 'explicit goal' }], 'the Session toggle must not add a second start')
+  assert.deepEqual(on.appended, [message])
+})
 
-  // A step that already carries an Orbit directive gains no second one.
-  const again = await fireBoundary(true, [message], onEntered)
-  assert.equal(enterMessages(again.decision).length, 2, 'an entered step keeps exactly one directive')
-  assert.equal(again.activations.length, 0)
+test('an explicit /agent-orbit keeps the goal verbatim', async () => {
+  const goal = '帮我停止 https://steambalance.030.qzz.io 的服务'
+  const run = await fireBoundary(false, [userMessage(`/agent-orbit   ${goal}  `)])
+  assert.deepEqual(run.activations, [{ goal }])
+})
+
+test('an empty explicit /agent-orbit never starts a run', async () => {
+  const message = userMessage('/agent-orbit   ')
+  const run = await fireBoundary(false, [message])
+  assert.equal(run.activations.length, 0)
+  assert.equal(run.appended.length, 0)
+  assert.deepEqual(enterMessages(run.decision), [message], 'the parent path stays untouched')
+})
+
+test('an explicit /agent-orbit wins over the enabled-Session ordinary path', async () => {
+  const message = userMessage('/agent-orbit explicit goal')
+  const earlier = userMessage('earlier ordinary message')
+  const run = await fireBoundary(true, [earlier, message])
+  assert.deepEqual(run.activations, [{ goal: 'explicit goal' }], 'the explicit goal wins, exactly once')
+  assert.deepEqual(run.appended, [earlier, message])
 })
 
 test('/orbit-toggle validates its argument', () => {

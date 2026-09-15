@@ -1,6 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-settings'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { Session } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { installOrbitGestureBoundary, registerOrbitCommand, registerOrbitToggleCommand } from './activation.ts'
 import { estimateLoopCount } from './kernel.ts'
@@ -9,7 +11,7 @@ import { resolveEffectiveRoutes, sessionSelectionOf, type OrbitRouteSettings } f
 import { installOrbitSessionProjection, orbitEnabledOf } from './session-state.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
-import type { OrbitRoute, OrbitRoutes } from './types.ts'
+import type { OrbitActionResult, OrbitRoute, OrbitRoutes } from './types.ts'
 
 /**
  * Minimum loop budget for a hard-activated run. The Commander is asked for a
@@ -142,39 +144,39 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
     ctx.tools.register(createOrbitTool(ctx, { legacy: true }))
   }
 
-  // Deterministic activation surfaces: the closed-namespace `/agent-orbit`
-  // host command (surfaces in the Web GUI slash menu through the Harness
-  // commands client) and the genuine-user-message gesture boundary for
-  // surfaces without command adjudication (headless CLI). Both default on.
-  //
-  // `commands` is registered lazily, not a required inject: every standard
-  // profile mounts it, but a minimal composition that omits the command
-  // registry keeps Orbit fully functional — the fiber never pends on it and
-  // simply never gains the slash command, while the gesture boundary still
-  // works.
-  if (config.slashCommand) {
-    ctx.inject(['commands'], (commandCtx) => {
-      registerOrbitCommand(commandCtx)
-      registerOrbitToggleCommand(commandCtx)
-    })
-    installOrbitGestureBoundary(ctx, {
-      sessionEnabled: (session) => orbitEnabledOf(ctx, session),
-      activate: async (agent, goal, signal) => {
-        const cwd = agent.session.header.cwd ?? process.cwd()
-        try {
-          // The initiator scope makes the run's children belong to this Agent;
-          // the parent model is never asked to decide or to run the task.
-          await ctx.agents.withInitiator(agent, () => service.run({
-            goal,
-            approved_loop_count: Math.max(estimateLoopCount(goal), HARD_ACTIVATION_MIN_LOOPS),
-          }, cwd, signal))
-        } catch {
-          // Durable run state owns failure reporting; a takeover failure must
-          // not fail the consumed parent turn.
-        }
-      },
-    })
-  }
+  // Slash-command registration is its own switch: the `/agent-orbit` command
+  // (surfaces in the Web GUI slash menu through the Harness commands client)
+  // rides `slashCommand`, while the per-chat toggle command and the host
+  // activation boundary below never depend on it. `commands` is registered
+  // lazily: a minimal composition without the command registry keeps Orbit
+  // fully functional — the fiber never pends on it, and the activation
+  // boundary (explicit `/agent-orbit` messages and enabled-Session ordinary
+  // messages) still runs.
+  ctx.inject(['commands'], (commandCtx) => {
+    registerOrbitToggleCommand(commandCtx)
+    if (config.slashCommand) registerOrbitCommand(commandCtx)
+  })
+
+  installOrbitGestureBoundary(ctx, {
+    sessionEnabled: (session) => orbitEnabledOf(ctx, session),
+    activate: async (agent, goal, signal) => {
+      const cwd = agent.session.header.cwd ?? process.cwd()
+      let result: OrbitActionResult
+      try {
+        // The initiator scope makes the run's children belong to this Agent;
+        // the parent model is never asked to decide or to run the task.
+        result = await ctx.agents.withInitiator(agent, () => service.run({
+          goal,
+          approved_loop_count: Math.max(estimateLoopCount(goal), HARD_ACTIVATION_MIN_LOOPS),
+        }, cwd, signal))
+      } catch (error) {
+        appendOrbitNotice(agent.session, `Orbit 启动失败：${error instanceof Error ? error.message : String(error)}`)
+        return
+      }
+      const notice = activationNotice(result)
+      if (notice !== undefined) appendOrbitNotice(agent.session, notice)
+    },
+  })
 
   // Per-Session Orbit enable state: natively durable through the Session log
   // and the projection registry. Minimal compositions without the registry
@@ -201,4 +203,42 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
     })
     ctx.on('tools/pre-execute', (exec, next) => handler(exec as never, next as never) as never)
   }
+}
+
+/**
+ * One durable, user-visible Orbit notice. The DSH `plugin` + `form: 'notice'`
+ * source renders as a collapsed notice row instead of a user message, and the
+ * text stays part of the conversation so the next turn can read the outcome.
+ */
+function appendOrbitNotice(session: Session, text: string): void {
+  session.append(
+    'user/message',
+    createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: 'dsh-orbit', form: 'notice', summary: boundContextSummary(text) },
+    }),
+    { surfaceOp: 'append' },
+  )
+}
+
+/**
+ * What the user must see when a hard-activated turn did not simply succeed:
+ * the waiting run's question, a refused start, or an unfinished run. The
+ * host stays the only mutation driver; the notice is reporting, never a
+ * hand-back of execution to the parent model.
+ */
+function activationNotice(result: OrbitActionResult): string | undefined {
+  if (result.ok && result.phase !== 'NEEDS_USER') return undefined
+  const lastError = result.data?.['last_error']
+  const reason = result.message ?? (typeof lastError === 'string' && lastError !== '' ? lastError : undefined)
+  if (result.phase === 'NEEDS_USER') {
+    return reason !== undefined && !reason.startsWith('COMMANDER_')
+      ? `Orbit 需要你的回复：${reason}`
+      : 'Orbit 需要你的回复：请回复当前运行需要的信息。'
+  }
+  if (result.message?.startsWith('ORBIT_ACTIVE_RUN_EXISTS') === true) {
+    return `Orbit 未接受这条新任务：${result.message}`
+  }
+  const phase = result.phase ?? 'UNKNOWN'
+  return `Orbit 运行未完成（phase=${phase}）${reason !== undefined ? `：${reason}` : ''}`
 }
