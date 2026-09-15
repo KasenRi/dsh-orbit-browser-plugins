@@ -32,24 +32,43 @@ type PreStepListener = (payload: {
   signal: AbortSignal
 }, next: () => Promise<PreStepDecision>) => Promise<PreStepDecision>
 
+interface BoundaryRun {
+  decision: PreStepDecision
+  activations: Array<{ goal: string }>
+  appended: UserMessage[]
+}
+
 /** Fire the installed boundary once with a fake agent and the given decision cut. */
 async function fireBoundary(
   sessionEnabled: boolean,
   messages: UserMessage[],
   decisionMessages: UserMessage[] = [...messages],
-): Promise<PreStepDecision> {
+): Promise<BoundaryRun> {
   let listener: PreStepListener | undefined
+  const activations: Array<{ goal: string }> = []
+  const appended: UserMessage[] = []
   const ctx = {
     on: (_event: string, fn: PreStepListener) => {
       listener = fn
     },
   } as unknown as Context
-  installOrbitGestureBoundary(ctx, { sessionEnabled: () => sessionEnabled })
+  installOrbitGestureBoundary(ctx, {
+    sessionEnabled: () => sessionEnabled,
+    activate: async (_agent, goal) => {
+      activations.push({ goal })
+    },
+  })
   assert.ok(listener)
-  return listener(
-    { agent: { session: {} as Session }, messages, turn: 1, step: 1, signal: new AbortController().signal },
+  const session = {
+    append: (_type: string, data: UserMessage) => {
+      appended.push(data)
+    },
+  }
+  const decision = await listener(
+    { agent: { session: session as unknown as Session }, messages, turn: 1, step: 1, signal: new AbortController().signal },
     async () => ({ kind: 'enter', messages: [...decisionMessages] }),
   )
+  return { decision, activations, appended }
 }
 
 test('parses /agent-orbit goals exactly', () => {
@@ -135,38 +154,57 @@ function enterMessages(decision: PreStepDecision): UserMessage[] {
   return decision.messages
 }
 
-test('ordinary messages activate only when the Session toggle is on', async () => {
+test('an enabled Session hard-activates ordinary messages and consumes the turn', async () => {
   const message = userMessage('fix the failing test')
 
   const off = await fireBoundary(false, [message])
-  assert.deepEqual(enterMessages(off), [message])
+  assert.deepEqual(enterMessages(off.decision), [message], 'OFF keeps the parent path untouched')
+  assert.equal(off.activations.length, 0, 'OFF must not start Orbit')
+  assert.equal(off.appended.length, 0)
 
   const on = await fireBoundary(true, [message])
-  const entered = enterMessages(on)
-  assert.equal(entered.length, 2)
-  const directive = entered[1]
-  assert.equal(directive?.source.kind, 'orbit-command')
-  assert.equal((directive?.source as { goal?: string }).goal, 'fix the failing test')
-  assert.match(textOf(directive as UserMessage), /Orbit is enabled for this chat/)
+  assert.deepEqual(enterMessages(on.decision), [], 'the host consumes the turn without a model call')
+  assert.deepEqual(on.activations, [{ goal: 'fix the failing test' }], 'the exact user text is the goal')
+  assert.deepEqual(on.appended, [message], 'the claimed message stays in the conversation exactly once')
+})
+
+test('the hard activation keeps the goal verbatim', async () => {
+  const goal = '帮我停止 https://steambalance.030.qzz.io 的服务'
+  const on = await fireBoundary(true, [userMessage(`  ${goal}  `)])
+  assert.deepEqual(on.activations, [{ goal }])
+})
+
+test('plugin messages never hard-activate', async () => {
+  const pluginMessage = createUserMessage({
+    content: [{ type: 'text', text: 'plugin context' }],
+    source: { kind: 'plugin', plugin: 'dsh-orbit' },
+  })
+  const on = await fireBoundary(true, [pluginMessage])
+  assert.equal(on.activations.length, 0)
+  assert.equal(on.appended.length, 0)
+  assert.deepEqual(enterMessages(on.decision), [pluginMessage])
 })
 
 test('an explicit /agent-orbit always wins and never doubles', async () => {
   const message = userMessage('/agent-orbit explicit goal')
 
   const off = await fireBoundary(false, [message])
-  const offEntered = enterMessages(off)
+  const offEntered = enterMessages(off.decision)
   assert.equal(offEntered.length, 2)
   assert.match(textOf(offEntered[1] as UserMessage), /Orbit activation is explicit/)
+  assert.equal(off.activations.length, 0, 'the explicit route must not hard-activate as well')
 
   const on = await fireBoundary(true, [message])
-  const onEntered = enterMessages(on)
+  const onEntered = enterMessages(on.decision)
   assert.equal(onEntered.length, 2, 'the Session toggle must not add a directive beside the explicit one')
   assert.match(textOf(onEntered[1] as UserMessage), /Orbit activation is explicit/)
   assert.equal((onEntered[1]?.source as { goal?: string }).goal, 'explicit goal')
+  assert.equal(on.activations.length, 0, 'explicit /agent-orbit must not double-start through the toggle')
 
   // A step that already carries an Orbit directive gains no second one.
   const again = await fireBoundary(true, [message], onEntered)
-  assert.equal(enterMessages(again).length, 2, 'an entered step keeps exactly one directive')
+  assert.equal(enterMessages(again.decision).length, 2, 'an entered step keeps exactly one directive')
+  assert.equal(again.activations.length, 0)
 })
 
 test('/orbit-toggle validates its argument', () => {

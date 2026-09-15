@@ -491,3 +491,60 @@ test('temporary strategy watchdog failure does not consume the challenge', async
   assert.ok(!(host.scriptsFor('executor').some((entry) => entry.label === 'executor-P1-3')))
   cleanup()
 })
+
+test('insufficient stop evidence cannot settle as FINAL SUCCESS', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P1', goal: 'stop the service' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'NEEDS_USER', reason: 'only an external HTTP 502 was observed' }) },
+    ])
+    .script('executor', [
+      { output: 'curl returned HTTP 502; no process, port, or systemd evidence collected', childId: 'e1', settlement: 'completed' },
+    ])
+  const result = await make(host, dir).bootstrap({ goal: 'stop the service', approved_loop_count: 5 })
+  assert.equal(result.phase, 'NEEDS_USER')
+  assert.notEqual(result.phase, 'SUCCESS')
+
+  // The Commander's final review receives the weak evidence verbatim, so the
+  // verdict can refuse SUCCESS instead of trusting the Executor's claim.
+  const finalPrompt =
+    host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')?.request.prompt ?? ''
+  assert.match(finalPrompt, /HTTP 502/)
+  assert.match(finalPrompt, /Executor claim:/)
+  cleanup()
+})
+
+test('a same-goal reply resumes the NEEDS_USER run instead of starting a new one', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P1', goal: 'a' }]) },
+      { structured: commander({ decision: 'NEEDS_USER' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { output: 'did a', childId: 'e1' },
+      { output: 'did a after the user reply', childId: 'e2' },
+      { output: 'did a again', childId: 'e3' },
+    ])
+  const supervisor = make(host, dir)
+
+  const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  assert.equal(first.phase, 'NEEDS_USER')
+  const paused = store.readState()
+  assert.ok(paused)
+
+  const resumed = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
+  const after = store.readState()
+  assert.equal(resumed.phase, 'SUCCESS')
+  assert.equal(after?.run_id, paused.run_id, 'the same durable run must continue, never a second run')
+  assert.equal(after?.goal, 'x')
+  cleanup()
+})

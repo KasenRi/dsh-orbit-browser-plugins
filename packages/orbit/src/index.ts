@@ -3,12 +3,21 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { installOrbitGestureBoundary, registerOrbitCommand, registerOrbitToggleCommand } from './activation.ts'
+import { estimateLoopCount } from './kernel.ts'
 import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
 import { resolveEffectiveRoutes, sessionSelectionOf, type OrbitRouteSettings } from './routes.ts'
 import { installOrbitSessionProjection, orbitEnabledOf } from './session-state.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
 import type { OrbitRoute, OrbitRoutes } from './types.ts'
+
+/**
+ * Minimum loop budget for a hard-activated run. The Commander is asked for a
+ * 2-5 step plan and every executed step consumes one loop slot, so the host
+ * must grant a budget that can finish a full plan; the goal complexity
+ * estimate raises it further when the goal asks for more.
+ */
+const HARD_ACTIVATION_MIN_LOOPS = 5
 
 export const name = 'dsh-orbit'
 export const inject = ['tools', 'agents', 'subagents']
@@ -150,6 +159,20 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
     })
     installOrbitGestureBoundary(ctx, {
       sessionEnabled: (session) => orbitEnabledOf(ctx, session),
+      activate: async (agent, goal, signal) => {
+        const cwd = agent.session.header.cwd ?? process.cwd()
+        try {
+          // The initiator scope makes the run's children belong to this Agent;
+          // the parent model is never asked to decide or to run the task.
+          await ctx.agents.withInitiator(agent, () => service.run({
+            goal,
+            approved_loop_count: Math.max(estimateLoopCount(goal), HARD_ACTIVATION_MIN_LOOPS),
+          }, cwd, signal))
+        } catch {
+          // Durable run state owns failure reporting; a takeover failure must
+          // not fail the consumed parent turn.
+        }
+      },
     })
   }
 

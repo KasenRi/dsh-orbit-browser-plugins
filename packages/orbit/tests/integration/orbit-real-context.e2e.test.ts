@@ -589,39 +589,45 @@ test('real session toggle: /orbit-toggle is durable and promotes ordinary messag
     assert.equal(root.sessionProjections.stateOf(parent.agent.session, 'orbitSession')?.enabled, true)
     assert.equal(existsSync(join(project.dir, '.cx', 'state.json')), false, 'toggling must not start a run')
 
-    // An ordinary message now activates through the existing boundary.
+    // An ordinary message now hard-activates: the host consumes the turn and
+    // starts the run itself — no synthetic directive, no parent model call.
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'fix the failing test' }], source: { kind: 'user' } }))
     await parent.agent.whenIdle()
-    let directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
-    assert.equal(directives.length, 1, 'the enabled Session activates the ordinary message exactly once')
-    assert.equal(directives[0]?.source.goal, 'fix the failing test')
-    assert.match(textOf(directives[0] as SessionMessageLike), /Orbit is enabled for this chat/)
+    assert.equal(
+      userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
+      0,
+      'the hard path must not inject a synthetic directive',
+    )
+    const run = readRunState(project.dir)
+    assert.equal(run?.goal, 'fix the failing test')
+    assert.equal(run?.phase, 'SUCCESS')
 
-    // Explicit /agent-orbit while ON must not double activate.
+    // Explicit /agent-orbit while ON keeps its own directive activation and
+    // must not start a second, hard-activated run.
+    const beforeExplicit = readRunState(project.dir)?.run_id
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit explicit goal' }], source: { kind: 'user' } }))
     await parent.agent.whenIdle()
-    directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
-    assert.equal(directives.length, 2, 'explicit activation must not be doubled by the toggle')
-    assert.equal(directives[1]?.source.goal, 'explicit goal')
-    assert.match(textOf(directives[1] as SessionMessageLike), /Orbit activation is explicit/)
+    const directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
+    assert.equal(directives.length, 1, 'explicit /agent-orbit activates exactly once')
+    assert.equal(directives[0]?.source.goal, 'explicit goal')
+    assert.match(textOf(directives[0] as SessionMessageLike), /Orbit activation is explicit/)
+    assert.equal(readRunState(project.dir)?.run_id, beforeExplicit, 'the explicit route must not start another run')
 
-    // OFF keeps ordinary chat native; the explicit command still works.
+    // OFF keeps ordinary chat native and starts nothing new.
     const off = await root.commands.execute(parent.agent, '/orbit-toggle off', [], new AbortController().signal)
     assert.ok(off)
     assert.equal(off.result.kind, 'success')
     assert.equal(root.sessionProjections.stateOf(parent.agent.session, 'orbitSession')?.enabled, false)
+    const seenBefore = adapter.seen.length
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'just chat now' }], source: { kind: 'user' } }))
     await parent.agent.whenIdle()
+    assert.ok(adapter.seen.length > seenBefore, 'OFF ordinary messages reach the parent model')
+    assert.equal(readRunState(project.dir)?.run_id, beforeExplicit, 'OFF must not start an Orbit run')
     assert.equal(
       userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command').length,
-      2,
-      'OFF must keep ordinary messages native',
+      1,
+      'OFF ordinary messages stay native',
     )
-    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit still explicit' }], source: { kind: 'user' } }))
-    await parent.agent.whenIdle()
-    directives = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'orbit-command')
-    assert.equal(directives.length, 3, '/agent-orbit must work while OFF')
-    assert.equal(directives[2]?.source.goal, 'still explicit')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -654,6 +660,62 @@ test('real session toggle: turning OFF during an active run never stops or mutat
     const result = await run
     assert.equal(result.ok, true, result.message)
     assert.equal(result.phase, 'SUCCESS', 'the run must finish normally after the toggle')
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host hard activation: an enabled Session runs Orbit from an ordinary message without the parent model', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-hard-activation')
+  try {
+    // Enable the per-chat toggle through the real host command.
+    const on = await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal)
+    assert.ok(on)
+    assert.equal(on.result.kind, 'success')
+    assert.equal(root.sessionProjections.stateOf(parent.agent.session, 'orbitSession')?.enabled, true)
+
+    // An ordinary message — never `/agent-orbit`. The scripted parent model
+    // never calls a tool: only the host can start Orbit here.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'create the hard activation proof' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+
+    const state = readRunState(project.dir)
+    assert.ok(state, 'the host must have written durable run state')
+    assert.equal(state.phase, 'SUCCESS')
+    assert.equal(state.goal, 'create the hard activation proof')
+    assert.ok(Number(state.approved_loop_count) >= 5, 'the host must grant a budget that can finish a 2-5 step plan')
+    assert.equal(adapter.executorCalls, 1, 'the Executor must run through the real Orbit chain')
+    assert.ok(adapter.seen.some((entry) => entry.includes('You are the Orbit Commander')), 'the Commander must actually plan')
+
+    // The parent turn was consumed: no parent model call, no parent tool call,
+    // and the user message stays in the conversation.
+    const parentEvents = parent.agent.session.snapshotEvents()
+    assert.equal(
+      parentEvents.filter((event) => event.type === 'assistant/message').length,
+      0,
+      'the parent model must not run for a hard-activated turn',
+    )
+    assert.equal(
+      parentEvents.filter((event) => event.type === 'tool/call').length,
+      0,
+      'the parent must not run tools for a hard-activated turn',
+    )
+    const userTexts = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'user').map(textOf)
+    assert.deepEqual(userTexts, ['create the hard activation proof'], 'the message stays as durable history')
+
+    // A second ordinary message starts the next run with the new goal.
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second hard activation goal' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+    const next = readRunState(project.dir)
+    assert.notEqual(next?.run_id, state.run_id, 'the finished run must be replaced by the next run')
+    assert.equal(next?.goal, 'second hard activation goal')
+    assert.equal(next?.phase, 'SUCCESS')
+    assert.equal(adapter.executorCalls, 2, 'the second run must execute again')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
