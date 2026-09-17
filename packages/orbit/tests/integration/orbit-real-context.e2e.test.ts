@@ -9,6 +9,7 @@ import LlmPlugin from '@deepseek-ai/dsh-llm'
 import SessionPlugin, { SessionId } from '@deepseek-ai/dsh-session'
 import PersistencePlugin from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionProjectionPlugin from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-api-session-controller/types'
 import SystemPromptPlugin from '@deepseek-ai/dsh-system-prompt'
 import ToolsPlugin, { defineTool } from '@deepseek-ai/dsh-tools'
 import AgentPlugin from '@deepseek-ai/dsh-agent'
@@ -45,6 +46,8 @@ class ScriptedAdapter extends LlmAdapter {
   readonly seen: string[] = []
   /** Every full prompt the adapter answered, in order. */
   readonly prompts: string[] = []
+  /** The provider/model route of every request, in order, with a prompt head. */
+  readonly requests: Array<{ provider: string; model: string; reasoningEffort?: string; prompt: string }> = []
   executorCalls = 0
   private stepEvaluateCalls = 0
   private readonly script: AdapterScript
@@ -70,6 +73,7 @@ class ScriptedAdapter extends LlmAdapter {
           { id: 'off', name: 'Off' },
           { id: 'low', name: 'Low' },
           { id: 'high', name: 'High' },
+          { id: 'xhigh', name: 'XHigh' },
         ],
         defaultEffort: 'off',
       },
@@ -85,6 +89,12 @@ class ScriptedAdapter extends LlmAdapter {
       .join('\n')
     this.seen.push(prompt.slice(0, 80))
     this.prompts.push(prompt)
+    this.requests.push({
+      provider: options.provider,
+      model: options.model,
+      ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: String(options.reasoningEffort) }),
+      prompt: prompt.slice(0, 40),
+    })
 
     if (this.script.hangMarker && prompt.includes(this.script.hangMarker)) {
       await hangUntilAborted(options.signal)
@@ -94,10 +104,10 @@ class ScriptedAdapter extends LlmAdapter {
     // the Executor settles with plain text.
     let reply = 'ok'
     let structured = false
-    if (prompt.includes('Produce the smallest set of 2-5 logical engineering steps')) {
+    if (prompt.includes('当前阶段：PLAN')) {
       reply = this.script.plan ?? '{"summary":"e2e","steps":[{"id":"P1","goal":"do the thing"}]}'
       structured = true
-    } else if (prompt.includes('You are the Orbit Executor')) {
+    } else if (prompt.includes('你是 Orbit 执行员')) {
       this.executorCalls += 1
       if (this.script.hangFirstExecutor && this.executorCalls === 1) {
         await hangUntilAborted(options.signal)
@@ -171,7 +181,7 @@ const ORBIT_CONFIG = {
   registerGuards: true,
 }
 
-async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number; slashCommand?: boolean } = {}): Promise<Context> {
+async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number; slashCommand?: boolean; providers?: string[] } = {}): Promise<Context> {
   const root = new Context()
   const storage = mkdtempSync(join(tmpdir(), 'dsh-orbit-e2e-store-'))
   const plugins: Array<[unknown, unknown]> = [
@@ -188,7 +198,7 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
     [AgentLoopPlugin, { agents: [] }],
   ]
   for (const [plugin, config] of plugins) await root.plugin(plugin as never, config as never)
-  root.llm.registerAdapter(['fake'], adapter)
+  root.llm.registerAdapter(options.providers ?? ['fake'], adapter)
   for (const name of ['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser']) root.tools.register(stubTool(name))
   await root.plugin(OrbitPlugin as never, {
     ...ORBIT_CONFIG,
@@ -327,6 +337,11 @@ test('real host runtime watchdog: executor timeout -> RUNTIME_DIAGNOSE -> RESTAR
     assert.equal(result.phase, 'SUCCESS')
     assert.ok(adapter.executorCalls >= 2, 'a fresh executor must run after RESTART_STEP')
     assert.ok(adapter.seen.some((entry) => entry.includes('RUNTIME_DIAGNOSE')), 'runtime watchdog must be invoked through the real host')
+    // The raw Watchdog prompt is Chinese, machine decision enums aside.
+    const watchdogPrompt = adapter.prompts.find((prompt) => prompt.includes('RUNTIME_DIAGNOSE')) ?? ''
+    assert.match(watchdogPrompt, /你是 Orbit 监控模型/)
+    assert.doesNotMatch(watchdogPrompt, /You are the Orbit Smart Watchdog/)
+    assert.doesNotMatch(watchdogPrompt, /Runtime anomaly:/)
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -721,7 +736,18 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     assert.equal(state.goal, 'create the hard activation proof')
     assert.ok(Number(state.approved_loop_count) >= 5, 'the host must grant a budget that can finish a 2-5 step plan')
     assert.equal(adapter.executorCalls, 1, 'the Executor must run through the real Orbit chain')
-    assert.ok(adapter.seen.some((entry) => entry.includes('You are the Orbit Commander')), 'the Commander must actually plan')
+    assert.ok(adapter.seen.some((entry) => entry.includes('Orbit 指挥官')), 'the Commander must actually plan')
+
+    // The raw role prompts are Chinese; only machine identifiers stay English.
+    const planPrompt = adapter.prompts.find((prompt) => prompt.includes('当前阶段：PLAN')) ?? ''
+    assert.match(planPrompt, /你是 Orbit 指挥官/)
+    assert.doesNotMatch(planPrompt, /You are the Orbit Commander/)
+    assert.doesNotMatch(planPrompt, /Hard constraints:/)
+    const executorPrompt = adapter.prompts.find((prompt) => prompt.startsWith('你是 Orbit 执行员')) ?? ''
+    assert.ok(executorPrompt !== '', 'the Executor prompt must be Chinese')
+    assert.doesNotMatch(executorPrompt, /You are the Orbit Executor/)
+    assert.doesNotMatch(executorPrompt, /Working directory:/)
+    assert.match(executorPrompt, /简体中文/)
 
     // The parent turn was consumed: no parent model call, no parent tool call,
     // and the user message stays in the conversation.
@@ -792,7 +818,7 @@ test('real host NEEDS_USER: an arbitrary user reply resumes the same run with th
 
     // The Commander and Executor actually consumed the reply.
     assert.ok(
-      adapter.prompts.some((prompt) => prompt.includes('You are the Orbit Executor') && prompt.includes('8080')),
+      adapter.prompts.some((prompt) => prompt.includes('你是 Orbit 执行员') && prompt.includes('8080')),
       'the Executor prompt must carry the user reply',
     )
     assert.ok(
@@ -843,6 +869,67 @@ test('real host: slashCommand=false keeps enabled-Session hard activation', { ti
     const next = readRunState(project.dir)
     assert.equal(next?.goal, 'second explicit goal')
     assert.equal(next?.phase, 'SUCCESS')
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+/** The durable `modelSelection` unit exactly as the session controller registers it. */
+function installTestModelSelection(root: Context): void {
+  root.sessionProjections.register({
+    key: 'modelSelection',
+    stateSchema: { parse: (value: unknown) => value },
+    init: () => ({ lastUsed: null, pending: null }),
+    apply: (state: { lastUsed: unknown; pending: unknown }, event: { type: string; data: unknown }) =>
+      event.type === 'model/selection' ? { lastUsed: state.lastUsed, pending: event.data } : state,
+    wire: {
+      viewSchema: { parse: (value: unknown) => value },
+      view: (state: { lastUsed: unknown; pending: unknown }) => ({
+        lastUsed: state.lastUsed,
+        next: state.pending ?? state.lastUsed,
+      }),
+    },
+    stateVersion: 2,
+  } as never)
+}
+
+test('real host: the Executor route follows the durable Session modelSelection without a request header', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter, { providers: ['fake', 'mysub-oc'] })
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-session-route')
+  try {
+    installTestModelSelection(root)
+    // The user picked a non-deepseek provider; no parent model request exists
+    // yet — exactly the hard-activation case that used to fall back to config.
+    parent.agent.session.append('model/selection', { provider: 'mysub-oc', model: 'glm-5.3-flash', reasoningEffort: 'xhigh' })
+    assert.equal(parent.agent.session.requestHeader(), undefined, 'this regression only reproduces without a request header')
+
+    const on = await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal)
+    assert.ok(on)
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'create the session route proof' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+
+    const state = readRunState(project.dir) as
+      | { phase?: string; routes?: Record<string, { provider?: string; model?: string; reasoningEffort?: string }> }
+      | undefined
+    assert.equal(state?.phase, 'SUCCESS')
+    assert.deepEqual(state?.routes?.['executor'], {
+      provider: 'mysub-oc',
+      model: 'glm-5.3-flash',
+      reasoningEffort: 'xhigh',
+    })
+
+    // The real Executor child actually requested the Session's route.
+    const executorRequests = adapter.requests.filter((entry) => entry.prompt.startsWith('你是 Orbit 执行员'))
+    assert.ok(executorRequests.length >= 1, 'the Executor must have run')
+    for (const entry of executorRequests) {
+      assert.equal(entry.provider, 'mysub-oc')
+      assert.equal(entry.model, 'glm-5.3-flash')
+      assert.equal(entry.reasoningEffort, 'xhigh')
+    }
   } finally {
     await parent.dispose()
     await root.fiber.dispose()

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OrbitStateStore } from '../src/state-store.ts'
 import { OrbitSupervisor, type OrbitSupervisorConfig } from '../src/supervisor.ts'
-import { resolveEffectiveRoutes, routeFromSelection, sessionSelectionOf } from '../src/routes.ts'
+import { resolveEffectiveRoutes, routeFromSelection, sessionModelStateOf, sessionSelectionOf } from '../src/routes.ts'
 import type { OrbitRoutes } from '../src/types.ts'
 import { FakeHost } from './helpers/fake-host.ts'
 
@@ -186,4 +186,61 @@ test('without resolveRoutes a new run keeps the config default routes', async ()
   assert.equal(result.phase, 'SUCCESS')
   assert.deepEqual(store.readState()?.routes, routes('config'))
   cleanup()
+})
+
+test('the durable session modelSelection wins over the request header', () => {
+  const configRoutes = routes('config')
+
+  // The pending choice (what the native seat shows) beats lastUsed and the
+  // legacy request header.
+  assert.deepEqual(
+    resolveEffectiveRoutes({
+      configRoutes,
+      sessionModel: {
+        lastUsed: { provider: 'old', model: 'old-model', reasoningEffort: 'low' },
+        pending: { provider: 'mysub-oc', model: 'glm-5.3-flash', reasoningEffort: 'xhigh' },
+      },
+      sessionSelection: { provider: 'header', model: 'header-model' },
+    }).executor,
+    { provider: 'mysub-oc', model: 'glm-5.3-flash', reasoningEffort: 'xhigh' },
+  )
+
+  // lastUsed applies when no choice is pending.
+  assert.deepEqual(
+    resolveEffectiveRoutes({
+      configRoutes,
+      sessionModel: { lastUsed: { provider: 'used', model: 'used-model' }, pending: null },
+      sessionSelection: { provider: 'header', model: 'header-model' },
+    }).executor,
+    { provider: 'used', model: 'used-model' },
+  )
+
+  // The request header remains a compatibility fallback below the durable
+  // projection, and config is the last resort.
+  assert.deepEqual(
+    resolveEffectiveRoutes({
+      configRoutes,
+      sessionModel: { lastUsed: null, pending: null },
+      sessionSelection: { provider: 'header', model: 'header-model' },
+    }).executor,
+    { provider: 'header', model: 'header-model' },
+  )
+  assert.deepEqual(
+    resolveEffectiveRoutes({ configRoutes, sessionModel: { lastUsed: null, pending: null } }).executor,
+    configRoutes.executor,
+  )
+})
+
+test('reads the session modelSelection projection without an inject declaration', () => {
+  const session = { id: 's' }
+  const state = { lastUsed: null, pending: { provider: 'mysub-oc', model: 'glm-5.3-flash' } }
+  const ctx = {
+    reflect: {
+      get: (name: string) => (name === 'sessionProjections' ? { stateOf: () => state } : undefined),
+    },
+  }
+  assert.deepEqual(sessionModelStateOf(ctx, session), state)
+  assert.equal(sessionModelStateOf({}, session), undefined)
+  assert.equal(sessionModelStateOf({ reflect: { get: () => ({ stateOf: () => 'nope' }) } }, session), undefined)
+  assert.equal(sessionModelStateOf({ reflect: { get: () => undefined } }, session), undefined)
 })

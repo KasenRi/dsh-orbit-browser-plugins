@@ -135,37 +135,43 @@ interface AuxRoleRequest {
   outputSchema?: ObjectJsonSchema
 }
 
-const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string) => `You are the Orbit Commander. Produce the smallest set of 2-5 logical engineering steps for this goal.
-Rules: ordinary engineering steps must omit capabilities. Add capability "browser" only when the step must drive a real web page, and "web-api-recon" when it must analyze captured network/API traffic. Keep it minimal.
-Submit your final plan through the structured result protocol.
-Goal: ${goal}
-Hard constraints: ${constraints.join('; ') || 'none'}${userReply}`
+const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string) => `你是 Orbit 指挥官（Commander），当前阶段：PLAN。
+请为下述目标制定最小化的 2-5 个逻辑工程步骤。
+规则：普通工程步骤不要声明 capabilities；仅当该步骤必须驱动真实网页时才添加 capability "browser"，仅当必须分析抓取到的网络/API 流量时才添加 "web-api-recon"。保持最小化。
+请通过结构化结果协议提交最终计划。
+你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、capability id、代码、命令、路径、provider/model ID 等机器标识保持原样。
+目标：${goal}
+硬性约束：${constraints.join('；') || '无'}${userReply}`
 
 const COMMANDER_STEP_PROMPT = (
   goal: string,
   step: OrbitPlanStep,
   evidence: string,
   state: OrbitState,
-) => `You are the Orbit Commander doing STEP_EVALUATE. Verify the real project state; do not trust the Executor claim alone. Treat verified execution evidence as authoritative.
-Allowed decisions ONLY: PASS_CURRENT_STEP | CORRECT_CURRENT_STEP | NEEDS_USER.
-- CORRECT_CURRENT_STEP requires a concrete next step goal (optional capabilities).
-Submit your final judgment through the structured result protocol.
-Original goal: ${goal}
-Current step ${step.id}: ${step.goal}
-Iteration counters: loop ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
-Executor claim:
+) => `你是 Orbit 指挥官（Commander），当前阶段：STEP_EVALUATE。
+请核实真实项目状态，不要只相信执行员的说法；以可验证的执行证据为准。
+允许的 decision 仅限：PASS_CURRENT_STEP | CORRECT_CURRENT_STEP | NEEDS_USER。
+- CORRECT_CURRENT_STEP 必须给出具体的下一步目标（可选 capabilities）。
+请通过结构化结果协议提交最终判断。
+你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+原始目标：${goal}
+当前步骤 ${step.id}：${step.goal}
+迭代计数：loop ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
+执行员证据：
 ${evidence}`
 
 const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence: string, state: OrbitState) =>
-  `You are the Orbit Commander doing FINAL_EVALUATE. All planned steps are done. Decide whether the original goal is truly satisfied against the real project state.
-Allowed decisions ONLY: SUCCESS | APPEND | NEEDS_USER.
-- APPEND requires next steps or a next step goal; appends are bounded by the remaining loop budget.
-Submit your final judgment through the structured result protocol.
-Original goal: ${goal}
-Plan summary: ${plan.summary}
-Steps: ${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}]`).join('; ')}
-Loop: ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
-Executor claim:
+  `你是 Orbit 指挥官（Commander），当前阶段：FINAL_EVALUATE。
+所有计划步骤均已执行完毕。请依据真实项目状态判断原始目标是否真正达成。
+允许的 decision 仅限：SUCCESS | APPEND | NEEDS_USER。
+- APPEND 必须给出新增步骤或下一步目标；追加受剩余 loop 预算限制。
+请通过结构化结果协议提交最终判断。
+你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+原始目标：${goal}
+计划摘要：${plan.summary}
+步骤：${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}]`).join('; ')}
+Loop：${state.loop.used}/${state.loop.max}${userReplyLine(state)}
+执行员证据：
 ${evidence}`
 
 /**
@@ -173,46 +179,56 @@ ${evidence}`
  * to a NEEDS_USER question and never replaces the original goal.
  */
 function userReplyLine(state: OrbitState): string {
-  return state.pending_user_reply ? `\nUser reply (the user's answer to the previous question): ${state.pending_user_reply}` : ''
+  return state.pending_user_reply ? `\n用户回复（对上一个问题的回答）：${state.pending_user_reply}` : ''
 }
 
 const COMMANDER_STRATEGY_PROMPT = (goal: string, base: string, challenge: string, state: OrbitState) =>
-  `You are the Orbit Commander reconsidering strategy after a repeated correction on ${base} (STRATEGY_RECONSIDER).
-Allowed decisions ONLY: KEEP_APPROACH | REPLACE_CURRENT_STEP | NEEDS_USER.
-- REPLACE_CURRENT_STEP requires a replacement goal.
-Submit your final judgment through the structured result protocol.
-Goal: ${goal}
-Loop: ${state.loop.used}/${state.loop.max}
-Watchdog challenge: ${challenge}`
+  `你是 Orbit 指挥官（Commander），当前阶段：STRATEGY_RECONSIDER。
+步骤 ${base} 已连续修正多次，请重新审视当前策略。
+允许的 decision 仅限：KEEP_APPROACH | REPLACE_CURRENT_STEP | NEEDS_USER。
+- REPLACE_CURRENT_STEP 必须给出替代目标。
+请通过结构化结果协议提交最终判断。
+你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+目标：${goal}
+Loop：${state.loop.used}/${state.loop.max}
+监控模型质疑：${challenge}`
 
 const WATCHDOG_RUNTIME_PROMPT = (step: OrbitPlanStep, reason: string, telemetry: OrbitTelemetry | undefined) =>
-  `You are the Orbit Smart Watchdog doing RUNTIME_DIAGNOSE. Diagnose only the current runtime anomaly. Do not review code quality.
-Allowed decisions ONLY: RESUME_CHILD | RESTART_STEP | NEEDS_USER | RUNTIME_BUG.
-Submit your final judgment through the structured result protocol.
-Failed step ${step.id}: ${step.goal}
-Runtime anomaly: ${reason}
-Telemetry: ${JSON.stringify(telemetry ?? {})}`
+  `你是 Orbit 监控模型（Smart Watchdog），当前阶段：RUNTIME_DIAGNOSE。
+只诊断当前运行时异常，不评审代码质量。
+允许的 decision 仅限：RESUME_CHILD | RESTART_STEP | NEEDS_USER | RUNTIME_BUG。
+请通过结构化结果协议提交最终判断。
+你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+失败步骤 ${step.id}：${step.goal}
+运行时异常：${reason}
+遥测：${JSON.stringify(telemetry ?? {})}`
 
 const WATCHDOG_STRATEGY_PROMPT = (step: OrbitPlanStep, reason: string, state: OrbitState) =>
-  `You are the Orbit Smart Watchdog doing STRATEGY_CHALLENGE. Ask: is the current approach tunnel vision? Is this blocker truly required? Is there a simpler route?
-Submit one focused challenge question through the structured result protocol.
-Step ${step.id}: ${step.goal}
-Repeated correction: ${reason}
-Loop: ${state.loop.used}/${state.loop.max}`
+  `你是 Orbit 监控模型（Smart Watchdog），当前阶段：STRATEGY_CHALLENGE。
+请质疑：当前思路是否陷入隧道视野？这个阻塞是否真的必要？是否存在更简单的路径？
+请通过结构化结果协议提交一个聚焦的质疑问题。
+你的自然语言输出默认使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+步骤 ${step.id}：${step.goal}
+重复修正：${reason}
+Loop：${state.loop.used}/${state.loop.max}`
 
 const WATCHDOG_GUARD_PROMPT = (code: GuardCode, count: number, stepId: string) =>
-  `You are the Orbit Smart Watchdog doing GUARD_ESCALATION. A safety guard blocked a tool ${count} times.
-Allowed decisions ONLY: RETRY_DIFFERENTLY | NEEDS_USER.
-Submit your final judgment through the structured result protocol.
-Guard code: ${code}
-Step: ${stepId}`
+  `你是 Orbit 监控模型（Smart Watchdog），当前阶段：GUARD_ESCALATION。
+安全护栏已连续 ${count} 次拦截某个工具调用。
+允许的 decision 仅限：RETRY_DIFFERENTLY | NEEDS_USER。
+请通过结构化结果协议提交最终判断。
+你的自然语言输出默认使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+护栏代码：${code}
+步骤：${stepId}`
 
 const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extensions: number, telemetry: OrbitTelemetry | undefined) =>
-  `You are the Orbit Smart Watchdog doing COMMANDER_TIMEOUT_REVIEW. The Commander has run ${elapsed}ms with ${extensions} extension(s).
-Allowed decisions ONLY: EXTEND | INTERRUPT | NEEDS_USER.
-Submit your final judgment through the structured result protocol.
-Mode: ${mode}
-Telemetry: ${JSON.stringify(telemetry ?? {})}`
+  `你是 Orbit 监控模型（Smart Watchdog），当前阶段：COMMANDER_TIMEOUT_REVIEW。
+指挥官已运行 ${elapsed}ms，期间延长 ${extensions} 次。
+允许的 decision 仅限：EXTEND | INTERRUPT | NEEDS_USER。
+请通过结构化结果协议提交最终判断。
+你的自然语言输出默认使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+模式：${mode}
+遥测：${JSON.stringify(telemetry ?? {})}`
 
 type CommanderOutcome =
   | { kind: 'decision'; decision: CommanderDecision }
@@ -649,14 +665,17 @@ export class OrbitSupervisor {
 
   private executorPrompt(state: OrbitState, step: OrbitPlanStep): string {
     const lines = [
-      'You are the Orbit Executor. Implement exactly the current step with real tools and real verification.',
-      `Current step ${step.id}: ${step.goal}`,
-      `Working directory: ${join(this.store.stateDir, '..')}`,
-      `Hard constraints: ${state.user_hard_constraints.join('; ') || 'none'}`,
+      '你是 Orbit 执行员（Executor）。',
+      '你只负责执行当前步骤：不要重新规划整个任务，也不要自行改变当前步骤的目标。',
+      '必须使用真实工具完成实际操作，并对结果进行真实验证。',
+      '完成后用简体中文提交简洁的执行证据：做了什么、运行了哪些命令/测试、验证结果以及仍存在的风险。',
+      '你的自然语言输出、执行说明和总结默认全部使用简体中文；代码、命令、路径、provider/model ID 等机器标识保持原样。',
+      `当前步骤 ${step.id}：${step.goal}`,
+      `工作目录：${join(this.store.stateDir, '..')}`,
+      `硬性约束：${state.user_hard_constraints.join('；') || '无'}`,
     ]
-    if (state.pending_user_reply) lines.push(`User reply (the user's answer to the previous question): ${state.pending_user_reply}`)
+    if (state.pending_user_reply) lines.push(`用户回复（对上一个问题的回答）：${state.pending_user_reply}`)
     if ((step.capabilities ?? []).length > 0) lines.push(`Capabilities: ${(step.capabilities ?? []).join(', ')}`)
-    lines.push('Return a compact evidence summary: what changed, commands/tests run, and residual risks.')
     return lines.join('\n')
   }
 

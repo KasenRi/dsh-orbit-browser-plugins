@@ -454,7 +454,8 @@ test('Commander receives the settled step evidence bundle', async () => {
     host.scriptsFor('commander').find((entry) => entry.label === 'commander-step_evaluate')?.request.prompt ?? ''
   assert.match(stepPrompt, /"settlement":"completed"/)
   assert.match(stepPrompt, /"command":"npm test"/)
-  assert.match(stepPrompt, /Executor claim:/)
+  assert.match(stepPrompt, /执行员证据/)
+  assert.match(stepPrompt, /你是 Orbit 指挥官/)
   cleanup()
 })
 
@@ -513,7 +514,8 @@ test('insufficient stop evidence cannot settle as FINAL SUCCESS', async () => {
   const finalPrompt =
     host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')?.request.prompt ?? ''
   assert.match(finalPrompt, /HTTP 502/)
-  assert.match(finalPrompt, /Executor claim:/)
+  assert.match(finalPrompt, /执行员证据/)
+  assert.match(finalPrompt, /你是 Orbit 指挥官/)
   cleanup()
 })
 
