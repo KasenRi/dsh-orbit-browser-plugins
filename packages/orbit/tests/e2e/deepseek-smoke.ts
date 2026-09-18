@@ -1,10 +1,12 @@
 /**
- * Real DeepSeek Orbit smoke.
+ * Real-provider Orbit smoke.
  *
- * Runs the full Orbit chain on a real Cordis Context with the official
- * `deepseek-official` route (real credentials from `~/.dsh/.credentials.yaml`),
- * real Commander/Executor children, real tools, and the real state machine.
+ * Runs the full Orbit chain with an explicitly configured provider adapter.
  * Intentionally tiny: one file, one verification command.
+ *
+ * The adapter has no private defaults. Configure it with
+ * ORBIT_SMOKE_BASE_URL, ORBIT_SMOKE_API_KEY_ENV, ORBIT_SMOKE_MODEL, and
+ * ORBIT_SMOKE_EFFORT.
  *
  * Usage: node packages/orbit/tests/e2e/deepseek-smoke.ts
  */
@@ -29,7 +31,15 @@ import * as DeepseekPlugin from '@deepseek-ai/dsh-llm-deepseek'
 import * as OrbitPlugin from '../../src/index.ts'
 
 const execFileAsync = promisify(execFile)
-const ROUTE = { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' }
+const BASE_URL = process.env['ORBIT_SMOKE_BASE_URL']
+const API_KEY_ENV = process.env['ORBIT_SMOKE_API_KEY_ENV']
+const MODEL = process.env['ORBIT_SMOKE_MODEL']
+const EFFORT = process.env['ORBIT_SMOKE_EFFORT']
+if (!BASE_URL || !API_KEY_ENV || !MODEL || !process.env[API_KEY_ENV]) {
+  console.log('SKIP REAL_PROVIDER_SMOKE_NOT_CONFIGURED: 请显式提供 ORBIT_SMOKE_BASE_URL、ORBIT_SMOKE_API_KEY_ENV、ORBIT_SMOKE_MODEL 及对应凭证。')
+  process.exit(0)
+}
+const ROUTE = { provider: 'provider-a', model: MODEL, ...(EFFORT ? { reasoningEffort: EFFORT } : {}) }
 
 function textTool(name: string, description: string, parameters: Record<string, unknown>, run: (args: Record<string, string>, cwd: string) => Promise<Record<string, unknown>>) {
   return defineTool({
@@ -84,7 +94,7 @@ async function main(): Promise<void> {
   for (const [plugin, config] of [
     [LlmPlugin, {}],
     [CredentialsLocal, {}],
-    [DeepseekPlugin, {}],
+    [DeepseekPlugin, { providerName: 'provider-a', baseURL: BASE_URL, apiKeyEnv: API_KEY_ENV }],
     [SessionPlugin, {}],
     [PersistencePlugin, { root: storage }],
     [SessionProjectionPlugin, {}],
@@ -114,7 +124,7 @@ async function main(): Promise<void> {
 
   const parent = await root.agents.create({
     sessionId: SessionId('deepseek-smoke-parent'),
-    agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    agentOptions: { provider: 'provider-a', model: MODEL },
     meta: { cwd: projectDir },
   })
 
@@ -122,7 +132,7 @@ async function main(): Promise<void> {
     root.orbit.run(
       {
         goal: '把 hello.txt 的内容改为 HELLO_WORLD，并用 bash 运行 cat hello.txt 验证输出包含 HELLO_WORLD',
-        approved_loop_count: 3,
+        approved_loop_count: 5,
         user_hard_constraints: ['只允许修改 hello.txt'],
       },
       projectDir,

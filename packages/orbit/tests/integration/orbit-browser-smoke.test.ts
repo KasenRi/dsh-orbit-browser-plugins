@@ -15,9 +15,9 @@ const agentBrowser = resolveExecutable('agent-browser', process.env.PATH)
 
 const config: OrbitSupervisorConfig = {
   defaultRoutes: {
-    commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
-    executor: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
-    watchdog: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' },
+    commander: { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' },
+    executor: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'high' },
+    watchdog: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
   },
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch'],
@@ -106,6 +106,8 @@ class CapabilityHost implements OrbitHost {
   hasTool(): boolean {
     return true
   }
+  async validateRoutes(): Promise<string[]> { return [] }
+  isMutationAuthorized(): boolean { return true }
   async otherMutationDrivers(): Promise<string[]> {
     return []
   }

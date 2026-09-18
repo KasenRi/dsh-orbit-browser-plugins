@@ -77,12 +77,12 @@ export function registerOrbitCommand(ctx: Context): void {
     () =>
       ctx.commands.register({
         name: AGENT_ORBIT_COMMAND,
-        description: 'Run a goal with Orbit deterministic engineering orchestration',
-        input: { hint: 'Describe the engineering goal for Orbit' },
+        description: '使用 Orbit 确定性工程编排执行目标',
+        input: { hint: '描述要交给 Orbit 完成的工程目标' },
         handler(invocation: CommandInvocation): CommandResult {
           const goal = invocation.rawInput.trim()
           if (goal === '') {
-            return { kind: 'error', text: `Usage: /${AGENT_ORBIT_COMMAND} <goal> — 请输入要交给 Orbit 完成的任务。` }
+            return { kind: 'error', text: `用法：/${AGENT_ORBIT_COMMAND} <goal>，请输入任务。` }
           }
           invocation.agent.followup(
             createUserMessage({
@@ -90,7 +90,7 @@ export function registerOrbitCommand(ctx: Context): void {
               source: { kind: 'user' },
             }),
           )
-          return { kind: 'success', text: 'Orbit activated — the existing supervisor will handle this goal.' }
+          return { kind: 'success', text: 'Orbit 已激活，现有 Supervisor 将处理此目标。' }
         },
       }),
     'dsh-orbit: /agent-orbit host command',
@@ -110,18 +110,18 @@ export function registerOrbitToggleCommand(ctx: Context): void {
     () =>
       ctx.commands.register({
         name: ORBIT_TOGGLE_COMMAND,
-        description: 'Turn the per-chat Orbit default on or off without starting a run',
-        input: { hint: 'on or off' },
+        description: '启用或关闭本会话 Orbit，不启动 Run',
+        input: { hint: '请输入 on 或 off' },
         handler(invocation: CommandInvocation): CommandResult {
           const enabled = parseOrbitToggle(invocation.rawInput)
           if (enabled === undefined) {
-            return { kind: 'error', text: `Usage: /${ORBIT_TOGGLE_COMMAND} on|off — 请输入 on 或 off。` }
+            return { kind: 'error', text: `用法：/${ORBIT_TOGGLE_COMMAND} on|off，请输入 on 或 off。` }
           }
           return {
             kind: 'success',
             text: enabled
-              ? 'Orbit is on for this chat — ordinary messages will enter Orbit.'
-              : 'Orbit is off for this chat — ordinary messages stay native.',
+              ? '本会话 Orbit 已启用，普通消息将进入 Orbit。'
+              : '本会话 Orbit 已关闭，普通消息使用原生执行方式。',
           }
         },
       }),

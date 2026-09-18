@@ -1,14 +1,17 @@
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { collectTurnToolFacts } from './evidence.ts'
 import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import { classifyTurnSettlement } from './settlement.ts'
 import type { OrbitTelemetry } from './types.ts'
+import type { OrbitRole, OrbitRoute } from './types.ts'
 
 interface SubagentRunLike {
   id: string
@@ -60,6 +63,7 @@ export class DshOrbitHost implements OrbitHost {
   private readonly ownedChildren = new Set<string>()
   private readonly interruptedChildren = new Set<string>()
   private readonly childParents = new Map<string, Agent>()
+  private readonly childGrants = new Map<string, { role: OrbitRole; workspace: string; tools: ReadonlySet<string> }>()
   private readonly nowFn: () => number
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>
 
@@ -79,12 +83,14 @@ export class DshOrbitHost implements OrbitHost {
 
   async startRole(request: RoleRunRequest): Promise<RoleHandle> {
     const parent = this.parent()
+    if (request.workspace !== undefined && resolve(parent.session.header.cwd ?? process.cwd()) !== resolve(request.workspace)) {
+      throw new Error('ORBIT_WORKSPACE_MISMATCH: 子代理工作目录必须与 Orbit 持有的 workspace 一致。')
+    }
     const prompt: ContentBlock[] = [{ type: 'text', text: request.prompt }]
     const agentOptions = {
       provider: request.route.provider,
       model: request.route.model,
-      ...(request.route.reasoningEffort ? { reasoningEffort: request.route.reasoningEffort as never } : {}),
-      ...(request.route.maxTokens ? { maxTokens: request.route.maxTokens } : {}),
+      reasoningEffort: request.route.reasoningEffort as never,
     }
 
     if (request.role === 'executor') {
@@ -117,7 +123,7 @@ export class DshOrbitHost implements OrbitHost {
       ...(request.toolFilter ? { toolFilter: request.toolFilter } : {}),
       ...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
     })) as unknown as SubagentRunLike
-    this.registerChild(run.id, parent)
+    this.registerChild(run.id, parent, request)
 
     const result: Promise<RoleRunResult> = run.result
       .then((value) => ({
@@ -161,13 +167,18 @@ export class DshOrbitHost implements OrbitHost {
     if (request.resumeOf) {
       const existingId = request.resumeOf
       const existing = this.ctx.agents.get(existingId as SessionId)
-      if (existing) {
+      const grant = this.childGrants.get(existingId)
+      const requestedTools = new Set(request.toolFilter?.allow ?? [])
+      const sameGrant = grant?.role === 'executor' && grant.workspace === (request.workspace ?? parent.session.header.cwd ?? process.cwd())
+        && grant.tools.size === requestedTools.size && [...grant.tools].every((tool) => requestedTools.has(tool))
+      if (existing && sameGrant && this.childParents.get(existingId) === parent && this.ctx.agents.isOwnedBy(SessionId(existingId), parent)) {
         const agent = existing as unknown as AgentLike
         this.interruptedChildren.delete(existingId)
-        const done = this.waitForExecutorSettlement(agent, existingId)
+        const previousTurns = (agent.session?.snapshotEvents?.() ?? []).filter((event) => event.type === 'turn/start').length
         await this.ctx.subagents.sendMessage(parent, existingId as SessionId, prompt, {
-          signal: new AbortController().signal,
+          signal: request.signal ?? new AbortController().signal,
         })
+        const done = this.waitForExecutorSettlement(agent, existingId, previousTurns)
         return {
           childId: existingId,
           result: done,
@@ -180,19 +191,27 @@ export class DshOrbitHost implements OrbitHost {
 
     const controller = new AbortController()
     request.signal?.addEventListener('abort', () => controller.abort(), { once: true })
-    const started = await this.ctx.subagents.startContinuable({
-      provider: 'spawn',
-      label: request.label,
-      request: {
-        prompt,
-        parent,
-        agentOptions,
-        ...(request.toolFilter ? { toolFilter: request.toolFilter } : {}),
-      },
-      signal: controller.signal,
-    })
-    const childId = String(started.childId)
-    this.registerChild(childId, parent)
+    const reservedId = SessionId(randomUUID())
+    const childId = String(reservedId)
+    this.registerChild(childId, parent, request)
+    let started
+    try {
+      started = await this.ctx.subagents.startContinuable({
+        provider: 'spawn',
+        label: request.label,
+        childId: reservedId,
+        request: {
+          prompt,
+          parent,
+          agentOptions,
+          ...(request.toolFilter ? { toolFilter: request.toolFilter } : {}),
+        },
+        signal: controller.signal,
+      })
+    } catch (error) {
+      this.forgetChild(childId)
+      throw error
+    }
     const agent = this.ctx.agents.get(started.childId)
     const result = agent
       ? this.waitForExecutorSettlement(agent as unknown as AgentLike, childId)
@@ -206,21 +225,28 @@ export class DshOrbitHost implements OrbitHost {
     }
   }
 
-  private registerChild(childId: string, parent: Agent): void {
+  private registerChild(childId: string, parent: Agent, request: RoleRunRequest): void {
     this.ownedChildren.add(childId)
     this.childParents.set(childId, parent)
+    this.childGrants.set(childId, {
+      role: request.role,
+      workspace: resolve(request.workspace ?? parent.session.header.cwd ?? process.cwd()),
+      tools: new Set(request.toolFilter?.allow ?? []),
+    })
   }
 
   private forgetChild(childId: string): void {
     this.ownedChildren.delete(childId)
     this.interruptedChildren.delete(childId)
     this.childParents.delete(childId)
+    this.childGrants.delete(childId)
   }
 
   private async interruptExecutor(childId: string, reason: string): Promise<void> {
     this.interruptedChildren.add(childId)
     const parent = this.childParents.get(childId)
     this.ctx.subagents.interrupt(childId as SessionId, parent ? { kind: 'ancestor', agent: parent } : { kind: 'user', parentSessionId: childId as SessionId })
+    await this.ctx.agents.get(SessionId(childId))?.whenIdle()
     void reason
   }
 
@@ -233,8 +259,8 @@ export class DshOrbitHost implements OrbitHost {
     this.forgetChild(childId)
   }
 
-  private async waitForExecutorSettlement(agent: AgentLike, childId: string): Promise<RoleRunResult> {
-    await this.waitForTurnOrIdle(agent)
+  private async waitForExecutorSettlement(agent: AgentLike, childId: string, previousTurns = 0): Promise<RoleRunResult> {
+    await this.waitForTurnOrIdle(agent, previousTurns)
     const events = agent.session?.snapshotEvents?.() ?? agent.session?.ownEvents?.() ?? []
     const classified = classifyTurnSettlement(events)
     const output = this.readFinalOutput(agent)
@@ -276,22 +302,24 @@ export class DshOrbitHost implements OrbitHost {
         return { childId, output, interrupted: true, reason: 'EXECUTOR_BLOCKED', telemetry, ...evidence }
       case 'max-tokens':
         return { childId, output, interrupted: true, reason: 'EXECUTOR_MAX_TOKENS', telemetry, ...evidence }
+      case 'interrupted':
+        return { childId, output, interrupted: true, reason: 'EXECUTOR_INTERRUPTED', telemetry, ...evidence }
       default:
         return { childId, output, interrupted: true, reason: 'EXECUTOR_NO_TURN', telemetry, ...evidence }
     }
   }
 
-  private async waitForTurnOrIdle(agent: AgentLike): Promise<void> {
+  private async waitForTurnOrIdle(agent: AgentLike, previousTurns = 0): Promise<void> {
     const deadline = this.nowFn() + EXECUTOR_TURN_START_TIMEOUT_MS
-    while (this.nowFn() < deadline && !this.hasTurnStarted(agent)) {
+    while (this.nowFn() < deadline && !this.hasTurnStarted(agent, previousTurns)) {
       await this.sleepFn(20)
     }
     await agent.whenIdle?.()
   }
 
-  private hasTurnStarted(agent: AgentLike): boolean {
+  private hasTurnStarted(agent: AgentLike, previousTurns: number): boolean {
     const events = agent.session?.snapshotEvents?.() ?? []
-    return events.some((event) => event.type === 'turn/start')
+    return events.filter((event) => event.type === 'turn/start').length > previousTurns
   }
 
   private readFinalOutput(agent: AgentLike): string {
@@ -369,6 +397,53 @@ export class DshOrbitHost implements OrbitHost {
     return this.ctx.tools.get(name, agent) !== undefined
   }
 
+  async validateRoutes(routes: Readonly<Record<OrbitRole, OrbitRoute>>, signal?: AbortSignal): Promise<string[]> {
+    const issues: string[] = []
+    const labels = { commander: '指挥官', executor: '执行员', watchdog: '监控模型' }
+    for (const role of ['commander', 'executor', 'watchdog'] as const) {
+      const route = routes[role]
+      try {
+        const llm = this.ctx.reflect.get('llm') as LlmRuntime | undefined
+        if (!llm) throw new Error('DSH LLM registry 不可用')
+        const deadline = AbortSignal.timeout(10_000)
+        const activeSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
+        const info = await llm.resolveModelInfo(route.provider, route.model, activeSignal)
+        const catalog = await llm.listModels(route.provider)
+        if (catalog.length > 0 && !catalog.some((entry) => entry.id === route.model)) {
+          issues.push(`${labels[role]}：ORBIT_MODEL_UNAVAILABLE (${route.provider}/${route.model})，当前模型目录中不存在，请重新选择。`)
+          continue
+        }
+        if (route.reasoningEffort !== undefined) {
+          const efforts = info.reasoning?.efforts ?? []
+          if (!efforts.some((effort) => effort.id === route.reasoningEffort)) {
+            issues.push(`${labels[role]}：ORBIT_REASONING_EFFORT_UNAVAILABLE (${route.provider}/${route.model}/${route.reasoningEffort})，当前模型未声明此推理等级。`)
+          }
+        }
+      } catch (error) {
+        issues.push(`${labels[role]}：ORBIT_MODEL_UNAVAILABLE (${route.provider}/${route.model})，当前不可用，请重新选择：${truncateSafe(error instanceof Error ? error.message : String(error), 200)}`)
+      }
+    }
+    return issues
+  }
+
+  isMutationAuthorized(agent: unknown, cwd: string, tool: string): boolean {
+    const id = String((agent as { id?: unknown } | undefined)?.id ?? '')
+    const grant = this.childGrants.get(id)
+    const parent = this.childParents.get(id)
+    return grant?.role === 'executor' && grant.workspace === resolve(cwd) && grant.tools.has(tool)
+      && !this.interruptedChildren.has(id) && this.ctx.agents.get(SessionId(id)) === agent
+      && parent !== undefined && this.ctx.agents.isOwnedBy(SessionId(id), parent)
+  }
+
+  async revokeWorkspace(cwd: string): Promise<void> {
+    const ids = [...this.childGrants].filter(([, grant]) => grant.workspace === resolve(cwd) && grant.role === 'executor').map(([id]) => id)
+    for (const id of ids) {
+      const parent = this.childParents.get(id)
+      await this.interruptExecutor(id, 'ORBIT_WORKSPACE_RELEASED')
+      if (parent) await this.drainExecutor(parent, id)
+    }
+  }
+
   /**
    * Mutation ownership is about top-level autonomous drivers, not about every
    * running agent. The calling parent, Orbit's own children, and ordinary
@@ -377,17 +452,18 @@ export class DshOrbitHost implements OrbitHost {
    * at tool start by the Orbit mutation guard.
    */
   async otherMutationDrivers(cwd: string): Promise<string[]> {
-    void cwd
     const drivers: string[] = []
     const initiator = this.ctx.agents.currentInitiator()
     // `ctx.reflect.get` is the official service lookup that does not require an
     // inject declaration, so Orbit stays loadable in profiles without dsh-goal.
     const reflect = (this.ctx as unknown as { reflect?: { get(name: string, strict?: boolean): unknown } }).reflect
     const goals = reflect?.get('goals') as GoalsLike | undefined
-    if (goals && initiator) {
+    const agents = this.ctx.agents.list?.() ?? (initiator ? [initiator] : [])
+    for (const candidate of agents) {
+      if (!goals || resolve(candidate.session.header.cwd ?? process.cwd()) !== resolve(cwd) || this.ownedChildren.has(String(candidate.id))) continue
       try {
-        const goal = goals.get(initiator)
-        if (goal?.phase === 'active') drivers.push('goal')
+        const goal = goals.get(candidate)
+        if (goal?.phase === 'active' && !drivers.includes('goal')) drivers.push('goal')
       } catch {
         // goal service is present but not readable for this initiator
       }

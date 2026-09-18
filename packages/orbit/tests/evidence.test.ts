@@ -6,6 +6,8 @@ import {
   EVIDENCE_LIMITS,
   formatEvidenceBundle,
   isTestCommand,
+  buildStepResult,
+  formatStepResults,
 } from '../src/evidence.ts'
 
 const call = (turn: number, callId: string, name: string, args: Record<string, unknown>) => ({
@@ -118,4 +120,20 @@ test('redacts secrets and enforces the total budget', () => {
 
 test('a log without turn boundaries yields no facts', () => {
   assert.deepEqual(collectTurnToolFacts([call(1, 'c1', 'read', { path: 'a.ts' }), result(1, 'c1')]), [])
+})
+
+test('durable step results bound and redact every string and final review retains every step', () => {
+  const result = buildStepResult('P0', 1, buildEvidenceBundle({
+    executorOutput: 'API_KEY=private-value ' + 'x'.repeat(9000),
+    changedFiles: Array.from({ length: 70 }, () => 'a'.repeat(900)),
+  }), Array.from({ length: 20 }, () => 'token=private-value ' + 't'.repeat(1000)))
+  assert.ok(result.summary.length <= 2000)
+  assert.ok(result.changed_files.length <= 50)
+  assert.ok(result.test_summary.length <= 10)
+  assert.ok(result.test_summary.every((item) => item.length <= 400))
+  assert.doesNotMatch(JSON.stringify(result), /private-value/)
+  const steps = Array.from({ length: 10 }, (_, i) => ({ id: `P${i}`, goal: 'g', status: 'passed' as const }))
+  const formatted = formatStepResults({ plan: { summary: '', steps }, step_results: steps.map((step) => ({ ...result, step_id: step.id })) } as never)
+  assert.ok(formatted.length <= 8000)
+  for (const step of steps) assert.ok(formatted.includes(`${step.id}[passed]`))
 })

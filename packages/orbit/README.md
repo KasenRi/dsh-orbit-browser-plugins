@@ -94,14 +94,13 @@ The `orbit_controller` tool drives the run:
 Orbit supports three activation styles:
 
 1. `/agent-orbit <goal>` — deterministic slash-command activation. In the Web
-   GUI it appears in the `/` menu (`Run a goal with Orbit deterministic
-   engineering orchestration`); on headless/CLI surfaces a genuine user message
+   GUI it appears in the `/` menu (`使用 Orbit 确定性工程编排执行目标`); on headless/CLI surfaces a genuine user message
    that starts with `/agent-orbit` activates Orbit directly. The original
    command line stays visible in the conversation, the goal is passed through
    without rewriting, and no goal asks for one instead of starting an empty run.
-2. `orbit模式` — recommended natural-language activation, e.g.
+  2. `orbit模式` — recommended natural-language activation, e.g.
    “用 orbit模式完成这个项目”.
-3. `cx模式` — legacy compatibility; still resolves to Orbit.
+  3. `cx模式` — legacy compatibility; still resolves to Orbit.
 
 All three routes converge on the existing `orbit_controller` tool and
 `OrbitService`; the activation layer never starts a run of its own.
@@ -113,20 +112,21 @@ seat (`conversation.input.right` renders before `conversation.input.model`).
 Its button names the Commander's model; the menu edits three roles:
 
 - **Commander** and **Watchdog** pick from the same native model catalog and
-  persist into the DSH `orbit` settings namespace (`settings.yaml`), with the
-  composition `config.routes` as the base/default. Switching a model uses that
-  model's own default reasoning effort — a previous model's effort is never
-  inherited.
+  persist into the DSH `orbit` settings namespace (`settings.yaml`). Picking a
+  model first opens reasoning selection; nothing is saved until the user chooses
+  a catalog-declared effort or provider default. No effort is inferred.
 - **Executor** follows the current session model ("Follows current session
   model"). Both the Orbit row and the native seat read and write the SAME
   per-session `ModelDirectory`, so a change in either place updates the other.
 
 A new run resolves its routes exactly once — Commander/Watchdog from `orbit`
-settings, Executor from the initiating session's current selection, each
-falling back to `config.routes` — and freezes them into `state.routes`.
+settings, Executor from the initiating session's current selection — and freezes
+them into `state.routes`. Orbit ships no provider/model or reasoning defaults.
 Changes made while a run is active apply to the next run; resumed runs keep
-their frozen routes. Headless/CLI profiles without a settings provider keep
-running from `config.routes` unchanged.
+their frozen routes. Explicit profile routes are permitted for headless/CLI:
+Commander/Watchdog use settings then explicit config; Executor uses the Session
+selection, with explicit config only when there is no Session. Missing or
+unavailable roles block creation of a Run before any child starts.
 
 ## State machine
 
@@ -158,11 +158,16 @@ PLAN → EXECUTE → EVALUATE → SUCCESS
 ## Safety boundaries
 
 - Commander and Watchdog receive read-only tool allowlists.
-- Executors receive the configured writer allowlist; browser tools are added
-  only for steps that declare the `browser` capability.
+- Executors always receive only base read tools (`read/read_image/glob/grep`).
+  Each Step explicitly declares `filesystem`, `shell`, `web`, or `browser` to
+  add only the corresponding tools. Legacy `web-api-recon` normalizes to `web`
+  plus `browser`. No capability means no bash, writers, web, or browser tools.
 - While Orbit owns a workspace, other top-level autonomous drivers
   (`create_goal`, `ralph`, `workflow`) are refused, and Orbit refuses to start
-  while an active goal driver owns the same workspace.
+  while an active Goal driver owns the same workspace. Only an Orbit-owned
+  Executor child can use mutation tools while Orbit owns that workspace.
+- Bounded, redacted `step_results` preserve each Step's summary, changes and
+  test evidence. Cold resume retains them and FINAL_EVALUATE sees every Step.
 - `.cx` durable state is written only by the Orbit service (atomic write, short
   lock transaction, monotonic revision).
 
@@ -171,10 +176,10 @@ PLAN → EXECUTE → EVALUATE → SUCCESS
 | Key | Default | Meaning |
 |---|---|---|
 | `projectDir` | session cwd | Project the run operates on. |
-| `routes.commander` | `deepseek-official` / `deepseek-v4-pro` / `high` | Commander model route. |
-| `routes.executor` | `deepseek-official` / `deepseek-v4-flash` / `high` | Executor model route. |
-| `routes.watchdog` | `deepseek-official` / `deepseek-v4-flash` / `low` | Watchdog model route. |
-| `executorTools` | read/glob/grep/bash/edit/write/… | Executor allowlist. |
+| `routes.commander` | none | Explicit profile fallback; normally user-selected in Orbit settings. |
+| `routes.executor` | none | Explicit config only without a Session; otherwise follows DSH Session selection. |
+| `routes.watchdog` | none | Explicit profile fallback; normally user-selected in Orbit settings. |
+| `executorTools` | read/read_image/glob/grep | Base read-only subset; mutation tools require Step capabilities. |
 | `browserTools` | `["agent_browser"]` | Browser capability tool names. |
 | `commanderReadOnlyTools` | read/glob/grep/web… | Commander allowlist. |
 | `watchdogTools` | read/glob/grep | Watchdog allowlist. |

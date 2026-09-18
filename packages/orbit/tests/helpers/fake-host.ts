@@ -2,6 +2,7 @@ import type { EvidenceToolFact } from '../../src/evidence.ts'
 import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult, RoleToolFilter } from '../../src/host.ts'
 import type { TurnSettlement } from '../../src/settlement.ts'
 import type { OrbitTelemetry } from '../../src/types.ts'
+import type { OrbitRole, OrbitRoute } from '../../src/types.ts'
 
 export interface RoleScript {
   output?: string
@@ -36,6 +37,7 @@ export class FakeHost implements OrbitHost {
   readonly tools = new Set<string>(['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser'])
   drivers: string[] = []
   changed: string[] = []
+  routeIssues: string[] = []
   private readonly queues = new Map<string, RoleScript[]>()
 
   script(role: string, scripts: RoleScript[]): this {
@@ -116,6 +118,14 @@ export class FakeHost implements OrbitHost {
 
   hasTool(name: string): boolean {
     return this.tools.has(name)
+  }
+
+  async validateRoutes(_routes: Readonly<Record<OrbitRole, OrbitRoute>>): Promise<string[]> {
+    return [...this.routeIssues]
+  }
+
+  isMutationAuthorized(): boolean {
+    return true
   }
 
   async otherMutationDrivers(): Promise<string[]> {

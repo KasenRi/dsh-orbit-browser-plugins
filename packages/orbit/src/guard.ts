@@ -21,23 +21,23 @@ const GITHUB_REMOTE_PATTERNS: readonly RegExp[] = [
 ]
 
 const DANGEROUS_PATTERNS: ReadonlyArray<[GuardCode, RegExp, string]> = [
-  ['destructive_operation', /\brm\s+-[A-Za-z]*r[A-Za-z]*f|\brm\s+-rf\b/i, 'recursive force deletion'],
-  ['destructive_operation', /\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[A-Za-z]*f/i, 'irreversible git reset/clean'],
-  ['production_operation', /\bdrop\s+database\b|\b(?:drop|truncate)\s+(?:table|schema)\b/i, 'irreversible database operation'],
+  ['destructive_operation', /\brm\s+-[A-Za-z]*r[A-Za-z]*f|\brm\s+-rf\b/i, '递归强制删除'],
+  ['destructive_operation', /\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-[A-Za-z]*f/i, '不可逆的 git reset/clean'],
+  ['production_operation', /\bdrop\s+database\b|\b(?:drop|truncate)\s+(?:table|schema)\b/i, '不可逆的数据库操作'],
   [
     'production_operation',
     /\b(?:production|prod)\b.*\b(?:deploy|migrate|database|restart)\b|\b(?:deploy|migrate)\b.*\b(?:production|prod)\b/i,
-    'production operation',
+    '生产环境操作',
   ],
   [
     'production_operation',
     /\b(?:kubectl|helm)\s+(?:apply|delete|upgrade|rollback)\b|\bterraform\s+apply\b|\bdocker\s+push\b/i,
-    'deployment or remote registry write',
+    '部署或远程 registry 写入',
   ],
-  ['production_operation', /\b(?:alembic|prisma|sequelize|rails)\b.*\b(?:upgrade|migrate|db:migrate)\b/i, 'database migration'],
-  ['production_operation', /\b(?:ufw|iptables)\b.*\b(?:allow|insert|append)\b|\bdocker\s+run\b.*\s-p\s/i, 'public network exposure'],
-  ['secret_operation', /\b(?:cat|less|more|head|tail)\b[^\n]*(?:\.env|secret|credential|auth\.json|cookie)/i, 'credential or secret output'],
-  ['secret_operation', /\b(?:curl|wget)\b[^\n]*(?:Authorization|Bearer|api[_-]?key|token)=?/i, 'credential-bearing network request'],
+  ['production_operation', /\b(?:alembic|prisma|sequelize|rails)\b.*\b(?:upgrade|migrate|db:migrate)\b/i, '数据库迁移'],
+  ['production_operation', /\b(?:ufw|iptables)\b.*\b(?:allow|insert|append)\b|\bdocker\s+run\b.*\s-p\s/i, '暴露公共网络端口'],
+  ['secret_operation', /\b(?:cat|less|more|head|tail)\b[^\n]*(?:\.env|secret|credential|auth\.json|cookie)/i, '输出凭证或敏感信息'],
+  ['secret_operation', /\b(?:curl|wget)\b[^\n]*(?:Authorization|Bearer|api[_-]?key|token)=?/i, '携带凭证的网络请求'],
 ]
 
 const SENSITIVE_ENV_NAME = /(?:^|_)(?:KEY|TOKEN|PASSWORD|PASSWD|SECRET|COOKIE|AUTH|CREDENTIAL|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN)(?:_|$)/i
@@ -89,27 +89,27 @@ export function guardBashCommand(command: string, intent: GuardIntent = {}): Gua
 
   if (intent.github_allowed !== true) {
     for (const pattern of GITHUB_REMOTE_PATTERNS) {
-      if (pattern.test(trimmed)) return block('github_remote_write', `GitHub remote write is not allowed: ${pattern.source}`)
+      if (pattern.test(trimmed)) return block('github_remote_write', `未授权 GitHub 远程写入：${pattern.source}`)
     }
   }
 
   if (isDurableStateWrite(trimmed)) {
-    return block('durable_state_write', 'Only the Orbit controller may write .cx durable state.')
+    return block('durable_state_write', '只有 Orbit controller 可以写入 .cx 持久状态。')
   }
 
   if (looksLikeEnvSecret(trimmed)) {
-    return block('secret_operation', 'Reading or exporting secrets is not allowed.')
+    return block('secret_operation', '不允许读取或导出敏感凭证。')
   }
   if (/^\s*export\s+[A-Za-z_][A-Za-z0-9_]*\s*=/i.test(trimmed)) {
     const assignment = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/i.exec(trimmed)
     if (assignment && SENSITIVE_ENV_NAME.test(assignment[1] ?? '')) {
-      return block('secret_operation', 'Exporting a secret environment variable is not allowed.')
+      return block('secret_operation', '不允许导出敏感环境变量。')
     }
   }
   if (/^\s*set\s+[A-Za-z_][A-Za-z0-9_]*=/i.test(trimmed)) {
     const assignment = /^\s*set\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/i.exec(trimmed)
     if (assignment && SENSITIVE_ENV_NAME.test(assignment[1] ?? '')) {
-      return block('secret_operation', 'Setting a secret environment variable is not allowed.')
+      return block('secret_operation', '不允许设置敏感环境变量。')
     }
   }
 
@@ -133,11 +133,11 @@ export function guardToolPath(toolName: string, targetPath: unknown, deps: ToolP
   const cwd = deps.cwd
   const absolute = isAbsolute(targetPath) ? targetPath : resolve(cwd, targetPath)
   if (isInsideDurableState(absolute, cwd)) {
-    return block('durable_state_write', 'Only the Orbit controller may write .cx durable state.')
+    return block('durable_state_write', '只有 Orbit controller 可以写入 .cx 持久状态。')
   }
   const realpath = deps.realpath ?? safeRealpath
   if (isInsideDurableState(realpathWithin(absolute, realpath), cwd)) {
-    return block('durable_state_write', 'Only the Orbit controller may write .cx durable state (symlink resolved).')
+    return block('durable_state_write', '只有 Orbit controller 可以写入 .cx 持久状态（已解析符号链接）。')
   }
   return { allowed: true }
 }
@@ -170,5 +170,5 @@ function safeRealpath(path: string): string {
 }
 
 export function guardReason(decision: Extract<GuardDecision, { allowed: false }>): string {
-  return `Blocked by Orbit safety guard (${decision.code}): ${decision.reason}`
+  return `Orbit 安全护栏阻断当前调用 (${decision.code})：${decision.reason}`
 }

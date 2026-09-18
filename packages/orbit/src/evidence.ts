@@ -9,7 +9,7 @@
  * they are never persisted into `.cx/state.json` as a whole.
  */
 
-import type { OrbitTelemetry } from './types.ts'
+import type { OrbitTelemetry, OrbitStepResult, OrbitState } from './types.ts'
 import { redactText, redactValue } from './sanitize.ts'
 import type { TurnSettlement } from './settlement.ts'
 
@@ -191,4 +191,30 @@ export function buildEvidenceBundle(input: EvidenceBundleInput): OrbitEvidenceBu
 /** Render a bundle for a prompt, hard-capped at the total evidence budget. */
 export function formatEvidenceBundle(bundle: OrbitEvidenceBundle): string {
   return bounded(JSON.stringify(bundle), EVIDENCE_LIMITS.total)
+}
+
+/** Persist only compact result facts, never a child transcript. */
+export function buildStepResult(stepId: string, attempt: number, bundle: OrbitEvidenceBundle, tests: readonly string[] = []): OrbitStepResult {
+  return {
+    step_id: bounded(stepId, 80),
+    attempt,
+    summary: bounded(bundle.executor_summary ?? '', EVIDENCE_LIMITS.executorSummary),
+    changed_files: bundle.changed_files.map((entry) => bounded(entry, EVIDENCE_LIMITS.entry)).slice(0, EVIDENCE_LIMITS.changedFiles),
+    test_summary: [...tests, ...bundle.tests.map((entry) => `${entry.command}: ${entry.status}`)]
+      .slice(0, EVIDENCE_LIMITS.testEvidence).map((entry) => bounded(entry, EVIDENCE_LIMITS.entry)),
+    evidence: formatEvidenceBundle(bundle),
+  }
+}
+
+/** Fair per-step quotas keep every step visible in a bounded final review. */
+export function formatStepResults(state: OrbitState): string {
+  const steps = state.plan.steps
+  const quota = Math.max(1, Math.floor(EVIDENCE_LIMITS.total / Math.max(1, steps.length)) - 100)
+  return steps.map((step) => {
+    const result = state.step_results?.find((entry) => entry.step_id === step.id)
+    const content = result === undefined ? '未记录持久化结果' : JSON.stringify({
+      summary: result.summary, test_summary: result.test_summary, changed_files: result.changed_files, evidence: result.evidence,
+    })
+    return `${bounded(step.id, 80)}[${step.status}] ${bounded(content, quota)}`
+  }).join('\n')
 }

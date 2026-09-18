@@ -1,13 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OrbitStateStore } from '../src/state-store.ts'
 import { OrbitSupervisor, type OrbitSupervisorConfig } from '../src/supervisor.ts'
-import { resolveEffectiveRoutes, routeFromSelection, sessionModelStateOf, sessionSelectionOf } from '../src/routes.ts'
+import { agentDefaultSelectionOf, resolveEffectiveRoutes, routeFromSelection, sessionModelSelectionOf, sessionModelStateOf, sessionSelectionOf } from '../src/routes.ts'
 import type { OrbitRoutes } from '../src/types.ts'
 import { FakeHost } from './helpers/fake-host.ts'
+import { Config } from '../src/index.ts'
 
 const config: Omit<OrbitSupervisorConfig, 'defaultRoutes' | 'resolveRoutes'> = {
   browserTools: ['agent_browser'],
@@ -29,7 +30,7 @@ function routes(tag: string): OrbitRoutes {
   }
 }
 
-const plan = (steps: Array<{ id: string; goal: string }>) => ({ summary: 'plan', steps })
+const plan = (steps: Array<{ id: string; goal: string; capabilities?: string[] }>) => ({ summary: 'plan', steps })
 const commander = (decision: Record<string, unknown>) => decision
 
 test('resolves effective routes from settings, session selection, and config fallback', () => {
@@ -81,8 +82,8 @@ test('falls back per role when settings or session selection are absent or unusa
     },
   )
 
-  assert.deepEqual(resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: 'x' } }), configRoutes)
-  assert.deepEqual(resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: '', model: '' } }), configRoutes)
+  assert.throws(() => resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: 'x' } }), /Executor 未选择/)
+  assert.throws(() => resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: '', model: '' } }), /Executor 未选择/)
 })
 
 test('route candidates require a complete provider/model pair', () => {
@@ -101,7 +102,7 @@ test('route candidates require a complete provider/model pair', () => {
 })
 
 test('reads the initiating session selection from the public request header', () => {
-  const selection = { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' }
+  const selection = { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' }
   assert.deepEqual(sessionSelectionOf({ session: { requestHeader: () => ({ config: selection }) } }), selection)
   assert.equal(sessionSelectionOf({ session: { requestHeader: () => undefined } }), undefined)
   assert.equal(sessionSelectionOf({ session: {} }), undefined)
@@ -188,59 +189,166 @@ test('without resolveRoutes a new run keeps the config default routes', async ()
   cleanup()
 })
 
-test('the durable session modelSelection wins over the request header', () => {
-  const configRoutes = routes('config')
-
-  // The pending choice (what the native seat shows) beats lastUsed and the
-  // legacy request header.
+test('the current Session model follows DSH selectionFor semantics', () => {
+  // 1. The pending choice (what the native seat shows) wins over header/default.
   assert.deepEqual(
-    resolveEffectiveRoutes({
-      configRoutes,
-      sessionModel: {
-        lastUsed: { provider: 'old', model: 'old-model', reasoningEffort: 'low' },
-        pending: { provider: 'mysub-oc', model: 'glm-5.3-flash', reasoningEffort: 'xhigh' },
+    sessionModelSelectionOf({
+      sessionModel: { pending: { provider: 'provider-b', model: 'model-b', reasoningEffort: 'xhigh' } },
+      requestHeader: { config: { provider: 'header', model: 'header-model' } },
+      agentDefault: { provider: 'default', model: 'default-model' },
+    }),
+    { provider: 'provider-b', model: 'model-b', reasoningEffort: 'xhigh' },
+  )
+
+  // 2. With no pending choice, the logged request header wins over the default.
+  assert.deepEqual(
+    sessionModelSelectionOf({
+      sessionModel: { lastUsed: { provider: 'ignored', model: 'ignored-model' }, pending: null },
+      requestHeader: { config: { provider: 'header', model: 'header-model', reasoningEffort: 'low' } },
+      agentDefault: { provider: 'default', model: 'default-model' },
+    }),
+    { provider: 'header', model: 'header-model', reasoningEffort: 'low' },
+  )
+
+  // 3. A header effort that only materialized the adapter default is not a
+  //    user choice and must be suppressed, exactly like DSH does.
+  assert.deepEqual(
+    sessionModelSelectionOf({
+      requestHeader: {
+        config: { provider: 'header', model: 'header-model', reasoningEffort: 'medium' },
+        adapterDefaults: { reasoningEffort: true },
       },
-      sessionSelection: { provider: 'header', model: 'header-model' },
-    }).executor,
-    { provider: 'mysub-oc', model: 'glm-5.3-flash', reasoningEffort: 'xhigh' },
+      agentDefault: { provider: 'default', model: 'default-model' },
+    }),
+    { provider: 'header', model: 'header-model' },
   )
 
-  // lastUsed applies when no choice is pending.
+  // 4. A fresh Session without projection state or header uses the deployment
+  //    default (`ctx.agentDefaultModel.currentSelection()`).
   assert.deepEqual(
-    resolveEffectiveRoutes({
-      configRoutes,
-      sessionModel: { lastUsed: { provider: 'used', model: 'used-model' }, pending: null },
-      sessionSelection: { provider: 'header', model: 'header-model' },
-    }).executor,
-    { provider: 'used', model: 'used-model' },
-  )
-
-  // The request header remains a compatibility fallback below the durable
-  // projection, and config is the last resort.
-  assert.deepEqual(
-    resolveEffectiveRoutes({
-      configRoutes,
+    sessionModelSelectionOf({
       sessionModel: { lastUsed: null, pending: null },
+      agentDefault: { provider: 'provider-b', model: 'model-b', reasoningEffort: 'xhigh' },
+    }),
+    { provider: 'provider-b', model: 'model-b', reasoningEffort: 'xhigh' },
+  )
+
+  // 5. Nothing known yields nothing: the route resolver falls to config.
+  assert.equal(sessionModelSelectionOf({}), undefined)
+})
+
+test('an unusable current-Session selection cannot fall back to profile executor', () => {
+  const configRoutes = routes('config')
+  assert.deepEqual(
+    resolveEffectiveRoutes({
+      configRoutes,
       sessionSelection: { provider: 'header', model: 'header-model' },
     }).executor,
     { provider: 'header', model: 'header-model' },
   )
+  assert.throws(() => resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: 'x' } }), /Executor 未选择/)
+  // Commander and Watchdog never follow the Session selection.
   assert.deepEqual(
-    resolveEffectiveRoutes({ configRoutes, sessionModel: { lastUsed: null, pending: null } }).executor,
-    configRoutes.executor,
+    resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: 'header', model: 'header-model' } }).commander,
+    configRoutes.commander,
   )
 })
 
-test('reads the session modelSelection projection without an inject declaration', () => {
+test('reads the session modelSelection projection and deployment default safely', () => {
   const session = { id: 's' }
-  const state = { lastUsed: null, pending: { provider: 'mysub-oc', model: 'glm-5.3-flash' } }
+  const state = { lastUsed: null, pending: { provider: 'provider-b', model: 'model-b' } }
   const ctx = {
     reflect: {
-      get: (name: string) => (name === 'sessionProjections' ? { stateOf: () => state } : undefined),
+      get: (name: string) => {
+        if (name === 'sessionProjections') return { stateOf: () => state }
+        if (name === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'default', model: 'default-model', reasoningEffort: 'high' }) }
+        }
+        return undefined
+      },
     },
   }
   assert.deepEqual(sessionModelStateOf(ctx, session), state)
+  assert.deepEqual(agentDefaultSelectionOf(ctx), { provider: 'default', model: 'default-model', reasoningEffort: 'high' })
   assert.equal(sessionModelStateOf({}, session), undefined)
   assert.equal(sessionModelStateOf({ reflect: { get: () => ({ stateOf: () => 'nope' }) } }, session), undefined)
   assert.equal(sessionModelStateOf({ reflect: { get: () => undefined } }, session), undefined)
+  assert.equal(agentDefaultSelectionOf({}), undefined)
+  assert.equal(agentDefaultSelectionOf({ reflect: { get: () => ({}) } }), undefined)
+  assert.equal(
+    agentDefaultSelectionOf({ reflect: { get: () => ({ currentSelection: () => { throw new Error('boom') } }) } }),
+    undefined,
+  )
+})
+
+test('empty plugin Config ships no model or reasoning defaults', () => {
+  const configured = Config({}) as { routes?: Record<string, { provider?: string; model?: string; reasoningEffort?: string }> }
+  for (const route of Object.values(configured.routes ?? {})) {
+    assert.ok(!route.provider)
+    assert.ok(!route.model)
+    assert.ok(!route.reasoningEffort)
+  }
+})
+
+test('missing role configuration blocks durable creation and every child', async () => {
+  for (const role of ['commander', 'executor', 'watchdog'] as const) {
+    const { dir, cleanup } = project()
+    const host = new FakeHost()
+    const explicit = routes('explicit')
+    const candidate: Partial<OrbitRoutes> = { ...explicit }
+    delete candidate[role]
+    const store = new OrbitStateStore(dir)
+    const result = await new OrbitSupervisor(store, host, { ...config, defaultRoutes: candidate }).bootstrap({ goal: 'g' })
+    assert.equal(result.ok, false)
+    assert.match(result.message ?? '', new RegExp(`${role === 'commander' ? 'Commander' : role === 'executor' ? 'Executor' : 'Watchdog'} 未选择`))
+    assert.equal(host.started.length, 0)
+    assert.equal(existsSync(store.statePath), false)
+    cleanup()
+  }
+})
+
+test('unavailable saved model blocks a new Run without persisting guessed routes', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host.routeIssues = ['commander: ORBIT_MODEL_UNAVAILABLE (provider-a/removed-model)']
+  const store = new OrbitStateStore(dir)
+  const result = await new OrbitSupervisor(store, host, { ...config, defaultRoutes: routes('user') }).bootstrap({ goal: 'g' })
+  assert.equal(result.ok, false)
+  assert.match(result.message ?? '', /commander.*ORBIT_MODEL_UNAVAILABLE/)
+  assert.equal(host.started.length, 0)
+  assert.equal(existsSync(store.statePath), false)
+  cleanup()
+})
+
+test('frozen user routes and reasoning reach the exact role requests without fallback or delegation tools', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  const selected: OrbitRoutes = {
+    commander: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'effort-a' },
+    executor: { provider: 'provider-b', model: 'model-b' },
+    watchdog: { provider: 'provider-c', model: 'model-c', reasoningEffort: 'effort-c' },
+  }
+  host.tools.add('subagent')
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'run', capabilities: ['shell'] }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { interrupted: true, reason: 'controlled anomaly', childId: 'exec-a' },
+      { output: 'done', childId: 'exec-b' },
+    ])
+    .script('watchdog', [{ structured: commander({ decision: 'RESTART_STEP' }) }])
+  const store = new OrbitStateStore(dir)
+  const supervisor = new OrbitSupervisor(store, host, { ...config, defaultRoutes: selected })
+  assert.equal((await supervisor.bootstrap({ goal: 'route proof', approved_loop_count: 3 })).phase, 'SUCCESS')
+  assert.deepEqual(store.readState()?.routes, selected)
+  for (const request of host.started) {
+    assert.deepEqual(request.request.route, selected[request.role as keyof OrbitRoutes])
+    assert.ok(!(request.toolFilter?.allow ?? []).includes('subagent'), `${request.role} must not delegate to a fourth autonomous Agent`)
+  }
+  assert.ok(host.scriptsFor('watchdog').length > 0, 'the controlled anomaly must invoke Watchdog')
+  assert.equal('reasoningEffort' in selected.executor, false, 'provider default remains an absent effort')
+  cleanup()
 })

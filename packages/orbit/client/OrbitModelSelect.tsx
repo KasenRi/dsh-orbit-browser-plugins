@@ -20,7 +20,6 @@ import {
   modelOf,
   routeForModel,
   routeLabelOf,
-  selectionForModel,
   type OrbitModelInjected,
   type OrbitRouteValue,
   type OrbitRoleName,
@@ -37,7 +36,7 @@ type Pane =
   | { kind: 'root' }
   | { kind: 'role'; role: OrbitRoleName }
   | { kind: 'models'; role: OrbitRoleName }
-  | { kind: 'efforts'; role: OrbitRoleName }
+  | { kind: 'efforts'; role: OrbitRoleName; draft?: OrbitRouteValue }
 
 const CHEVRON = '\u203A'
 const CARET = '\u25BE'
@@ -85,6 +84,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   const [open, setOpen] = useState(false)
   const [pane, setPane] = useState<Pane>({ kind: 'root' })
   const [busy, setBusy] = useState(false)
+  const submitting = useRef(false)
   const triggerRef = useRef<HTMLSpanElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
   const position = useAnchoredPosition({ open, anchorRef: triggerRef, panelRef, side: 'top', gap: 8, margin: 12 })
@@ -127,17 +127,27 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   const watchdogEffort = effortLabelOf(watchdogModel, watchdogRoute?.reasoningEffort)
 
   const commitRole = async (role: 'commander' | 'watchdog', route: OrbitRouteValue): Promise<void> => {
+    if (submitting.current || config.status !== 'ready') return
+    submitting.current = true
     setBusy(true)
-    const ok = await writeRole(role, route)
-    setBusy(false)
-    if (ok) setOpen(false)
+    try {
+      if (await writeRole(role, route)) setOpen(false)
+    } finally {
+      submitting.current = false
+      setBusy(false)
+    }
   }
 
   const commitExecutor = async (selection: ModelSelection): Promise<void> => {
+    if (submitting.current) return
+    submitting.current = true
     setBusy(true)
-    const ok = await selectModel(selection)
-    setBusy(false)
-    if (ok) setOpen(false)
+    try {
+      if (await selectModel(selection)) setOpen(false)
+    } finally {
+      submitting.current = false
+      setBusy(false)
+    }
   }
 
   const currentRouteOf = (role: OrbitRoleName): OrbitRouteValue | undefined =>
@@ -176,15 +186,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
         className={css.row}
         disabled={busy}
         onClick={() => {
-          if (active) {
-            setOpen(false)
-            return
-          }
-          if (role === 'executor') {
-            void commitExecutor(selectionForModel(dir, provider, model))
-            return
-          }
-          void commitRole(role, routeForModel(provider, model))
+          setPane({ kind: 'efforts', role, draft: routeForModel(provider, model) })
         }}
       >
         <span className={css.rowLabel}>
@@ -196,7 +198,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
     )
   }
 
-  const effortPaneRoute = pane.kind === 'efforts' ? currentRouteOf(pane.role) : undefined
+  const effortPaneRoute = pane.kind === 'efforts' ? pane.draft ?? currentRouteOf(pane.role) : undefined
   const effortPaneModel = modelOf(dir, effortPaneRoute)
   const effortPaneChoices = pane.kind === 'efforts' ? effortChoicesOf(effortPaneModel, t('providerDefault')) : []
 
@@ -408,7 +410,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                       }}
                     >
                       <span className={css.rowLabel}>{choice.label}</span>
-                      {effortPaneRoute.reasoningEffort === choice.effort ? <span className={css.check}>{'\u2713'}</span> : null}
+                       {pane.draft === undefined && effortPaneRoute.reasoningEffort === choice.effort ? <span className={css.check}>{'\u2713'}</span> : null}
                     </button>
                   ))}
                 </>

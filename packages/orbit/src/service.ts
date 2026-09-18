@@ -1,4 +1,5 @@
-import { accessSync, constants, mkdirSync } from 'node:fs'
+import { accessSync, constants, existsSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
@@ -6,6 +7,7 @@ import { DshOrbitHost } from './dsh-host.ts'
 import { OrbitStateStore } from './state-store.ts'
 import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome } from './supervisor.ts'
 import type { OrbitActionResult, OrbitRoutes, GuardCode } from './types.ts'
+import type { OrbitConfiguredRoutes } from './routes.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -18,12 +20,17 @@ declare module '@deepseek-ai/cordis' {
 
 export interface OrbitPluginConfig {
   projectDir?: string
-  routes: OrbitRoutes
+  routes: OrbitConfiguredRoutes
   /**
    * Resolve the role routes for a NEW run (settings + session selection).
    * Optional so minimal/headless compositions keep using `routes` unchanged.
    */
   resolveRoutes?: () => OrbitRoutes
+  /**
+   * Resolve the DSH Session driving the current operation. A new run records
+   * it and only that Session may answer its NEEDS_USER question.
+   */
+  resolveOwnerSessionId?: () => string | undefined
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
@@ -40,6 +47,7 @@ export interface OrbitDoctorReport {
 export class OrbitService extends Service {
   private readonly host: DshOrbitHost
   private readonly config: OrbitPluginConfig
+  private readonly executions = new Map<string, { controller: AbortController; result: Promise<OrbitActionResult> }>()
 
   constructor(ctx: Context, config: OrbitPluginConfig) {
     super(ctx, 'orbit')
@@ -51,6 +59,7 @@ export class OrbitService extends Service {
     return new OrbitSupervisor(new OrbitStateStore(projectDir), this.host, {
       defaultRoutes: this.config.routes,
       ...(this.config.resolveRoutes ? { resolveRoutes: this.config.resolveRoutes } : {}),
+      ...(this.config.resolveOwnerSessionId ? { resolveOwnerSessionId: this.config.resolveOwnerSessionId } : {}),
       browserTools: this.config.browserTools,
       commanderReadOnlyTools: this.config.commanderReadOnlyTools,
       watchdogTools: this.config.watchdogTools,
@@ -60,23 +69,62 @@ export class OrbitService extends Service {
   }
 
   private resolveProjectDir(projectDir?: string): string {
-    return projectDir ?? this.config.projectDir ?? process.cwd()
+    return resolve(projectDir ?? this.config.projectDir ?? process.cwd())
   }
 
   run(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal): Promise<OrbitActionResult> {
-    return this.supervisorFor(this.resolveProjectDir(projectDir)).bootstrap(input, signal)
+    const dir = this.resolveProjectDir(projectDir)
+    return this.execute(dir, signal, (activeSignal) => this.supervisorFor(dir).bootstrap(input, activeSignal))
+  }
+
+  private async execute(dir: string, signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<OrbitActionResult>): Promise<OrbitActionResult> {
+    if (this.executions.has(dir)) return { ok: false, action: 'run', message: 'ORBIT_MUTATION_DRIVER_CONFLICT: 此 workspace 已有 Orbit 执行中的调用。' }
+    const controller = new AbortController()
+    const abort = (): void => controller.abort()
+    if (signal?.aborted) controller.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    const result = Promise.resolve().then(() => operation(controller.signal))
+    this.executions.set(dir, { controller, result })
+    try {
+      const settled = await result
+      if (settled.phase === 'SUCCESS' || settled.phase === 'STOPPED' || settled.phase === 'BUDGET_EXHAUSTED' || settled.message === 'ORBIT_ABORTED') {
+        await this.host.revokeWorkspace(dir)
+      }
+      return settled
+    } catch (error) {
+      await this.host.revokeWorkspace(dir)
+      throw error
+    } finally {
+      signal?.removeEventListener('abort', abort)
+      this.executions.delete(dir)
+    }
   }
 
   async resume(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal): Promise<OrbitActionResult> {
     const dir = this.resolveProjectDir(projectDir)
     const state = new OrbitStateStore(dir).readState()
-    if (!state) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: no durable run to resume.' }
+    if (!state) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: 没有可继续的持久化 Run。' }
     const supervisor = this.supervisorFor(dir)
-    return supervisor.run(state, signal)
+    if (input.run_id && input.run_id !== state.run_id) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: Run id 不匹配。' }
+    if (state.phase === 'NEEDS_USER') {
+      if (state.owner_session_id !== undefined) return this.run(input, dir, signal)
+      // Explicit resume is the only ownerless compatibility path; it never
+      // adopts the caller or stores its message as a user reply.
+      state.phase = state.plan.steps.length === 0 ? 'PLAN' : 'EXECUTE'
+      state.status = 'running'
+    }
+    return this.execute(dir, signal, (activeSignal) => supervisor.run(state, activeSignal))
   }
 
-  stop(runId?: string, projectDir?: string): OrbitActionResult {
-    return this.supervisorFor(this.resolveProjectDir(projectDir)).stop('stop', runId)
+  async stop(runId?: string, projectDir?: string): Promise<OrbitActionResult> {
+    const dir = this.resolveProjectDir(projectDir)
+    const state = new OrbitStateStore(dir).readState()
+    if (runId && state?.run_id !== runId) return { ok: false, action: 'stop', message: 'ORBIT_RUN_NOT_FOUND: Run id 不匹配。' }
+    const active = this.executions.get(dir)
+    active?.controller.abort()
+    if (active) await active.result.catch(() => undefined)
+    await this.host.revokeWorkspace(dir)
+    return this.supervisorFor(dir).stop('stop', runId)
   }
 
   status(projectDir?: string): Promise<OrbitActionResult> {
@@ -92,6 +140,14 @@ export class OrbitService extends Service {
     return state !== null && state.driver_ownership !== 'CLOSED'
   }
 
+  isMutationAuthorized(agent: unknown, tool: string, projectDir?: string): boolean {
+    return this.host.isMutationAuthorized(agent, this.resolveProjectDir(projectDir), tool)
+  }
+
+  browserToolNames(): readonly string[] {
+    return this.config.browserTools
+  }
+
   githubAllowed(projectDir?: string): boolean {
     const state = new OrbitStateStore(this.resolveProjectDir(projectDir)).readState()
     return state?.github_allowed === true
@@ -101,9 +157,8 @@ export class OrbitService extends Service {
     const dir = this.resolveProjectDir(projectDir)
     const checks: OrbitDoctorReport['checks'] = []
     try {
-      mkdirSync(`${dir}/.cx`, { recursive: true, mode: 0o700 })
-      accessSync(`${dir}/.cx`, constants.W_OK)
-      checks.push({ name: 'state-storage', status: 'pass', detail: `${dir}/.cx is writable` })
+      accessSync(existsSync(`${dir}/.cx`) ? `${dir}/.cx` : dir, constants.W_OK)
+      checks.push({ name: 'state-storage', status: 'pass', detail: '状态存储目录可写' })
     } catch (error) {
       checks.push({ name: 'state-storage', status: 'fail', detail: String(error) })
     }
@@ -136,11 +191,16 @@ export class OrbitService extends Service {
       status: 'pass',
       detail: 'DshOrbitHost provides cancel/dispose/runtimeSnapshot for every role handle',
     })
-    checks.push({
-      name: 'role-routes',
-      status: this.config.routes.commander.model && this.config.routes.executor.model ? 'pass' : 'fail',
-      detail: `commander=${this.config.routes.commander.model} executor=${this.config.routes.executor.model} watchdog=${this.config.routes.watchdog.model}`,
-    })
+    const reflect = this.ctx.reflect
+    checks.push({ name: 'model-registry', status: reflect.get('llm') ? 'pass' : 'fail', detail: '使用 DSH 当前 LLM registry 校验模型，不内置角色模型。' })
+    checks.push({ name: 'orbit-settings', status: reflect.get('settings') ? 'pass' : 'warn', detail: 'Commander / Watchdog 使用用户 Orbit 设置或显式 profile routes。' })
+    try {
+      const routes = this.config.resolveRoutes?.()
+      const issues = routes ? await this.host.validateRoutes(routes) : ['未配置模型解析来源']
+      checks.push({ name: 'role-model-configuration', status: issues.length ? 'warn' : 'pass', detail: issues.join('；') || '三角色用户模型配置可用。' })
+    } catch (error) {
+      checks.push({ name: 'role-model-configuration', status: 'warn', detail: String(error) })
+    }
     checks.push({ name: 'tested-dsh-version', status: 'pass', detail: 'tested against @deepseek-ai/dsh 0.1.5-rc.2' })
     const status = checks.some((check) => check.status === 'fail') ? 'fail' : checks.some((check) => check.status === 'warn') ? 'warn' : 'pass'
     return { status, generatedAt: new Date().toISOString(), checks }

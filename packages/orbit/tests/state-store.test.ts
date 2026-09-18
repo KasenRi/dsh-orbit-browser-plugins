@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OrbitStateStore, driverOwnershipFor } from '../src/state-store.ts'
@@ -9,9 +9,9 @@ import { FakeHost } from './helpers/fake-host.ts'
 
 const config: OrbitSupervisorConfig = {
   defaultRoutes: {
-    commander: { provider: 'deepseek-official', model: 'm' },
-    executor: { provider: 'deepseek-official', model: 'm' },
-    watchdog: { provider: 'deepseek-official', model: 'm' },
+    commander: { provider: 'provider-a', model: 'm' },
+    executor: { provider: 'provider-a', model: 'm' },
+    watchdog: { provider: 'provider-a', model: 'm' },
   },
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read'],
@@ -87,5 +87,16 @@ test('active run with a different goal is rejected', async () => {
   const conflict = await supervisor.bootstrap({ goal: 'second', approved_loop_count: 3 })
   assert.equal(conflict.ok, false)
   assert.match(String(conflict.message), /ORBIT_ACTIVE_RUN_EXISTS/)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('invalid and future state are never treated as an empty run', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-invalid-state-'))
+  const store = new OrbitStateStore(dir)
+  mkdirSync(join(dir, '.cx'), { recursive: true })
+  writeFileSync(store.statePath, '{broken')
+  assert.throws(() => store.readState(), /ORBIT_STATE_INVALID/)
+  writeFileSync(store.statePath, JSON.stringify({ schema_version: 999 }))
+  assert.throws(() => store.readState(), /ORBIT_STATE_SCHEMA_UNSUPPORTED/)
   rmSync(dir, { recursive: true, force: true })
 })

@@ -142,6 +142,8 @@ describe('Orbit client plugin wiring', () => {
 
     await face.selectModel({ provider: 'p', model: 'v4-flash', reasoningEffort: 'low' })
     expect(select).toHaveBeenCalledWith({ provider: 'p', model: 'v4-flash', reasoningEffort: 'low' })
+    await Promise.resolve()
+    await Promise.resolve()
 
     const route: OrbitRouteValue = { provider: 'p', model: 'v4-pro', reasoningEffort: 'high' }
     await expect(face.writeRole('commander', route)).resolves.toBe(true)
@@ -164,6 +166,8 @@ describe('Orbit client plugin wiring', () => {
     })
     apply(refused.context as never)
     const face = refused.registrations[0]!.inject!('session-1')
+    await Promise.resolve()
+    await Promise.resolve()
     await expect(face.writeRole('watchdog', { provider: 'p', model: 'm' })).resolves.toBe(false)
     // The refused write re-reads the server value rather than faking success.
     expect(refused.describe).toHaveBeenCalled()

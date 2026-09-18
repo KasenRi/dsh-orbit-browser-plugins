@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
-import { buildEvidenceBundle, formatEvidenceBundle, type OrbitEvidenceBundle } from './evidence.ts'
+import { buildEvidenceBundle, buildStepResult, formatStepResults, formatEvidenceBundle, type OrbitEvidenceBundle } from './evidence.ts'
 import {
   assertCommanderDecision,
   assertStrategyDecision,
@@ -48,9 +48,12 @@ import {
   restoreEvaluationState,
   resumeFromNeedsUser,
   stopRun,
+  upsertStepResult,
+  normalizeCapabilities,
 } from './kernel.ts'
 import { truncateSafe } from './sanitize.ts'
 import { OrbitStateStore } from './state-store.ts'
+import { executorToolsFor, EXECUTOR_READ_ONLY_TOOLS, READ_ONLY_ROLE_TOOLS } from './capabilities.ts'
 import {
   COMMANDER_EXTENSION_MS,
   COMMANDER_HARD_CEILING_MS,
@@ -78,15 +81,23 @@ import {
   type TimeoutDecision,
   type WatchdogDecision,
 } from './types.ts'
+import { resolveEffectiveRoutes, type OrbitConfiguredRoutes } from './routes.ts'
 
 export interface OrbitSupervisorConfig {
-  defaultRoutes: OrbitState['routes']
+  defaultRoutes?: OrbitConfiguredRoutes
   /**
    * Resolve the role routes for a NEW run (settings + session selection).
-   * Absent or unused falls back to `defaultRoutes`; an existing run always
+   * Explicit profile routes are the headless fallback; an existing run always
    * resumes from its frozen `state.routes` and never calls this.
    */
   resolveRoutes?: () => OrbitState['routes']
+  /**
+   * Resolve the DSH Session driving the current operation. A NEW run records
+   * it as `owner_session_id`; a NEEDS_USER continuation is only accepted when
+   * the same Session asks again. Compositions without this seam cannot prove
+   * ownership, so a waiting run is never resumed automatically.
+   */
+  resolveOwnerSessionId?: () => string | undefined
   browserTools: readonly string[]
   commanderReadOnlyTools: readonly string[]
   watchdogTools: readonly string[]
@@ -136,8 +147,8 @@ interface AuxRoleRequest {
 }
 
 const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string) => `你是 Orbit 指挥官（Commander），当前阶段：PLAN。
-请为下述目标制定最小化的 2-5 个逻辑工程步骤。
-规则：普通工程步骤不要声明 capabilities；仅当该步骤必须驱动真实网页时才添加 capability "browser"，仅当必须分析抓取到的网络/API 流量时才添加 "web-api-recon"。保持最小化。
+ 请为下述目标制定最小化的 1-5 个逻辑工程步骤。
+规则：基础读取不声明 capabilities；修改文件使用 "filesystem"，执行命令使用 "shell"，访问网页/API 使用 "web"，驱动真实浏览器使用 "browser"。只选择当前步骤真正需要的能力，可组合，保持最小化。
 请通过结构化结果协议提交最终计划。
 你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、capability id、代码、命令、路径、provider/model ID 等机器标识保持原样。
 目标：${goal}
@@ -253,40 +264,96 @@ export class OrbitSupervisor {
   }
 
   createState(input: OrbitRunInput): OrbitState {
+    const ownerSessionId = this.config.resolveOwnerSessionId?.()
     return createInitialState({
       runId: typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID(),
       now: this.now(),
       goal: (input.goal ?? '').trim(),
       ...(input.preset !== undefined ? { preset: input.preset } : {}),
-      routes: this.config.resolveRoutes?.() ?? this.config.defaultRoutes,
+      routes: this.resolveNewRoutes(),
       ...(input.approved_loop_count !== undefined ? { approvedLoopCount: input.approved_loop_count } : {}),
       ...(input.max_loops !== undefined ? { maxLoops: input.max_loops } : {}),
       ...(input.user_hard_constraints ? { userHardConstraints: input.user_hard_constraints } : {}),
       githubAllowed: input.github_allowed === true,
+      ...(ownerSessionId === undefined ? {} : { ownerSessionId }),
     })
   }
 
+  private resolveNewRoutes(): OrbitState['routes'] {
+    if (this.config.resolveRoutes) return this.config.resolveRoutes()
+    return resolveEffectiveRoutes({ configRoutes: this.config.defaultRoutes })
+  }
+
+  private async preflightRoutes(routes: OrbitState['routes'], signal?: AbortSignal): Promise<string | undefined> {
+    const issues = await this.host.validateRoutes(routes, signal)
+    return issues.length === 0 ? undefined : `ORBIT_ROLE_MODEL_UNAVAILABLE: ${issues.join('；')}。请重新选择可用模型。`
+  }
+
   async bootstrap(input: OrbitRunInput, signal?: AbortSignal): Promise<OrbitActionResult> {
+    if (signal?.aborted) return { ok: false, action: 'run', message: 'ORBIT_ABORTED' }
+    const competitors = await this.host.otherMutationDrivers(join(this.store.stateDir, '..'))
+    if (competitors.length > 0) return {
+      ok: false, action: 'run', message: `ORBIT_MUTATION_DRIVER_CONFLICT: ${competitors.join(', ')} 已持有此 workspace 的修改权。`,
+    }
     const requestedGoal = (input.goal ?? '').trim()
     let state = this.store.readState()
     const raw = this.store.readRawState()
     const legacy = raw !== null && raw['schema_version'] !== 2
 
     if (legacy && requestedGoal) {
-      state = this.store.writeState(this.createState(input))
+      let created: OrbitState
+      try { created = this.createState(input) } catch (error) {
+        return { ok: false, action: 'run', message: error instanceof Error ? error.message : String(error) }
+      }
+      const invalid = await this.preflightRoutes(created.routes, signal)
+      if (invalid) return { ok: false, action: 'run', message: invalid }
+      state = this.store.writeState(created)
     } else if (!state) {
-      if (!requestedGoal) return { ok: false, action: 'run', message: 'ORBIT_GOAL_REQUIRED: provide a goal to start a run.' }
-      state = this.store.writeState(this.createState(input))
+      if (!requestedGoal) return { ok: false, action: 'run', message: 'ORBIT_GOAL_REQUIRED: 请提供要执行的目标。' }
+      let created: OrbitState
+      try { created = this.createState(input) } catch (error) {
+        return { ok: false, action: 'run', message: error instanceof Error ? error.message : String(error) }
+      }
+      const invalid = await this.preflightRoutes(created.routes, signal)
+      if (invalid) return { ok: false, action: 'run', message: invalid }
+      state = this.store.writeState(created)
     } else if (input.run_id && input.run_id !== state.run_id && !legacy) {
       return { ok: false, action: 'run', message: `ORBIT_RUN_NOT_FOUND: ${input.run_id}` }
     }
 
     if (['SUCCESS', 'STOPPED', 'BUDGET_EXHAUSTED'].includes(state.phase) && requestedGoal) {
-      state = this.store.writeState(this.createState(input))
+      let created: OrbitState
+      try { created = this.createState(input) } catch (error) {
+        return { ok: false, action: 'run', message: error instanceof Error ? error.message : String(error) }
+      }
+      const invalid = await this.preflightRoutes(created.routes, signal)
+      if (invalid) return { ok: false, action: 'run', message: invalid }
+      state = this.store.writeState(created)
     }
     if (state.phase === 'NEEDS_USER' && requestedGoal) {
       // A reply to the Commander's question is not a new goal: keep the run,
-      // its original goal and its frozen routes, and carry the reply durably.
+      // its original goal and its frozen routes, and carry the reply durably —
+      // but only from the Session that owns the run. Another Session's message
+      // must never be consumed as this run's reply.
+      const owner = state.owner_session_id
+      const incoming = this.config.resolveOwnerSessionId?.()
+      if (owner === undefined) {
+        return {
+          ok: false, action: 'run', run_id: state.run_id, phase: state.phase,
+          message: `ORBIT_NEEDS_USER_OWNER_UNKNOWN: 这是升级前遗留 Run ${state.run_id}，无法安全判断所属 Session。请显式 resume，或 stop 后重新开始。`,
+        }
+      }
+      if (incoming === undefined || incoming !== owner) {
+        return {
+          ok: false,
+          action: 'run',
+          run_id: state.run_id,
+          phase: state.phase,
+          message:
+            `ORBIT_NEEDS_USER_OTHER_SESSION: Run ${state.run_id}（goal: ${truncateSafe(state.goal, 120)}）仍在等待所属 Session 的用户回复；` +
+            '当前消息未被当作回复。请在原 Session 回复，或显式 stop/resume。',
+        }
+      }
       resumeFromNeedsUser(state, requestedGoal)
       this.store.writeState(state)
     } else if (!legacy && requestedGoal && state.goal && state.goal !== requestedGoal) {
@@ -294,13 +361,13 @@ export class OrbitSupervisor {
         ok: false,
         action: 'run',
         run_id: state.run_id,
-        message: 'ORBIT_ACTIVE_RUN_EXISTS: current Lite run owns this project; resume it or stop it before starting a different goal.',
+        message: 'ORBIT_ACTIVE_RUN_EXISTS: 当前项目已有活动中的 Orbit Run，请先继续或停止该 Run。',
       }
     }
     return this.run(state, signal)
   }
 
-  async run(state: OrbitState, signal?: AbortSignal): Promise<OrbitActionResult> {
+  async run(state: OrbitState, signal?: AbortSignal, preflight = true): Promise<OrbitActionResult> {
     if (signal?.aborted) return this.result(state, false, 'ORBIT_ABORTED')
     const projectDir = join(this.store.stateDir, '..')
     const competitors = await this.host.otherMutationDrivers(projectDir)
@@ -311,7 +378,7 @@ export class OrbitSupervisor {
         run_id: state.run_id,
         phase: state.phase,
         status: state.status,
-        message: `ORBIT_MUTATION_DRIVER_CONFLICT: ${competitors.join(', ')} already owns mutation in this workspace.`,
+        message: `ORBIT_MUTATION_DRIVER_CONFLICT: ${competitors.join(', ')} 已持有此 workspace 的修改权。`,
       }
     }
 
@@ -319,6 +386,11 @@ export class OrbitSupervisor {
     if (state.phase === 'SUCCESS') return this.result(state, true)
     if (state.phase === 'STOPPED') return this.result(state, true)
     if (state.phase === 'BUDGET_EXHAUSTED') return this.result(state, true)
+
+    if (preflight) {
+      const routeIssue = await this.preflightRoutes(state.routes, signal)
+      if (routeIssue) return this.result(state, false, routeIssue)
+    }
 
     if (state.plan.steps.length === 0 && state.phase === 'PLAN') {
       const planOutcome = await this.makePlan(state, signal)
@@ -335,7 +407,7 @@ export class OrbitSupervisor {
       const outcome = await this.commanderEvaluate(state, step, false, signal)
       const applied = await this.applyCommanderOutcome(state, outcome, step, false, signal)
       if (applied) return applied
-      return this.run(state, signal)
+      return this.run(state, signal, false)
     }
 
     const step =
@@ -346,7 +418,7 @@ export class OrbitSupervisor {
       const outcome = await this.commanderEvaluate(state, undefined, true, signal)
       const applied = await this.applyCommanderOutcome(state, outcome, undefined, true, signal)
       if (applied) return applied
-      return this.run(state, signal)
+      return this.run(state, signal, false)
     }
 
     if (state.loop.used >= state.loop.max) {
@@ -360,7 +432,7 @@ export class OrbitSupervisor {
 
     const executed = await this.executeStep(state, step, signal)
     if (executed.done) return this.result(state, executed.ok, executed.message)
-    return this.run(state, signal)
+    return this.run(state, signal, false)
   }
 
   // ── tool scoping ───────────────────────────────────────────────────────────
@@ -372,7 +444,7 @@ export class OrbitSupervisor {
   private toolAllow(names: readonly string[], label: string): RoleToolFilter {
     const allowed = names.filter((name) => this.host.hasTool(name))
     if (allowed.length === 0) {
-      throw new Error(`ORBIT_TOOL_FILTER_EMPTY: none of [${names.join(', ')}] are registered for ${label}`)
+      throw new Error(`ORBIT_TOOL_FILTER_EMPTY: ${label} 没有任何已注册的允许工具：[${names.join(', ')}]`)
     }
     return { allow: allowed }
   }
@@ -414,7 +486,7 @@ export class OrbitSupervisor {
   ): Promise<CommanderOutcome> {
     const mode: EvaluationMode = final ? 'FINAL_EVALUATE' : 'STEP_EVALUATE'
     const evidence =
-      this.evidenceFor(state, step) ?? state.commander?.summary ?? state.last_error ?? 'no evidence recorded'
+      this.evidenceFor(state, step, final) ?? state.commander?.summary ?? state.last_error ?? '未记录执行证据'
     const prompt = final
       ? COMMANDER_FINAL_PROMPT(state.goal, state.plan, evidence, state)
       : COMMANDER_STEP_PROMPT(state.goal, step as OrbitPlanStep, evidence, state)
@@ -441,10 +513,11 @@ export class OrbitSupervisor {
    * qualifies; after a cold resume the bundle is gone and the caller falls back
    * to the durable state summary.
    */
-  private evidenceFor(state: OrbitState, step: OrbitPlanStep | undefined): string | undefined {
+  private evidenceFor(state: OrbitState, step: OrbitPlanStep | undefined, final = false): string | undefined {
+    if (final) return formatStepResults(state)
     const stepId = step?.id ?? state.current_step?.id
-    if (!this.stepEvidence || this.stepEvidence.stepId !== stepId) return undefined
-    return formatEvidenceBundle(this.stepEvidence.bundle)
+    if (this.stepEvidence && this.stepEvidence.stepId === stepId) return formatEvidenceBundle(this.stepEvidence.bundle)
+    return state.step_results?.find((entry) => entry.step_id === stepId)?.evidence
   }
 
   /**
@@ -468,7 +541,8 @@ export class OrbitSupervisor {
         label: `commander-${mode.toLowerCase()}`,
         prompt,
         route: state.routes.commander,
-        toolFilter: this.toolAllow(this.config.commanderReadOnlyTools, `commander ${mode}`),
+        workspace: join(this.store.stateDir, '..'),
+        toolFilter: this.toolAllow(this.config.commanderReadOnlyTools.filter((name) => (READ_ONLY_ROLE_TOOLS as readonly string[]).includes(name)), `commander ${mode}`),
         outputSchema,
         ...(signal ? { signal } : {}),
       })
@@ -533,12 +607,12 @@ export class OrbitSupervisor {
       ...(signal ? { signal } : {}),
     })
     if (!result || result.interrupted) {
-      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog unavailable' }
+      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: '监控模型暂时不可用' }
     }
     try {
       return assertTimeoutDecision(result.structured as TimeoutDecision)
     } catch {
-      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: 'Smart Watchdog invalid output' }
+      return { decision: extensions === 0 ? 'EXTEND' : 'INTERRUPT', reason: '监控模型返回了无效结果' }
     }
   }
 
@@ -549,17 +623,19 @@ export class OrbitSupervisor {
     step: OrbitPlanStep,
     signal?: AbortSignal,
   ): Promise<{ done: boolean; ok: boolean; message?: string }> {
-    const capabilities = step.capabilities ?? []
-    if (capabilities.includes('browser') && !this.host.hasTool(this.config.browserTools[0] ?? 'agent_browser')) {
+    const capabilities = normalizeCapabilities(step.capabilities) ?? []
+    if (capabilities.includes('browser') && !this.config.browserTools.some((tool) => this.host.hasTool(tool))) {
       applyExecutorCapabilityUnavailable(state, step.id)
+      upsertStepResult(state, buildStepResult(step.id, state.current_step?.attempt ?? 1, buildEvidenceBundle({
+        executorOutput: state.commander?.summary,
+      })))
       this.store.writeState(state)
       return { done: false, ok: false }
     }
 
     let toolFilter: RoleToolFilter
     try {
-      const capabilityTools = capabilities.includes('browser') ? [...this.config.browserTools] : []
-      toolFilter = this.toolAllow([...this.config.executorTools, ...capabilityTools], `executor ${step.id}`)
+      toolFilter = this.toolAllow(executorToolsFor(capabilities, this.config.browserTools, this.config.executorTools), `executor ${step.id}`)
     } catch (error) {
       const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
       enterNeedsUser(state, reason)
@@ -574,6 +650,7 @@ export class OrbitSupervisor {
         label: `executor-${step.id}`,
         prompt: this.executorPrompt(state, step),
         route: state.routes.executor,
+        workspace: join(this.store.stateDir, '..'),
         toolFilter,
         capabilities,
         ...(signal ? { signal } : {}),
@@ -643,6 +720,7 @@ export class OrbitSupervisor {
         telemetry: result.telemetry,
       }),
     }
+    upsertStepResult(state, buildStepResult(step.id, state.current_step?.attempt ?? 1, this.stepEvidence.bundle, state.test_summary))
     this.store.writeState(state)
     await this.disposeHandle(handle)
     return { done: false, ok: false }
@@ -653,6 +731,7 @@ export class OrbitSupervisor {
     const timeoutMs = this.config.executorTimeoutMs ?? EXECUTOR_TIMEOUT_MS
     const raced = await this.raceWithSleep(handle.result, timeoutMs, signal)
     if (raced.kind === 'work') return raced.value
+    await this.cancelHandle(handle, raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'EXECUTOR_TIMEOUT')
     const telemetry = await handle.runtimeSnapshot?.()
     return {
       ...(handle.childId ? { childId: handle.childId } : {}),
@@ -675,7 +754,7 @@ export class OrbitSupervisor {
       `硬性约束：${state.user_hard_constraints.join('；') || '无'}`,
     ]
     if (state.pending_user_reply) lines.push(`用户回复（对上一个问题的回答）：${state.pending_user_reply}`)
-    if ((step.capabilities ?? []).length > 0) lines.push(`Capabilities: ${(step.capabilities ?? []).join(', ')}`)
+    if ((step.capabilities ?? []).length > 0) lines.push(`能力：${(step.capabilities ?? []).join(', ')}`)
     return lines.join('\n')
   }
 
@@ -724,7 +803,7 @@ export class OrbitSupervisor {
     if (decision.decision === 'APPEND') {
       const append = applyFinalAppend(state, decision)
       if (append === 'invalid') {
-        return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: append needs next_steps or next_step_goal')
+        return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: APPEND 需要 next_steps 或 next_step_goal')
       }
       this.store.writeState(state)
       if (append === 'budget_exhausted') return this.result(state, false)
@@ -748,7 +827,7 @@ export class OrbitSupervisor {
     signal?: AbortSignal,
   ): Promise<OrbitActionResult | undefined> {
     if (!step || !decision.next_step_goal) {
-      return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: correction needs next_step_goal')
+      return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: CORRECT_CURRENT_STEP 需要 next_step_goal')
     }
     const base = baseStepIdOf(step.id)
     const correctionDepth = correctionDepthOf(step.id)
@@ -798,7 +877,7 @@ export class OrbitSupervisor {
     }
     const challengeValue = challengeResult.structured as { question?: unknown }
     const challenge = typeof challengeValue.question === 'string' ? challengeValue.question.trim() : ''
-    if (!challenge) return { kind: 'interrupted', reason: 'SMART_WATCHDOG_STRATEGY_OUTPUT_INVALID: question is required' }
+    if (!challenge) return { kind: 'interrupted', reason: 'SMART_WATCHDOG_STRATEGY_OUTPUT_INVALID: 缺少 question' }
 
     const outcome = await this.runCommander(
       state,
@@ -928,7 +1007,9 @@ export class OrbitSupervisor {
    * even on interruption or timeout.
    */
   private async runAuxRole(state: OrbitState, request: AuxRoleRequest): Promise<RoleRunResult | undefined> {
-    const names = request.role === 'watchdog' ? this.config.watchdogTools : this.config.commanderReadOnlyTools
+    const configured = request.role === 'watchdog' ? this.config.watchdogTools : this.config.commanderReadOnlyTools
+    const readOnly = request.role === 'watchdog' ? EXECUTOR_READ_ONLY_TOOLS : READ_ONLY_ROLE_TOOLS
+    const names = configured.filter((name) => (readOnly as readonly string[]).includes(name))
     let handle: RoleHandle | undefined
     try {
       handle = await this.host.startRole({
@@ -936,6 +1017,7 @@ export class OrbitSupervisor {
         label: request.label,
         prompt: request.prompt,
         route: state.routes[request.role],
+        workspace: join(this.store.stateDir, '..'),
         toolFilter: this.toolAllow(names, request.role),
         ...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
         ...(request.signal ? { signal: request.signal } : {}),
@@ -1006,7 +1088,7 @@ export class OrbitSupervisor {
 
   stop(action: string, runId?: string): OrbitActionResult {
     const state = this.store.readState()
-    if (!state) return { ok: false, action, message: 'ORBIT_RUN_NOT_FOUND: no active run.' }
+    if (!state) return { ok: false, action, message: 'ORBIT_RUN_NOT_FOUND: 没有活动中的 Run。' }
     if (runId && runId !== state.run_id) return { ok: false, action, message: `ORBIT_RUN_NOT_FOUND: ${runId}` }
     stopRun(state)
     this.store.writeState(state)
@@ -1015,7 +1097,7 @@ export class OrbitSupervisor {
 
   async status(): Promise<OrbitActionResult> {
     const state = this.store.readState()
-    if (!state) return { ok: false, action: 'status', message: 'ORBIT_RUN_NOT_FOUND: no run state.' }
+    if (!state) return { ok: false, action: 'status', message: 'ORBIT_RUN_NOT_FOUND: 没有 Run 状态。' }
     return this.result(state, true)
   }
 
@@ -1036,6 +1118,7 @@ export class OrbitSupervisor {
       guard_recovery: state.guard_recovery,
       last_error: state.last_error,
       pending_user_reply: state.pending_user_reply,
+      step_results: state.step_results,
       changed_files: state.changed_files,
       test_summary: state.test_summary,
       driver_ownership: state.driver_ownership,

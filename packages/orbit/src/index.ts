@@ -5,21 +5,19 @@ import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { installOrbitGestureBoundary, registerOrbitCommand, registerOrbitToggleCommand } from './activation.ts'
-import { estimateLoopCount } from './kernel.ts'
 import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
-import { resolveEffectiveRoutes, sessionModelStateOf, sessionSelectionOf, type OrbitRouteSettings } from './routes.ts'
+import { agentDefaultSelectionOf, resolveEffectiveRoutes, sessionModelSelectionOf, sessionModelStateOf, type OrbitRouteSettings } from './routes.ts'
 import { installOrbitSessionProjection, orbitEnabledOf } from './session-state.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
-import type { OrbitActionResult, OrbitRoute, OrbitRoutes } from './types.ts'
+import type { OrbitActionResult, OrbitRoute } from './types.ts'
+import type { OrbitConfiguredRoutes } from './routes.ts'
 
 /**
- * Minimum loop budget for a hard-activated run. The Commander is asked for a
- * 2-5 step plan and every executed step consumes one loop slot, so the host
- * must grant a budget that can finish a full plan; the goal complexity
- * estimate raises it further when the goal asks for more.
+ * Fixed hard-activation budget. Explicit tool calls may still supply a bounded
+ * user-owned budget; ordinary activation never guesses complexity from words.
  */
-const HARD_ACTIVATION_MIN_LOOPS = 5
+const HARD_ACTIVATION_LOOP_BUDGET = 5
 
 export const name = 'dsh-orbit'
 export const inject = ['tools', 'agents', 'subagents']
@@ -50,17 +48,13 @@ export const Config = z.object({
       executor: Route,
       watchdog: Route,
     })
-    .default({
-      commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
-      executor: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
-      watchdog: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' },
-    }),
+    .default({} as never),
   browserTools: z.array(z.string()).default(['agent_browser']),
   commanderReadOnlyTools: z.array(z.string()).default(['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch']),
   watchdogTools: z.array(z.string()).default(['read', 'read_image', 'glob', 'grep']),
   executorTools: z
     .array(z.string())
-    .default(['read', 'read_image', 'glob', 'grep', 'bash', 'write', 'edit', 'str_replace_editor', 'web_search', 'web_fetch']),
+    .default(['read', 'read_image', 'glob', 'grep']),
   executorTimeoutMs: z.natural().default(480_000),
   registerTool: z.boolean().default(true),
   registerGuards: z.boolean().default(true),
@@ -69,7 +63,7 @@ export const Config = z.object({
 
 export interface OrbitConfigShape {
   projectDir?: string
-  routes: { commander: OrbitRoute; executor: OrbitRoute; watchdog: OrbitRoute }
+  routes: OrbitConfiguredRoutes
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
@@ -85,51 +79,50 @@ interface GoalsLike {
 }
 
 export function apply(ctx: Context, config: OrbitConfigShape): void {
-  // Orbit settings bridge: register the `orbit` namespace with the composition
-  // routes as its base/default, so a user who never opens the model UI keeps
-  // today's behavior exactly. Lazily injected: minimal/headless compositions
-  // without a settings provider keep running from `config.routes`.
-  let routeSettings: OrbitRouteSettings | undefined
+  // Orbit settings bridge. The package ships no model defaults; only explicit
+  // profile routes can act as a headless compatibility fallback.
+  let readRouteSettings: () => OrbitRouteSettings | undefined = () => undefined
   ctx.inject(['settings'], (settingsCtx) => {
-    const baseRoute = (route: OrbitRoute): { provider: string; model: string; reasoningEffort: string } => ({
-      provider: route.provider,
-      model: route.model,
-      reasoningEffort: route.reasoningEffort ?? '',
-    })
     const scope = settingsCtx.settings.register('orbit', OrbitRouteSettingsSchema, {
       base: {
-        commander: baseRoute(config.routes.commander),
-        watchdog: baseRoute(config.routes.watchdog),
+        commander: { provider: '', model: '', reasoningEffort: '' },
+        watchdog: { provider: '', model: '', reasoningEffort: '' },
       },
     })
-    const sync = (): void => {
-      routeSettings = scope.get()
-    }
-    sync()
-    scope.watch(() => {
-      sync()
-    })
+    readRouteSettings = () => scope.get()
+    settingsCtx.effect(() => () => { readRouteSettings = () => undefined })
   })
 
   // A NEW run resolves its three routes exactly once: Commander/Watchdog from
   // the Orbit settings (base = config), Executor from the initiating Session's
-  // durable `modelSelection` projection (pending → lastUsed), with the public
-  // request-header seam and the config route as compatibility fallbacks for
-  // surfaces without one. Existing runs resume from their frozen
-  // `state.routes`.
-  const resolveRoutes = (): OrbitRoutes => {
+  // current model with DSH `selectionFor(agent)` semantics (pending choice →
+  // logged header → deployment default). Explicit config routes are only for
+  // sessions without a DSH model source. Existing runs resume from frozen routes.
+  const resolveRoutes = () => {
     const agent = ctx.agents.currentInitiator()
     return resolveEffectiveRoutes({
       configRoutes: config.routes,
-      settings: routeSettings,
-      sessionModel: sessionModelStateOf(ctx, agent?.session),
-      sessionSelection: sessionSelectionOf(agent),
+      settings: readRouteSettings(),
+      hasSession: agent !== undefined,
+      sessionSelection: sessionModelSelectionOf({
+        sessionModel: sessionModelStateOf(ctx, agent?.session),
+        requestHeader: agent?.session?.requestHeader?.(),
+        agentDefault: agent === undefined ? undefined : agentDefaultSelectionOf(ctx),
+      }),
     })
+  }
+
+  // The DSH Session driving the current operation: a new run records it, and
+  // only that Session may answer the run's NEEDS_USER question.
+  const resolveOwnerSessionId = (): string | undefined => {
+    const agent = ctx.agents.currentInitiator()
+    return agent === undefined ? undefined : String(agent.session.id)
   }
 
   const serviceConfig: OrbitPluginConfig = {
     routes: config.routes,
     resolveRoutes,
+    resolveOwnerSessionId,
     browserTools: config.browserTools,
     commanderReadOnlyTools: config.commanderReadOnlyTools,
     watchdogTools: config.watchdogTools,
@@ -171,7 +164,7 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
         // the parent model is never asked to decide or to run the task.
         result = await ctx.agents.withInitiator(agent, () => service.run({
           goal,
-          approved_loop_count: Math.max(estimateLoopCount(goal), HARD_ACTIVATION_MIN_LOOPS),
+          approved_loop_count: HARD_ACTIVATION_LOOP_BUDGET,
         }, cwd, signal))
       } catch (error) {
         appendOrbitNotice(agent.session, `Orbit 启动失败：${error instanceof Error ? error.message : String(error)}`)
@@ -189,8 +182,9 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
     installOrbitSessionProjection(projectionCtx)
   })
 
-  if (config.registerGuards) {
+  {
     const handler = createOrbitPreExecuteHandler(service, {
+      contentGuards: config.registerGuards,
       competingDriver: (agent) => {
         const reflect = (ctx as unknown as { reflect?: { get(name: string, strict?: boolean): unknown } }).reflect
         const goals = reflect?.get('goals') as GoalsLike | undefined
@@ -235,6 +229,11 @@ function activationNotice(result: OrbitActionResult): string | undefined {
   if (result.ok && result.phase !== 'NEEDS_USER') return undefined
   const lastError = result.data?.['last_error']
   const reason = result.message ?? (typeof lastError === 'string' && lastError !== '' ? lastError : undefined)
+  if (result.message?.startsWith('ORBIT_NEEDS_USER_OTHER_SESSION') === true || result.message?.startsWith('ORBIT_NEEDS_USER_OWNER_UNKNOWN') === true) {
+    // Another Session owns the waiting run: report instead of consuming the
+    // message as its reply.
+    return result.message
+  }
   if (result.phase === 'NEEDS_USER') {
     return reason !== undefined && !reason.startsWith('COMMANDER_')
       ? `Orbit 需要你的回复：${reason}`

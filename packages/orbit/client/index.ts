@@ -92,6 +92,7 @@ export function apply(ctx: Context): void {
 
   const writeRole = async (role: 'commander' | 'watchdog', route: OrbitRouteValue): Promise<boolean> => {
     const snapshot = settings.getSnapshot()
+    if (snapshot.status !== 'ready' || snapshot.revision === undefined) return false
     try {
       const response = await ctx.remote.settings.update(
         ORBIT_SETTINGS_NS,

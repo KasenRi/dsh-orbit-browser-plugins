@@ -17,7 +17,7 @@ export type OrbitDriverOwnership = 'ACTIVE' | 'PAUSED' | 'AWAITING_USER' | 'CLOS
 
 export type OrbitRole = 'commander' | 'executor' | 'watchdog'
 
-export type OrbitCapability = 'browser' | 'web-api-recon'
+export type OrbitCapability = 'filesystem' | 'shell' | 'web' | 'browser'
 
 export type OrbitStepStatus = 'pending' | 'running' | 'passed' | 'needs_correction' | 'skipped'
 
@@ -41,13 +41,22 @@ export interface OrbitRoute {
   provider: string
   model: string
   reasoningEffort?: string
-  maxTokens?: number
 }
 
 export interface OrbitRoutes {
   commander: OrbitRoute
   executor: OrbitRoute
   watchdog: OrbitRoute
+}
+
+/** Bounded execution evidence retained for one logical plan step. */
+export interface OrbitStepResult {
+  step_id: string
+  attempt: number
+  summary: string
+  changed_files: string[]
+  test_summary: string[]
+  evidence: string
 }
 
 export interface OrbitState extends Record<string, unknown> {
@@ -68,6 +77,7 @@ export interface OrbitState extends Record<string, unknown> {
   remaining_budget: number
   loop_count: number
   plan: { summary: string; steps: OrbitPlanStep[] }
+  step_results?: OrbitStepResult[]
   current_step?: { id: string; attempt: number }
   child?: { id?: string; status: 'running' | 'completed' | 'interrupted' | 'unknown' }
   commander?: { last_decision?: string; summary?: string; remaining_gap?: string }
@@ -80,6 +90,12 @@ export interface OrbitState extends Record<string, unknown> {
    * read while the run continues. Absent on runs created before the field.
    */
   pending_user_reply?: string | null
+  /**
+   * DSH Session that created this run. A NEEDS_USER continuation is only
+   * accepted from this exact Session; another Session's message is never
+   * treated as the run's reply. Absent on runs created before the field.
+   */
+  owner_session_id?: string
   user_hard_constraints: string[]
   github_allowed: boolean
   smart_watchdog?: { step_id?: string; calls: number; last_decision?: string; last_reason?: string }
@@ -169,14 +185,15 @@ export const MAX_WATCHDOG_CALLS_PER_STEP = 2
 export const MAX_EXECUTOR_INTERRUPT_RETRIES = 2
 export const MAX_PLAN_STEPS = 5
 export const MIN_PLAN_STEPS = 1
+export const DEFAULT_LOOP_BUDGET = 5
 
 export const GUARD_FIRST_INSTRUCTION =
-  'Use a safer method and continue the current task. Do not retry the same blocked operation unchanged.'
+  '请改用更安全的方法继续当前任务，不要原样重试刚被阻断的操作。'
 export const GUARD_REPEAT_INSTRUCTION =
-  'The same blocked operation was attempted again. Stop repeating it and choose a different safe approach.'
+  '同一操作再次被阻断。请停止重复，并选择不同的安全方案。'
 export const GUARD_RETRY_INSTRUCTION =
-  'The previous approach repeatedly hit Orbit safety guards. Use a different safe approach. Do not retry the blocked operation.'
+  '之前的方案反复触发 Orbit 安全护栏。请改用不同的安全方案，不要重试被阻断的操作。'
 export const GUARD_NEEDS_USER_INSTRUCTION =
-  'This restricted action appears necessary for the user goal. Orbit has paused for user guidance.'
+  '受限操作可能是完成目标所必需的。Orbit 已暂停并等待用户指引。'
 
-export const DEFAULT_CAPABILITIES: readonly OrbitCapability[] = ['browser', 'web-api-recon']
+export const DEFAULT_CAPABILITIES: readonly OrbitCapability[] = ['filesystem', 'shell', 'web', 'browser']

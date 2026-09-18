@@ -78,22 +78,6 @@ export function modelOf(state: ModelDirectoryState, route: OrbitRouteValue | und
   return undefined
 }
 
-/**
- * UI-only fallback ladder for models whose catalog entry declares no reasoning
- * metadata. The DSH catalog is never modified: this only fills the Orbit
- * picker, and a provider that rejects an effort still fails through the normal
- * selection error path.
- */
-export const FALLBACK_REASONING_EFFORTS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max']
-
-const FALLBACK_EFFORT_LABELS: Record<string, string> = {
-  low: 'Low',
-  medium: 'Medium',
-  high: 'High',
-  xhigh: 'XHigh',
-  max: 'Max',
-}
-
 /** One effort option as the Orbit picker shows it. */
 export interface OrbitEffortOption {
   id: string
@@ -101,13 +85,13 @@ export interface OrbitEffortOption {
 }
 
 /**
- * Effort options for one model: the adapter's explicit list when the catalog
- * declares one, otherwise the Orbit UI fallback ladder.
+ * Effort options for one model: exactly the DSH model metadata's explicit
+ * `reasoning.efforts`. A model without reasoning metadata yields none; the
+ * picker then offers only Provider default.
  */
 export function effortsOf(model: ModelEntry | undefined): OrbitEffortOption[] {
   const explicit = model?.reasoning?.efforts ?? []
-  if (explicit.length > 0) return explicit.map((effort) => ({ id: effort.id, name: effort.name }))
-  return FALLBACK_REASONING_EFFORTS.map((id) => ({ id, name: FALLBACK_EFFORT_LABELS[id] ?? id }))
+  return explicit.map((effort) => ({ id: effort.id, name: effort.name }))
 }
 
 /** Human effort label for a stored effort id; falls back to the raw id. */
@@ -115,7 +99,7 @@ export function effortLabelOf(model: ModelEntry | undefined, effort: string | un
   if (effort === undefined || effort === '') return undefined
   const explicit = model?.reasoning?.efforts.find((entry) => entry.id === effort)
   if (explicit !== undefined) return explicit.name
-  return FALLBACK_EFFORT_LABELS[effort] ?? effort
+  return effort
 }
 
 /** Display name for a stored route: catalog name, then its model id. */
@@ -125,28 +109,25 @@ export function routeLabelOf(state: ModelDirectoryState, route: OrbitRouteValue 
 }
 
 /**
- * Route for a freshly picked model: the model's own default effort. A model
- * without effort metadata yields no effort — a previous model's effort is
- * never inherited.
+ * Route for a freshly picked model: no reasoning effort is adopted, not even
+ * the catalog metadata's `defaultEffort`. Provider default means the absent
+ * effort, and a previous model's effort is never inherited.
  */
 export function routeForModel(provider: string, model: ModelEntry): OrbitRouteValue {
-  const defaultEffort = model.reasoning?.defaultEffort
   return {
     provider,
     model: model.id,
-    ...(defaultEffort === undefined ? {} : { reasoningEffort: defaultEffort }),
   }
 }
 
 /**
- * Selection for the shared Session directory: preserve the current effort
- * when the route did not change, otherwise use the picked model's default.
+ * Selection for the shared Session directory: re-selecting the same model
+ * keeps its current effort; any model change drops the effort (Provider
+ * default) instead of adopting `defaultEffort` or the previous model's effort.
  */
 export function selectionForModel(state: ModelDirectoryState, provider: string, model: ModelEntry): ModelSelection {
   const sameRoute = state.current?.provider === provider && state.current.model === model.id
-  const effort = sameRoute
-    ? state.current?.reasoningEffort ?? model.reasoning?.defaultEffort
-    : model.reasoning?.defaultEffort
+  const effort = sameRoute ? state.current?.reasoningEffort : undefined
   return {
     provider,
     model: model.id,
@@ -162,7 +143,7 @@ export interface OrbitEffortChoice {
 
 /**
  * Effort rows for one model: Provider default (an undefined effort) first,
- * then the model's explicit ladder or the Orbit UI fallback.
+ * then the model's explicit metadata efforts, if any.
  */
 export function effortChoicesOf(model: ModelEntry | undefined, providerDefaultLabel: string): OrbitEffortChoice[] {
   return [

@@ -1,17 +1,8 @@
-/**
- * Effective route resolution for a new Orbit run.
- *
- * Orbit stores only Commander and Watchdog itself (`orbit` settings namespace,
- * falling back to the composition `config.routes`). The Executor follows the
- * initiating Session's current model selection, read from the durable
- * `modelSelection` projection (the user's pending choice first, then the model
- * that actually served the last request) with the request-header seam and
- * `config.routes.executor` as compatibility fallbacks (headless, CLI, minimal
- * profiles, tests). Resolution happens exactly once per new run and is frozen
- * into `state.routes`.
- */
+/** Effective route resolution for a new Orbit run. */
 
-import type { OrbitRoute, OrbitRoutes } from './types.ts'
+import type { OrbitRoute, OrbitRole, OrbitRoutes } from './types.ts'
+
+export type OrbitConfiguredRoutes = Partial<Record<OrbitRole, OrbitRoute>>
 
 /** The `orbit` settings section: the two roles Orbit stores itself. */
 export interface OrbitRouteSettings {
@@ -26,109 +17,123 @@ export interface ModelSelectionLike {
   reasoningEffort?: unknown
 }
 
-/**
- * Host-side `modelSelection` projection state: the user's pending choice and
- * the selection the last model request actually used.
- */
 export interface SessionModelStateLike {
   lastUsed?: ModelSelectionLike | null
   pending?: ModelSelectionLike | null
+}
+
+export interface SessionHeaderLike {
+  config?: ModelSelectionLike | undefined
+  adapterDefaults?: { reasoningEffort?: unknown } | undefined
 }
 
 interface ProjectionRegistryLike {
   stateOf?: (session: unknown, key: string) => unknown
 }
 
-/**
- * Resolve the optional session projection registry without an inject
- * declaration, exactly like the goal-driver lookup: minimal compositions
- * without the registry simply have no durable model selection.
- * @param ctx - any context whose `reflect` service lookup is available.
- * @returns the registry, or undefined when the composition omits it.
- */
+interface AgentDefaultModelLike {
+  currentSelection?: () => unknown
+}
+
 export function projectionRegistryOf(ctx: unknown): ProjectionRegistryLike | undefined {
   const reflect = (ctx as { reflect?: { get(name: string, strict?: boolean): unknown } } | undefined)?.reflect
   const registry = reflect?.get('sessionProjections')
   return registry !== null && typeof registry === 'object' ? (registry as ProjectionRegistryLike) : undefined
 }
 
-/**
- * Read one Session's durable model-selection state (`modelSelection` unit).
- * @param ctx - context carrying the projection registry.
- * @param session - the initiating Session, when one exists.
- * @returns the projection state, or undefined when it is unavailable.
- */
 export function sessionModelStateOf(ctx: unknown, session: unknown): SessionModelStateLike | undefined {
   const state = projectionRegistryOf(ctx)?.stateOf?.(session, 'modelSelection')
   return state !== null && typeof state === 'object' ? (state as SessionModelStateLike) : undefined
 }
 
-/**
- * Normalize one provider/model/effort candidate into a complete route.
- * @param selection - candidate fields from settings, the session model, or tests.
- * @returns the complete route, or undefined when provider/model are unusable.
- */
+/** Read-only access to DSH's deployment model selection. */
+export function agentDefaultSelectionOf(ctx: unknown): ModelSelectionLike | undefined {
+  const reflect = (ctx as { reflect?: { get(name: string, strict?: boolean): unknown } } | undefined)?.reflect
+  const service = reflect?.get('agentDefaultModel') as AgentDefaultModelLike | undefined
+  if (service?.currentSelection === undefined) return undefined
+  try {
+    const selection = service.currentSelection()
+    return selection !== null && typeof selection === 'object' ? (selection as ModelSelectionLike) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export interface SessionSelectionSources {
+  sessionModel?: SessionModelStateLike | undefined
+  requestHeader?: SessionHeaderLike | undefined
+  agentDefault?: ModelSelectionLike | undefined
+}
+
+/** DSH selection intent: pending choice, last request, then deployment default. */
+export function sessionModelSelectionOf(sources: SessionSelectionSources): ModelSelectionLike | undefined {
+  const pending = sources.sessionModel?.pending
+  if (pending !== undefined && pending !== null) return pending
+  const header = sources.requestHeader
+  if (header?.config !== undefined) {
+    const effort = header.config.reasoningEffort
+    const adapterDefaultEffort = header.adapterDefaults?.reasoningEffort === true
+    return {
+      provider: header.config.provider,
+      model: header.config.model,
+      ...(effort === undefined || effort === '' || adapterDefaultEffort ? {} : { reasoningEffort: effort }),
+    }
+  }
+  return sources.agentDefault
+}
+
+/** Normalize a user-owned selection; whitespace and malformed effort are invalid. */
 export function routeFromSelection(selection: ModelSelectionLike | undefined): OrbitRoute | undefined {
   if (selection === undefined) return undefined
-  const { provider, model, reasoningEffort } = selection
-  if (typeof provider !== 'string' || provider === '') return undefined
-  if (typeof model !== 'string' || model === '') return undefined
+  const provider = typeof selection.provider === 'string' ? selection.provider.trim() : ''
+  const model = typeof selection.model === 'string' ? selection.model.trim() : ''
+  if (provider === '' || model === '') return undefined
+  const effort = selection.reasoningEffort
+  if (effort !== undefined && typeof effort !== 'string') return undefined
   return {
     provider,
     model,
-    ...(typeof reasoningEffort === 'string' && reasoningEffort !== '' ? { reasoningEffort } : {}),
+    ...(typeof effort === 'string' && effort.trim() !== '' ? { reasoningEffort: effort.trim() } : {}),
   }
 }
 
 export interface EffectiveRoutesInput {
-  /** Role routes declared by the composition config; the fallback layer. */
-  configRoutes: OrbitRoutes
-  /** Resolved `orbit` settings section when the settings provider is attached. */
+  /** Explicit profile/headless fallback only; the package default is empty. */
+  configRoutes?: OrbitConfiguredRoutes | undefined
   settings?: OrbitRouteSettings | undefined
-  /** Durable Session `modelSelection` projection state of the initiating agent. */
-  sessionModel?: SessionModelStateLike | undefined
-  /** Legacy request-header selection; a compatibility fallback only. */
   sessionSelection?: ModelSelectionLike | undefined
+  hasSession?: boolean
 }
 
-/**
- * Resolve the three role routes for a NEW run:
- * Commander = settings (base = config) → config; Executor = session model
- * (pending → lastUsed) → request header → config; Watchdog = settings
- * (base = config) → config.
- * @param input - config fallback, settings section, and session model state.
- * @returns the complete frozen route set.
- */
+const ROLE_LABELS: Record<OrbitRole, string> = {
+  commander: 'Commander',
+  executor: 'Executor',
+  watchdog: 'Watchdog',
+}
+
+/** Resolve all three routes or fail before a durable run is created. */
 export function resolveEffectiveRoutes(input: EffectiveRoutesInput): OrbitRoutes {
-  return {
-    commander: routeFromSelection(input.settings?.commander) ?? input.configRoutes.commander,
-    executor:
-      routeFromSelection(input.sessionModel?.pending ?? undefined) ??
-      routeFromSelection(input.sessionModel?.lastUsed ?? undefined) ??
-      routeFromSelection(input.sessionSelection) ??
-      input.configRoutes.executor,
-    watchdog: routeFromSelection(input.settings?.watchdog) ?? input.configRoutes.watchdog,
+  const routes: Partial<OrbitRoutes> = {
+    commander: routeFromSelection(input.settings?.commander) ?? routeFromSelection(input.configRoutes?.commander),
+    executor: input.hasSession === true || input.sessionSelection !== undefined
+      ? routeFromSelection(input.sessionSelection)
+      : routeFromSelection(input.configRoutes?.executor),
+    watchdog: routeFromSelection(input.settings?.watchdog) ?? routeFromSelection(input.configRoutes?.watchdog),
   }
+  const missing = (['commander', 'executor', 'watchdog'] as const).filter((role) => routes[role] === undefined)
+  if (missing.length > 0) {
+    throw new Error(
+      `ORBIT_ROLE_MODEL_CONFIGURATION_REQUIRED: Orbit 尚未完成角色模型配置：${missing.map((role) => `${ROLE_LABELS[role]} 未选择`).join('；')}。` +
+      '请先在 Orbit 模型菜单中选择；无 Web 设置界面的 profile 可显式配置 routes。',
+    )
+  }
+  return structuredClone(routes as OrbitRoutes)
 }
 
-interface HeaderLike {
-  config?: ModelSelectionLike | undefined
-}
+interface HeaderLike { config?: ModelSelectionLike | undefined }
+interface SessionLike { requestHeader?: () => HeaderLike | undefined }
+interface AgentLike { session?: SessionLike | undefined }
 
-interface SessionLike {
-  requestHeader?: () => HeaderLike | undefined
-}
-
-interface AgentLike {
-  session?: SessionLike | undefined
-}
-
-/**
- * Read the initiating Session's current model selection from the public
- * request-header seam (`Agent.session.requestHeader().config`).
- * @param agent - initiating agent, or undefined outside a boundary.
- * @returns the selection route, or undefined when no header exists.
- */
-export function sessionSelectionOf(agent: AgentLike | undefined): OrbitRoute | undefined {
-  return routeFromSelection(agent?.session?.requestHeader?.()?.config)
+export function sessionSelectionOf(agent: AgentLike | undefined): ModelSelectionLike | undefined {
+  return agent?.session?.requestHeader?.()?.config
 }

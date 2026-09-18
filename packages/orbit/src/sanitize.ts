@@ -2,7 +2,7 @@
 
 const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
   /(authorization\s*:\s*(?:bearer\s+)?)[^\s,;]+/gi,
-  /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|cookie|secret|private[_-]?key)\s*[=:]\s*)[^\s,;]+/gi,
+  /((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|cookie|secret|private[_-]?key)\s*[=:]\s*)[^\s,;]+/gi,
   /(\b(?:sk|pk|ghp|github_pat)_[A-Za-z0-9_-]{8,})/g,
   /(\bBearer\s+)[A-Za-z0-9._-]+/gi,
 ]
@@ -33,7 +33,8 @@ export function redactValue(value: unknown, key?: string): unknown {
 export function truncateSafe(value: string, max = 4000): string {
   const redacted = redactText(value)
   if (redacted.length <= max) return redacted
-  return `${redacted.slice(0, max)}\n...[truncated]`
+  const marker = '\n...[truncated]'
+  return `${redacted.slice(0, Math.max(0, max - marker.length))}${marker}`
 }
 
 export function looksLikeSecretKey(key: string): boolean {

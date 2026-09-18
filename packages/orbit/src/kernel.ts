@@ -8,6 +8,7 @@
 
 import {
   MAX_CORRECTION_DEPTH,
+  DEFAULT_LOOP_BUDGET,
   MAX_PLAN_STEPS,
   MAX_WATCHDOG_CALLS_PER_STEP,
   MIN_PLAN_STEPS,
@@ -18,10 +19,11 @@ import {
   type OrbitPlanStep,
   type OrbitRoutes,
   type OrbitState,
+  type OrbitStepResult,
 } from './types.ts'
 
 /** Capabilities a plan step may request. */
-export const ORBIT_CAPABILITIES: readonly OrbitCapability[] = ['browser', 'web-api-recon']
+export const ORBIT_CAPABILITIES: readonly OrbitCapability[] = ['filesystem', 'shell', 'web', 'browser']
 
 const STEP_CAPABILITIES = new Set<string>(ORBIT_CAPABILITIES)
 
@@ -31,11 +33,14 @@ export function normalizeCapabilities(value: unknown): OrbitCapability[] | undef
   if (!Array.isArray(value)) return undefined
   const result: OrbitCapability[] = []
   for (const item of value) {
+    if (item === 'web-api-recon') {
+      for (const legacy of ['web', 'browser'] as const) if (!result.includes(legacy)) result.push(legacy)
+      continue
+    }
     if (typeof item !== 'string' || !STEP_CAPABILITIES.has(item)) continue
     if (!result.includes(item as OrbitCapability)) result.push(item as OrbitCapability)
   }
   if (result.length === 0) return undefined
-  if (result.includes('web-api-recon') && !result.includes('browser')) result.unshift('browser')
   return result
 }
 
@@ -64,6 +69,9 @@ export function normalizePlan(plan: CommanderPlan): { summary: string; steps: Or
   if (steps.some((step) => !step.goal)) {
     throw new Error('COMMANDER_PLAN_OUTPUT_INVALID: every step needs a goal')
   }
+  if (new Set(steps.map((step) => step.id)).size !== steps.length) {
+    throw new Error('COMMANDER_PLAN_OUTPUT_INVALID: 步骤 id 不得重复')
+  }
   return { summary: String(plan.summary ?? '').slice(0, 1000), steps }
 }
 
@@ -91,15 +99,6 @@ export function explicitLoopBudget(input: OrbitLoopBudgetInput): number | undefi
   if (!Number.isSafeInteger(raw) || raw <= 0) throw new Error('ORBIT_LOOP_BUDGET_INVALID: approved_loop_count must be a positive integer')
   if (raw > 10) throw new Error('ORBIT_LOOP_BUDGET_INVALID: approved_loop_count above 10 requires an explicit execution request')
   return raw
-}
-
-export function estimateLoopCount(goal: string): number {
-  const text = goal.toLowerCase()
-  if (/critical|migrate|migration|production|架构|重构/.test(text)) return 6
-  if (/integration|联调|ui|high/.test(text)) return 4
-  if (/feature|多文件|multi-file/.test(goal)) return 3
-  if (/bug|fix|test/.test(text)) return 2
-  return 1
 }
 
 export function updateLoopBudget(state: OrbitState, budget: number): void {
@@ -175,12 +174,14 @@ export interface InitialStateInput {
   maxLoops?: number
   userHardConstraints?: readonly string[]
   githubAllowed: boolean
+  /** DSH Session creating the run; the only Session allowed to answer NEEDS_USER. */
+  ownerSessionId?: string
 }
 
 export function createInitialState(input: InitialStateInput): OrbitState {
   const max =
     explicitLoopBudget({ approved_loop_count: input.approvedLoopCount, max_loops: input.maxLoops }) ??
-    estimateLoopCount(input.goal)
+    DEFAULT_LOOP_BUDGET
   return {
     schema_version: ORBIT_SCHEMA_VERSION,
     active_run_id: input.runId,
@@ -193,16 +194,18 @@ export function createInitialState(input: InitialStateInput): OrbitState {
     goal: input.goal,
     goal_hash: hashGoal(input.goal),
     preset: input.preset ?? 'orbit-lite',
-    routes: input.routes,
+    routes: structuredClone(input.routes),
     loop: { used: 0, max },
     approved_loop_count: max,
     remaining_budget: max,
     loop_count: 0,
     plan: { summary: '', steps: [] },
+    step_results: [],
     changed_files: [],
     test_summary: [],
     last_error: null,
     pending_user_reply: null,
+    ...(input.ownerSessionId === undefined ? {} : { owner_session_id: input.ownerSessionId }),
     user_hard_constraints: input.userHardConstraints ? [...input.userHardConstraints] : [],
     github_allowed: input.githubAllowed === true,
     interruption_retries: 0,
@@ -248,7 +251,7 @@ export function applyExecutorCapabilityUnavailable(state: OrbitState, stepId: st
   state.last_error = 'BROWSER_CAPABILITY_UNAVAILABLE'
   state.commander = {
     last_decision: state.commander?.last_decision,
-    summary: `Executor could not run step ${stepId}: BROWSER_CAPABILITY_UNAVAILABLE (agent_browser tool is not registered).`,
+    summary: `Executor 无法执行步骤 ${stepId}：BROWSER_CAPABILITY_UNAVAILABLE（配置的 Browser 工具不可用）。`,
   }
   state.phase = 'EVALUATE'
 }
@@ -286,6 +289,17 @@ export interface ExecutorSuccessInput {
   summary: string
   changedFiles: string[]
   testSummary: string[]
+}
+
+export const MAX_STEP_RESULTS = 10
+
+/** Upsert one bounded durable result without allowing evidence to drive transitions. */
+export function upsertStepResult(state: OrbitState, result: OrbitStepResult): void {
+  const results = state.step_results ?? []
+  const index = results.findIndex((entry) => entry.step_id === result.step_id)
+  if (index === -1) results.push(result)
+  else results[index] = result
+  state.step_results = results.slice(-MAX_STEP_RESULTS)
 }
 
 /** Apply a real Executor success: consume one loop slot, then enter EVALUATE. */
@@ -339,7 +353,8 @@ export function applyFinalAppend(state: OrbitState, decision: CommanderDecision)
     return 'budget_exhausted'
   }
   for (const item of appended.slice(0, remaining)) {
-    const index = state.plan.steps.filter((candidate) => isBaseStepId(candidate.id)).length
+    let index = state.plan.steps.filter((candidate) => isBaseStepId(candidate.id)).length
+    while (state.plan.steps.some((candidate) => candidate.id === `P${index}`)) index += 1
     state.plan.steps.push({
       id: `P${index}`,
       goal: item.goal,
@@ -366,7 +381,9 @@ export function applyCorrectionStep(state: OrbitState, step: OrbitPlanStep, inpu
   step.status = 'needs_correction'
   const number = correctionDepthOf(step.id) + 2
   const insertAt = state.plan.steps.indexOf(step) + 1
-  const correctionCapabilities = normalizeCapabilities(input.capabilities) ?? step.capabilities
+  const correctionCapabilities = input.capabilities === undefined
+    ? step.capabilities
+    : normalizeCapabilities(input.capabilities)
   state.plan.steps.splice(insertAt, 0, {
     id: `${base}-${number}`,
     goal: input.nextGoal,

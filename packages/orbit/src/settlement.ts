@@ -6,7 +6,9 @@
  * appears on cold-read synthesis). A child that is merely `idle` is NOT success.
  */
 
-export type TurnSettlement = 'completed' | 'aborted' | 'error' | 'blocked' | 'max-tokens' | 'open'
+import { truncateSafe } from './sanitize.ts'
+
+export type TurnSettlement = 'completed' | 'aborted' | 'error' | 'blocked' | 'max-tokens' | 'interrupted' | 'open'
 
 export interface SettlementResult {
   settlement: TurnSettlement
@@ -43,11 +45,13 @@ export function classifyTurnSettlement(events: readonly EventLike[]): Settlement
     case 'aborted':
       return { settlement: 'aborted', ...(reason.reason?.kind ? { cancelCause: reason.reason.kind } : {}) }
     case 'error':
-      return { settlement: 'error', ...(reason.error?.message ? { errorMessage: reason.error.message } : {}) }
+      return { settlement: 'error', ...(reason.error?.message ? { errorMessage: truncateSafe(reason.error.message, 500) } : {}) }
     case 'blocked':
       return { settlement: 'blocked' }
     case 'max-tokens':
       return { settlement: 'max-tokens' }
+    case 'interrupted':
+      return { settlement: 'interrupted' }
     default:
       return { settlement: 'open' }
   }

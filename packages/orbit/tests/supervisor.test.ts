@@ -9,9 +9,9 @@ import { FakeHost } from './helpers/fake-host.ts'
 
 const config: OrbitSupervisorConfig = {
   defaultRoutes: {
-    commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
-    executor: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high' },
-    watchdog: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' },
+    commander: { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' },
+    executor: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'high' },
+    watchdog: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
   },
   browserTools: ['agent_browser'],
   commanderReadOnlyTools: ['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch'],
@@ -336,7 +336,7 @@ test('browser capability unavailable routes to Commander without executing', asy
   cleanup()
 })
 
-test('ordinary Executor scope excludes driver and browser tools, allows writers', async () => {
+test('ordinary Executor scope is read-only without capabilities', async () => {
   const { dir, cleanup } = project()
   const host = new FakeHost()
   host
@@ -349,12 +349,13 @@ test('ordinary Executor scope excludes driver and browser tools, allows writers'
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   const allow = host.scriptsFor('executor')[0]?.toolFilter?.allow ?? []
   assert.ok(allow.includes('read'))
-  assert.ok(allow.includes('bash'))
-  assert.ok(allow.includes('write'))
+  assert.ok(!allow.includes('bash'))
+  assert.ok(!allow.includes('write'))
   assert.ok(!allow.includes('agent_browser'))
   assert.ok(!allow.includes('create_goal'))
   assert.ok(!allow.includes('ralph'))
   assert.ok(!allow.includes('workflow'))
+  assert.ok(!allow.includes('subagent'))
   cleanup()
 })
 
@@ -536,10 +537,11 @@ test('a same-goal reply resumes the NEEDS_USER run instead of starting a new one
       { output: 'did a after the user reply', childId: 'e2' },
       { output: 'did a again', childId: 'e3' },
     ])
-  const supervisor = make(host, dir)
+  const supervisor = new OrbitSupervisor(store, host, { ...config, resolveOwnerSessionId: () => 'session-a' })
 
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(first.phase, 'NEEDS_USER')
+  assert.equal(store.readState()?.owner_session_id, 'session-a', 'a new run records its owning Session')
   const paused = store.readState()
   assert.ok(paused)
 
@@ -566,7 +568,7 @@ test('an arbitrary user reply resumes the NEEDS_USER run and stays durable', asy
       { output: 'need the port', childId: 'e1' },
       { output: 'deployed on 8080', childId: 'e2' },
     ])
-  const supervisor = make(host, dir)
+  const supervisor = new OrbitSupervisor(store, host, { ...config, resolveOwnerSessionId: () => 'session-a' })
 
   const first = await supervisor.bootstrap({ goal: 'deploy service', approved_loop_count: 5 })
   assert.equal(first.phase, 'NEEDS_USER')
@@ -590,5 +592,102 @@ test('an arbitrary user reply resumes the NEEDS_USER run and stays durable', asy
     .scriptsFor('commander')
     .find((entry) => entry.label === 'commander-step_evaluate' && entry.request.prompt.includes('8080'))?.request.prompt
   assert.ok(stepPrompt, 'the Commander step evaluation must read the reply')
+  cleanup()
+})
+
+test('a different Session never resumes a NEEDS_USER run', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P1', goal: 'collect the port' }]) },
+      { structured: commander({ decision: 'NEEDS_USER', reason: 'which port?' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { output: 'need the port', childId: 'e1' },
+      { output: 'deployed on 8080', childId: 'e2' },
+    ])
+  let session = 'session-a'
+  const supervisor = new OrbitSupervisor(store, host, { ...config, resolveOwnerSessionId: () => session })
+
+  const first = await supervisor.bootstrap({ goal: 'deploy service', approved_loop_count: 5 })
+  assert.equal(first.phase, 'NEEDS_USER')
+  const paused = store.readState()
+  assert.ok(paused)
+  assert.equal(paused.owner_session_id, 'session-a')
+  const executorCalls = host.scriptsFor('executor').length
+
+  // Session B's brand-new task must not be consumed as Session A's reply.
+  session = 'session-b'
+  const blocked = await supervisor.bootstrap({ goal: 'check another project', approved_loop_count: 5 })
+  assert.equal(blocked.ok, false)
+  assert.match(String(blocked.message), /ORBIT_NEEDS_USER_OTHER_SESSION/)
+  const after = store.readState()
+  assert.equal(after?.run_id, paused.run_id, 'the old run id must not change')
+  assert.equal(after?.goal, 'deploy service', 'the old goal must not change')
+  assert.equal(after?.phase, 'NEEDS_USER')
+  assert.equal(after?.pending_user_reply ?? null, null, 'a foreign message never enters pending_user_reply')
+  assert.equal(host.scriptsFor('executor').length, executorCalls, 'no Executor may start for a foreign Session')
+
+  // The owning Session still resumes normally.
+  session = 'session-a'
+  const resumed = await supervisor.bootstrap({ goal: '8080', approved_loop_count: 5 })
+  const done = store.readState()
+  assert.equal(resumed.phase, 'SUCCESS')
+  assert.equal(done?.run_id, paused.run_id)
+  assert.equal(done?.pending_user_reply, '8080')
+  cleanup()
+})
+
+test('an ownerless NEEDS_USER Run explicitly rejects automatic reply without adopting the Session', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  const supervisor = make(host, dir)
+  const state = supervisor.createState({ goal: 'old goal' })
+  state.phase = 'NEEDS_USER'
+  state.status = 'needs_user'
+  store.writeState(state)
+  const before = store.readRawState()
+  const caller = new OrbitSupervisor(store, host, { ...config, resolveOwnerSessionId: () => 'new-session' })
+  const result = await caller.bootstrap({ goal: 'new reply' })
+  assert.equal(result.ok, false)
+  assert.match(result.message ?? '', /ORBIT_NEEDS_USER_OWNER_UNKNOWN/)
+  assert.deepEqual(store.readRawState(), before)
+  assert.equal(host.started.length, 0)
+  cleanup()
+})
+
+test('FINAL_EVALUATE sees every durable step result after rebuilding the Supervisor', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  host.script('commander', [
+    { structured: plan([{ id: 'P0', goal: 'first' }, { id: 'P1', goal: 'second' }, { id: 'P2', goal: 'third' }]) },
+    { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+    { interrupted: true, reason: 'review interrupted' },
+  ]).script('executor', [
+    { output: 'P0 result', changedFiles: ['first.ts'], testSummary: ['first tests pass'] },
+    { output: 'P1 result', changedFiles: ['second.ts'], testSummary: ['second tests pass'] },
+  ])
+  assert.equal((await make(host, dir).bootstrap({ goal: 'three steps', approved_loop_count: 5 })).phase, 'EVALUATE')
+  const persisted = store.readState()!
+  assert.equal(persisted.step_results?.length, 2)
+  host.script('commander', [
+    { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+    { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+    { structured: commander({ decision: 'SUCCESS' }) },
+  ]).script('executor', [{ output: 'P2 result', changedFiles: ['third.ts'], testSummary: ['third tests pass'] }])
+  assert.equal((await new OrbitSupervisor(store, host, config).run(persisted)).phase, 'SUCCESS')
+  const final = host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')!.request.prompt
+  for (const value of ['P0 result', 'P1 result', 'P2 result', 'first.ts', 'second.ts', 'third.ts', 'first tests pass', 'second tests pass', 'third tests pass']) {
+    assert.ok(final.includes(value), `FINAL must retain ${value}`)
+  }
+  const coldReview = host.scriptsFor('commander').filter((entry) => entry.label === 'commander-step_evaluate')[2]!.request.prompt
+  assert.ok(coldReview.includes('P1 result'))
+  assert.equal(host.scriptsFor('watchdog').length, 0)
   cleanup()
 })

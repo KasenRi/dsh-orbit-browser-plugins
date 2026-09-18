@@ -20,7 +20,6 @@ import {
   createInitialState,
   enterBudgetExhausted,
   enterNeedsUser,
-  estimateLoopCount,
   explicitLoopBudget,
   hashGoal,
   isBaseStepId,
@@ -86,7 +85,7 @@ test('normalizes plan steps and capabilities', () => {
   })
   assert.equal(plan.steps[0]?.id, 'P0')
   assert.equal(plan.steps[1]?.id, 'P1')
-  assert.deepEqual(plan.steps[1]?.capabilities, ['browser', 'web-api-recon'])
+  assert.deepEqual(plan.steps[1]?.capabilities, ['web', 'browser'])
 })
 
 test('rejects plan with too many steps', () => {
@@ -124,12 +123,11 @@ test('validates the explicit loop budget', () => {
   assert.throws(() => explicitLoopBudget({ approved_loop_count: 11 }), /above 10/)
 })
 
-test('estimates loop budget deterministically from the goal', () => {
-  assert.equal(estimateLoopCount('migrate the production database'), 6)
-  assert.equal(estimateLoopCount('ship a UI integration feature'), 4)
-  assert.equal(estimateLoopCount('add a multi-file feature'), 3)
-  assert.equal(estimateLoopCount('fix this bug'), 2)
-  assert.equal(estimateLoopCount('say hello'), 1)
+test('uses one predictable default loop budget regardless of goal wording', () => {
+  for (const goal of ['production migration', 'UI integration', 'fix bug', 'say hello']) {
+    const initial = createInitialState({ runId: goal, now: 0, goal, routes: ROUTES, githubAllowed: false })
+    assert.equal(initial.loop.max, 5)
+  }
 })
 
 test('updates the loop budget without losing used slots', () => {
@@ -149,7 +147,7 @@ test('normalizes APPEND decisions into plan steps', () => {
     { goal: 'do y', capabilities: ['browser'] },
   ])
   assert.deepEqual(normalizeAppend({ decision: 'APPEND', next_step_goal: 'do z', next_step_capabilities: ['web-api-recon'] }), [
-    { goal: 'do z', capabilities: ['browser', 'web-api-recon'] },
+    { goal: 'do z', capabilities: ['web', 'browser'] },
   ])
   assert.deepEqual(normalizeAppend({ decision: 'APPEND', next_steps: [{ goal: '' }, '   '] }), [])
 })
@@ -205,9 +203,9 @@ test('initial state follows the kernel rules', () => {
   assert.equal(initial.interruption_retries, 0)
 })
 
-test('initial state estimates the loop budget when none is explicit', () => {
+test('initial state uses the fixed default budget when none is explicit', () => {
   const initial = createInitialState({ runId: 'r', now: 0, goal: 'ship a UI integration', routes: ROUTES, githubAllowed: false })
-  assert.equal(initial.loop.max, 4)
+  assert.equal(initial.loop.max, 5)
 })
 
 test('resumeFromNeedsUser re-enters EXECUTE', () => {
@@ -249,7 +247,7 @@ test('capability unavailable records a completed shell for evaluation', () => {
   applyExecutorCapabilityUnavailable(current, 'P2')
   assert.deepEqual(current.child, { status: 'completed' })
   assert.equal(current.last_error, 'BROWSER_CAPABILITY_UNAVAILABLE')
-  assert.match(current.commander?.summary ?? '', /step P2/)
+  assert.match(current.commander?.summary ?? '', /步骤 P2/)
   assert.equal(current.phase, 'EVALUATE')
 })
 
@@ -392,7 +390,7 @@ test('correction inserts P1-2 then P1-3 with inherited capabilities', () => {
     ['P1', 'P1-2', 'P1-3'],
   )
   assert.equal(current.plan.steps[2]?.goal, 'fix twice')
-  assert.deepEqual(current.plan.steps[2]?.capabilities, ['browser', 'web-api-recon'])
+  assert.deepEqual(current.plan.steps[2]?.capabilities, ['web', 'browser'])
 })
 
 test('strategy challenge bookkeeping and evaluation restore', () => {

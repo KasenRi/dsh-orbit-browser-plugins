@@ -19,16 +19,3 @@
       config:
         browserTools:
           - agent_browser
-        routes:
-          commander:
-            provider: deepseek-official
-            model: deepseek-v4-pro
-            reasoningEffort: high
-          executor:
-            provider: deepseek-official
-            model: deepseek-v4-flash
-            reasoningEffort: high
-          watchdog:
-            provider: deepseek-official
-            model: deepseek-v4-flash
-            reasoningEffort: low

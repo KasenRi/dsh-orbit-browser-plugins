@@ -25,16 +25,16 @@ export const COMMANDER_PLAN_SCHEMA: ObjectJsonSchema = {
   additionalProperties: false,
   required: ['summary', 'steps'],
   properties: {
-    summary: { type: 'string', description: 'One-sentence plan summary.' },
+    summary: { type: 'string', description: '一句话计划摘要。' },
     steps: {
       type: 'array',
-      description: '2-5 logical engineering steps.',
+      description: '1-5 个逻辑工程步骤。',
       items: {
         type: 'object',
         additionalProperties: false,
         required: ['goal'],
         properties: {
-          id: { type: 'string', description: 'Stable id such as P0.' },
+          id: { type: 'string', description: '稳定标识，例如 P0。' },
           goal: { type: 'string' },
           capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
         },
@@ -110,7 +110,7 @@ export const WATCHDOG_STRATEGY_SCHEMA: ObjectJsonSchema = {
   additionalProperties: false,
   required: ['question'],
   properties: {
-    question: { type: 'string', description: 'The single strategy question to put to the Commander.' },
+    question: { type: 'string', description: '提交给 Commander 的单个策略质疑问题。' },
   },
 }
 

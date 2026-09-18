@@ -10,12 +10,11 @@ export const ORBIT_TOOL_NAME = 'orbit_controller'
 export const LEGACY_CX_TOOL_NAME = 'cx_controller'
 
 const TOOL_DESCRIPTION =
-  'Drive Orbit engineering autonomy for the current project. Orbit runs a deterministic Supervisor ' +
-  '(Commander -> Executor -> Smart Watchdog) over a durable .cx/state.json. Use action "run" with a ' +
-  'goal to start or continue, "resume" to continue a persisted run, "status" to inspect, "stop" to ' +
-  'close the run, and "doctor" to check the environment. Only Orbit writes .cx durable state.'
+  '驱动当前项目的 Orbit 工程编排。Orbit 由确定性的 Supervisor 控制 Commander、Executor 和 Smart Watchdog，' +
+  '并将状态保存到 .cx/state.json。使用 action "run" 启动或继续，"resume" 继续持久化运行，"status" 查看状态，' +
+  '"stop" 关闭运行，"doctor" 检查环境。只有 Orbit 可以写入 .cx 持久状态。'
 
-const LEGACY_TOOL_DESCRIPTION = `Legacy compatibility alias. Prefer ${ORBIT_TOOL_NAME}. ${TOOL_DESCRIPTION}`
+const LEGACY_TOOL_DESCRIPTION = `Legacy compatibility alias（兼容旧接口），请优先使用 ${ORBIT_TOOL_NAME}。${TOOL_DESCRIPTION}`
 
 interface ToolArgs {
   action: 'run' | 'start' | 'resume' | 'stop' | 'status' | 'doctor'
@@ -62,12 +61,12 @@ export function createOrbitTool(ctx: Context, options: OrbitToolOptions = {}) {
     description: legacy ? LEGACY_TOOL_DESCRIPTION : TOOL_DESCRIPTION,
     parameters: {
       action: { type: 'string', required: true, enum: ['run', 'start', 'resume', 'stop', 'status', 'doctor'] },
-      goal: { type: 'string', description: 'The engineering goal (required for run/start).' },
-      preset: { type: 'string', description: 'Run preset id.' },
-      approved_loop_count: { type: 'integer', description: 'Explicit loop budget (positive, <= 10).' },
-      run_id: { type: 'string', description: 'Target run id for resume/stop.' },
+      goal: { type: 'string', description: '工程目标，run/start 时必填。' },
+      preset: { type: 'string', description: 'Run preset id。' },
+      approved_loop_count: { type: 'integer', description: '用户显式批准的 loop 预算，正整数且不超过 10。' },
+      run_id: { type: 'string', description: 'resume/stop 的目标 run id。' },
       user_hard_constraints: { type: 'array', items: { type: 'string' } },
-      github_allowed: { type: 'boolean', description: 'Allow GitHub remote writes for this run.' },
+      github_allowed: { type: 'boolean', description: '是否允许此 Run 执行 GitHub 远程写入。' },
     },
     output: {
       schema: { type: 'json' },
@@ -93,7 +92,7 @@ export function createOrbitTool(ctx: Context, options: OrbitToolOptions = {}) {
         ...(args.github_allowed !== undefined ? { github_allowed: args.github_allowed } : {}),
       }
       if (args.action === 'status') return (await service.status(cwd)) as unknown as JsonValue
-      if (args.action === 'stop') return service.stop(args.run_id, cwd) as unknown as JsonValue
+      if (args.action === 'stop') return (await service.stop(args.run_id, cwd)) as unknown as JsonValue
       if (args.action === 'doctor') return (await service.doctor(cwd)) as unknown as JsonValue
       if (args.action === 'resume') return (await service.resume(input, cwd, exec.signal)) as unknown as JsonValue
       return (await service.run(input, cwd, exec.signal)) as unknown as JsonValue

@@ -216,5 +216,5 @@ test('/orbit-toggle validates its argument', () => {
   assert.equal(definition.handler({ rawInput: 'off' }).kind, 'success')
   const invalid = definition.handler({ rawInput: 'maybe' })
   assert.equal(invalid.kind, 'error')
-  assert.match(invalid.text ?? '', /Usage: \/orbit-toggle/)
+  assert.match(invalid.text ?? '', /用法：\/orbit-toggle/)
 })

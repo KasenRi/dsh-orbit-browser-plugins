@@ -199,6 +199,7 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
   ]
   for (const [plugin, config] of plugins) await root.plugin(plugin as never, config as never)
   root.llm.registerAdapter(options.providers ?? ['fake'], adapter)
+  root.provide('agentDefaultModel', { currentSelection: () => ({ ...ROUTE }) } as never)
   for (const name of ['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser']) root.tools.register(stubTool(name))
   await root.plugin(OrbitPlugin as never, {
     ...ORBIT_CONFIG,
@@ -488,8 +489,8 @@ test('real host command: /agent-orbit is registered, preserved in history, and h
     const descriptors = root.commands.list(parent.agent)
     const descriptor = descriptors.find((entry) => entry.name === 'agent-orbit')
     assert.ok(descriptor, `agent-orbit must be listed (got: ${descriptors.map((entry) => entry.name).join(', ') || '(none)'})`)
-    assert.equal(descriptor.description, 'Run a goal with Orbit deterministic engineering orchestration')
-    assert.equal(descriptor.input?.hint, 'Describe the engineering goal for Orbit')
+    assert.equal(descriptor.description, '使用 Orbit 确定性工程编排执行目标')
+    assert.equal(descriptor.input?.hint, '描述要交给 Orbit 完成的工程目标')
 
     const commandLine = '/agent-orbit implement the deterministic fix'
     const execution = await root.commands.execute(parent.agent, commandLine, [], new AbortController().signal)
@@ -538,7 +539,7 @@ test('real host command: empty /agent-orbit is rejected without starting a run',
     const execution = await root.commands.execute(parent.agent, '/agent-orbit', [], new AbortController().signal)
     assert.ok(execution)
     assert.ok(execution.result.kind === 'error', 'an empty goal must be rejected')
-    assert.match(execution.result.text, /Usage: \/agent-orbit/)
+    assert.match(execution.result.text, /用法：\/agent-orbit/)
     await parent.agent.whenIdle()
 
     assert.equal(userMessagesOf(parent.agent).length, 0, 'an empty goal must post no user message')
@@ -734,7 +735,7 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     assert.ok(state, 'the host must have written durable run state')
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.goal, 'create the hard activation proof')
-    assert.ok(Number(state.approved_loop_count) >= 5, 'the host must grant a budget that can finish a 2-5 step plan')
+    assert.equal(Number(state.approved_loop_count), 5, 'hard activation uses one fixed predictable budget')
     assert.equal(adapter.executorCalls, 1, 'the Executor must run through the real Orbit chain')
     assert.ok(adapter.seen.some((entry) => entry.includes('Orbit 指挥官')), 'the Commander must actually plan')
 
@@ -897,14 +898,14 @@ function installTestModelSelection(root: Context): void {
 
 test('real host: the Executor route follows the durable Session modelSelection without a request header', { timeout: 120_000 }, async () => {
   const adapter = new ScriptedAdapter()
-  const root = await boot(adapter, { providers: ['fake', 'mysub-oc'] })
+  const root = await boot(adapter, { providers: ['fake', 'provider-b'] })
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-session-route')
   try {
     installTestModelSelection(root)
     // The user picked a non-deepseek provider; no parent model request exists
     // yet — exactly the hard-activation case that used to fall back to config.
-    parent.agent.session.append('model/selection', { provider: 'mysub-oc', model: 'glm-5.3-flash', reasoningEffort: 'xhigh' })
+    parent.agent.session.append('model/selection', { provider: 'provider-b', model: 'model-b', reasoningEffort: 'xhigh' })
     assert.equal(parent.agent.session.requestHeader(), undefined, 'this regression only reproduces without a request header')
 
     const on = await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal)
@@ -917,8 +918,8 @@ test('real host: the Executor route follows the durable Session modelSelection w
       | undefined
     assert.equal(state?.phase, 'SUCCESS')
     assert.deepEqual(state?.routes?.['executor'], {
-      provider: 'mysub-oc',
-      model: 'glm-5.3-flash',
+      provider: 'provider-b',
+      model: 'model-b',
       reasoningEffort: 'xhigh',
     })
 
@@ -926,8 +927,115 @@ test('real host: the Executor route follows the durable Session modelSelection w
     const executorRequests = adapter.requests.filter((entry) => entry.prompt.startsWith('你是 Orbit 执行员'))
     assert.ok(executorRequests.length >= 1, 'the Executor must have run')
     for (const entry of executorRequests) {
-      assert.equal(entry.provider, 'mysub-oc')
-      assert.equal(entry.model, 'glm-5.3-flash')
+      assert.equal(entry.provider, 'provider-b')
+      assert.equal(entry.model, 'model-b')
+      assert.equal(entry.reasoningEffort, 'xhigh')
+    }
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host: a different Session never resumes another Session NEEDS_USER run', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter({
+    stepEvaluates: [
+      '{"decision":"NEEDS_USER","reason":"请提供端口号"}',
+      '{"decision":"PASS_CURRENT_STEP"}',
+    ],
+  })
+  const root = await boot(adapter)
+  const project = tempProject()
+  const sessionA = await makeParent(root, project.dir, 'e2e-session-a')
+  const sessionB = await makeParent(root, project.dir, 'e2e-session-b')
+  const executorRuns = () => adapter.requests.filter((entry) => entry.prompt.startsWith('你是 Orbit 执行员')).length
+  try {
+    // Session A starts a run that waits for user input.
+    assert.ok(await root.commands.execute(sessionA.agent, '/orbit-toggle on', [], new AbortController().signal))
+    sessionA.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'deploy service' }], source: { kind: 'user' } }))
+    await sessionA.agent.whenIdle()
+    const paused = readRunState(project.dir)
+    assert.equal(paused?.phase, 'NEEDS_USER')
+    assert.equal(paused?.owner_session_id, String(sessionA.agent.session.id), 'the run records its owning Session')
+    const before = executorRuns()
+
+    // Session B sends a brand-new task: it must never be consumed as A's reply.
+    assert.ok(await root.commands.execute(sessionB.agent, '/orbit-toggle on', [], new AbortController().signal))
+    sessionB.agent.followup(createUserMessage({ content: [{ type: 'text', text: '帮我检查另一个项目' }], source: { kind: 'user' } }))
+    await sessionB.agent.whenIdle()
+
+    const blocked = readRunState(project.dir)
+    assert.equal(blocked?.run_id, paused?.run_id, 'the old run id must not change')
+    assert.equal(blocked?.goal, 'deploy service', 'the old goal must not change')
+    assert.equal(blocked?.phase, 'NEEDS_USER')
+    assert.equal(blocked?.pending_user_reply ?? null, null, "Session B's message never enters pending_user_reply")
+    assert.equal(executorRuns(), before, 'no Executor may auto-start for a foreign Session')
+
+    const notices = userMessagesOf(sessionB.agent).filter((message) => (message.source as { form?: string }).form === 'notice')
+    assert.ok(
+      notices.some((message) => textOf(message as SessionMessageLike).includes('ORBIT_NEEDS_USER_OTHER_SESSION')),
+      'Session B must see the owner notice',
+    )
+
+    // The owning Session still resumes the same run.
+    sessionA.agent.followup(createUserMessage({ content: [{ type: 'text', text: '8080' }], source: { kind: 'user' } }))
+    await sessionA.agent.whenIdle()
+    const done = readRunState(project.dir)
+    assert.equal(done?.run_id, paused?.run_id)
+    assert.equal(done?.goal, 'deploy service')
+    assert.equal(done?.pending_user_reply, '8080')
+    assert.equal(done?.phase, 'SUCCESS')
+  } finally {
+    await sessionA.dispose()
+    await sessionB.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host: a fresh Session without projection state or header uses the deployment default model', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter, { providers: ['fake', 'provider-b'] })
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-fresh-session')
+  try {
+    // The deployment default service, as the real profile mounts it.
+    ;(root.reflect.get('agentDefaultModel') as { currentSelection: () => unknown }).currentSelection =
+      () => ({ provider: 'provider-b', model: 'model-b', reasoningEffort: 'xhigh' })
+
+    // A fresh Session: the projection is registered but empty, no header yet.
+    installTestModelSelection(root)
+    assert.equal(parent.agent.session.requestHeader(), undefined, 'no parent request exists before the hard activation')
+    const projected = root.sessionProjections.stateOf(parent.agent.session, 'modelSelection') as
+      | { pending?: unknown; lastUsed?: unknown }
+      | undefined
+    assert.equal(projected?.pending ?? null, null)
+    assert.equal(projected?.lastUsed ?? null, null)
+
+    assert.ok(await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal))
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'create the fresh-session proof' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+
+    const state = readRunState(project.dir) as
+      | { phase?: string; routes?: Record<string, { provider?: string; model?: string; reasoningEffort?: string }> }
+      | undefined
+    assert.equal(state?.phase, 'SUCCESS')
+    assert.deepEqual(state?.routes?.['executor'], {
+      provider: 'provider-b',
+      model: 'model-b',
+      reasoningEffort: 'xhigh',
+    })
+    // Commander and Watchdog keep their own configured routes.
+    assert.deepEqual(state?.routes?.['commander'], { provider: 'fake', model: 'fm', reasoningEffort: 'off' })
+    assert.deepEqual(state?.routes?.['watchdog'], { provider: 'fake', model: 'fm', reasoningEffort: 'off' })
+
+    // The real Executor child actually requested the deployment default.
+    const executorRequests = adapter.requests.filter((entry) => entry.prompt.startsWith('你是 Orbit 执行员'))
+    assert.ok(executorRequests.length >= 1, 'the Executor must have run')
+    for (const entry of executorRequests) {
+      assert.equal(entry.provider, 'provider-b')
+      assert.equal(entry.model, 'model-b')
       assert.equal(entry.reasoningEffort, 'xhigh')
     }
   } finally {

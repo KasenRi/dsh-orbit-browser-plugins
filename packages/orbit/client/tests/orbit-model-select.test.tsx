@@ -18,20 +18,20 @@ const reasoning = {
     { id: 'low', name: 'Low' },
     { id: 'high', name: 'High' },
   ],
-  defaultEffort: 'high',
+  defaultEffort: 'effort-b',
 }
 
 function directoryState(overrides: Partial<ModelDirectoryState> = {}): ModelDirectoryState {
   return {
-    current: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' },
+    current: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
     routable: true,
     groups: [
       {
-        id: 'deepseek-official',
-        name: 'DeepSeek',
+        id: 'provider-a',
+        name: 'Provider A',
         models: [
-          { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', reasoning },
-          { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', reasoning },
+          { id: 'model-a', name: 'Model A', reasoning },
+          { id: 'model-b', name: 'Model B', reasoning },
           { id: 'plain-model', name: 'Plain Model' },
         ],
       },
@@ -46,8 +46,8 @@ function directoryState(overrides: Partial<ModelDirectoryState> = {}): ModelDire
 function settingsState(overrides: Partial<OrbitSettingsState> = {}): OrbitSettingsState {
   return {
     status: 'ready',
-    commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' },
-    watchdog: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' },
+    commander: { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' },
+    watchdog: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
     revision: 3,
     ...overrides,
   }
@@ -121,9 +121,9 @@ function renderControl(parts: Harness) {
 afterEach(cleanup)
 
 const ROLE_ROWS = [
-  ['指挥官', '指挥官模型', 'DeepSeek-V4-Pro', 'High'],
-  ['执行员', '执行员模型', 'DeepSeek-V4-Flash', 'Low'],
-  ['监控模型', '监控模型', 'DeepSeek-V4-Flash', 'Low'],
+  ['指挥官', '指挥官模型', 'Model B', 'High'],
+  ['执行员', '执行员模型', 'Model A', 'Low'],
+  ['监控模型', '监控模型', 'Model A', 'Low'],
 ] as const
 
 const ROLE_MODEL_LABELS: Record<string, string> = {
@@ -183,7 +183,7 @@ describe('Orbit role pages offer model and reasoning effort as separate entries'
   it('shows Provider default for a role without a stored effort', () => {
     renderControl(harness(
       directoryState(),
-      settingsState({ commander: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } }),
+      settingsState({ commander: { provider: 'provider-a', model: 'model-b' } }),
     ))
     openRole('指挥官')
     const effortRow = screen.getByRole('menuitem', { name: /^推理等级/ })
@@ -204,17 +204,16 @@ describe('Orbit effort ladder follows the catalog metadata', () => {
     expect(screen.queryByRole('menuitem', { name: /^Max/ })).toBeNull()
   })
 
-  it('falls back to the UI effort ladder when the model declares none', () => {
+  it('offers only Provider default when the model declares no reasoning metadata', () => {
     const parts = harness(
       directoryState(),
-      settingsState({ commander: { provider: 'deepseek-official', model: 'plain-model' } }),
+      settingsState({ commander: { provider: 'provider-a', model: 'plain-model' } }),
     )
     renderControl(parts)
     openRoleEfforts('指挥官')
 
-    for (const label of [/^提供方默认/, /^Low/, /^Medium/, /^High/, /^XHigh/, /^Max/]) {
-      expect(screen.getByRole('menuitem', { name: label })).toBeTruthy()
-    }
+    expect(screen.getByRole('menuitem', { name: /^提供方默认/ })).toBeTruthy()
+    for (const label of [/^Low/, /^Medium/, /^High/, /^XHigh/, /^Max/]) expect(screen.queryByRole('menuitem', { name: label })).toBeNull()
   })
 })
 
@@ -228,8 +227,8 @@ describe('Orbit effort-only changes stay on their own path', () => {
 
     await waitFor(() => {
       expect(parts.writeRole).toHaveBeenCalledWith('commander', {
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-pro',
+        provider: 'provider-a',
+        model: 'model-b',
         reasoningEffort: 'low',
       })
     })
@@ -245,14 +244,14 @@ describe('Orbit effort-only changes stay on their own path', () => {
 
     await waitFor(() => {
       expect(parts.selectModel).toHaveBeenCalledWith({
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-flash',
+        provider: 'provider-a',
+        model: 'model-a',
         reasoningEffort: 'high',
       })
     })
     expect(parts.directory.getSnapshot().current).toEqual({
-      provider: 'deepseek-official',
-      model: 'deepseek-v4-flash',
+      provider: 'provider-a',
+      model: 'model-a',
       reasoningEffort: 'high',
     })
     expect(parts.writeRole).not.toHaveBeenCalled()
@@ -267,8 +266,8 @@ describe('Orbit effort-only changes stay on their own path', () => {
 
     await waitFor(() => {
       expect(parts.writeRole).toHaveBeenCalledWith('watchdog', {
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-flash',
+        provider: 'provider-a',
+        model: 'model-a',
         reasoningEffort: 'high',
       })
     })
@@ -286,26 +285,28 @@ describe('Orbit effort-only changes stay on their own path', () => {
       expect(parts.writeRole).toHaveBeenCalledTimes(1)
     })
     const [, route] = parts.writeRole.mock.calls[0] as [string, OrbitRouteValue]
-    expect(route).toEqual({ provider: 'deepseek-official', model: 'deepseek-v4-pro' })
+    expect(route).toEqual({ provider: 'provider-a', model: 'model-b' })
     expect('reasoningEffort' in route).toBe(false)
   })
 })
 
 describe('Orbit model picks never inherit a stale effort', () => {
-  it('switching to a model with metadata applies that model default effort', async () => {
+  it('switching models waits for explicit reasoning selection', async () => {
     const parts = harness(
       directoryState(),
-      settingsState({ commander: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' } }),
+      settingsState({ commander: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' } }),
     )
     renderControl(parts)
     openRoleModels('指挥官')
 
-    fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4-Pro/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Model B/ }))
+    expect(parts.writeRole).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'High' }))
 
     await waitFor(() => {
       expect(parts.writeRole).toHaveBeenCalledWith('commander', {
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-pro',
+        provider: 'provider-a',
+        model: 'model-b',
         reasoningEffort: 'high',
       })
     })
@@ -317,12 +318,14 @@ describe('Orbit model picks never inherit a stale effort', () => {
     openRoleModels('指挥官')
 
     fireEvent.click(screen.getByRole('menuitem', { name: /Plain Model/ }))
+    expect(parts.writeRole).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('menuitem', { name: /^提供方默认/ }))
 
     await waitFor(() => {
       expect(parts.writeRole).toHaveBeenCalledTimes(1)
     })
     const [, route] = parts.writeRole.mock.calls[0] as [string, OrbitRouteValue]
-    expect(route).toEqual({ provider: 'deepseek-official', model: 'plain-model' })
+    expect(route).toEqual({ provider: 'provider-a', model: 'plain-model' })
     expect('reasoningEffort' in route).toBe(false)
   })
 
@@ -331,19 +334,21 @@ describe('Orbit model picks never inherit a stale effort', () => {
     renderControl(parts)
     openRoleModels('指挥官')
 
-    fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4-Flash/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Model A/ }))
+    expect(parts.writeRole).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'High' }))
 
     await waitFor(() => {
       expect(parts.writeRole).toHaveBeenCalledWith('commander', {
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-flash',
+        provider: 'provider-a',
+        model: 'model-a',
         reasoningEffort: 'high',
       })
     })
     expect(parts.selectModel).not.toHaveBeenCalled()
     expect(parts.directory.getSnapshot().current).toEqual({
-      provider: 'deepseek-official',
-      model: 'deepseek-v4-flash',
+      provider: 'provider-a',
+      model: 'model-a',
       reasoningEffort: 'low',
     })
   })
@@ -353,12 +358,14 @@ describe('Orbit model picks never inherit a stale effort', () => {
     renderControl(parts)
     openRoleModels('监控模型')
 
-    fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4-Pro/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Model B/ }))
+    expect(parts.writeRole).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'High' }))
 
     await waitFor(() => {
       expect(parts.writeRole).toHaveBeenCalledWith('watchdog', {
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-pro',
+        provider: 'provider-a',
+        model: 'model-b',
         reasoningEffort: 'high',
       })
     })
@@ -374,24 +381,26 @@ describe('Orbit executor shares the session model directory', () => {
 
     // The Orbit entry sits before the native seat; its trigger names the Commander.
     const executorRow = screen.getByRole('menuitem', { name: /执行员/ })
-    expect(executorRow.textContent).toContain('DeepSeek-V4-Flash')
+    expect(executorRow.textContent).toContain('Model A')
     expect(executorRow.textContent).toContain('跟随当前会话模型')
     fireEvent.click(executorRow)
 
     fireEvent.click(screen.getByRole('menuitem', { name: /^执行员模型/ }))
-    fireEvent.click(screen.getByRole('menuitem', { name: /DeepSeek-V4-Pro/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Model B/ }))
+    expect(parts.selectModel).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'High' }))
 
     await waitFor(() => {
       expect(parts.selectModel).toHaveBeenCalledWith({
-        provider: 'deepseek-official',
-        model: 'deepseek-v4-pro',
+        provider: 'provider-a',
+        model: 'model-b',
         reasoningEffort: 'high',
       })
     })
     // One state: the directory now holds the executor pick.
     expect(parts.directory.getSnapshot().current).toEqual({
-      provider: 'deepseek-official',
-      model: 'deepseek-v4-pro',
+      provider: 'provider-a',
+      model: 'model-b',
       reasoningEffort: 'high',
     })
   })
@@ -400,9 +409,9 @@ describe('Orbit executor shares the session model directory', () => {
     const parts = harness()
     renderControl(parts)
     // The native seat switches the session model behind the panel.
-    parts.directory.set(directoryState({ current: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } }))
+    parts.directory.set(directoryState({ current: { provider: 'provider-a', model: 'model-b' } }))
     fireEvent.click(screen.getByTitle('Orbit 模型配置'))
-    expect(screen.getByRole('menuitem', { name: /执行员/ }).textContent).toContain('DeepSeek-V4-Pro')
+    expect(screen.getByRole('menuitem', { name: /执行员/ }).textContent).toContain('Model B')
   })
 })
 
@@ -444,14 +453,14 @@ describe('Orbit per-Session enable toggle', () => {
     renderControl(parts)
     const trigger = screen.getByTitle('Orbit 模型配置')
     expect(trigger.textContent).toContain('Orbit Off')
-    expect(trigger.textContent).not.toContain('DeepSeek-V4-Pro')
+    expect(trigger.textContent).not.toContain('Model B')
   })
 
   it('shows the Commander model and effort once the Session is enabled', () => {
     const parts = harness(directoryState(), settingsState(), true)
     renderControl(parts)
     const trigger = screen.getByTitle('Orbit 模型配置')
-    expect(trigger.textContent).toContain('DeepSeek-V4-Pro')
+    expect(trigger.textContent).toContain('Model B')
     expect(trigger.textContent).toContain('High')
     expect(trigger.textContent).not.toContain('Orbit Off')
   })
@@ -469,7 +478,7 @@ describe('Orbit per-Session enable toggle', () => {
       expect(parts.setOrbitEnabled).toHaveBeenCalledWith(true)
     })
     await waitFor(() => {
-      expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('DeepSeek-V4-Pro')
+      expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('Model B')
     })
   })
 
@@ -491,7 +500,7 @@ describe('Orbit per-Session enable toggle', () => {
   it('restores the stored state on a fresh mount', () => {
     const parts = harness(directoryState(), settingsState(), true)
     renderControl(parts)
-    expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('DeepSeek-V4-Pro')
+    expect(screen.getByTitle('Orbit 模型配置').textContent).toContain('Model B')
   })
 
   it('keeps Sessions isolated: toggling one control leaves the other unchanged', async () => {
@@ -512,7 +521,7 @@ describe('Orbit per-Session enable toggle', () => {
       expect(b.setOrbitEnabled).not.toHaveBeenCalled()
     })
     const after = screen.getAllByTitle('Orbit 模型配置')
-    expect(after[0]?.textContent).toContain('DeepSeek-V4-Pro')
+    expect(after[0]?.textContent).toContain('Model B')
     expect(after[1]?.textContent).toContain('Orbit Off')
   })
 

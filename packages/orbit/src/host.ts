@@ -13,6 +13,9 @@ export interface RoleRunRequest {
   label: string
   prompt: string
   route: OrbitRoute
+  workspace?: string
+  runId?: string
+  stepId?: string
   toolFilter?: RoleToolFilter
   capabilities?: readonly string[]
   signal?: AbortSignal
@@ -66,6 +69,10 @@ export interface OrbitHost {
   interruptRole(handle: RoleHandle, reason: string): Promise<void>
   releaseRole(handle: RoleHandle): Promise<void>
   hasTool(name: string): boolean
+  /** Validate frozen routes against the current DSH LLM registry. */
+  validateRoutes(routes: Readonly<Record<OrbitRole, OrbitRoute>>, signal?: AbortSignal): Promise<string[]>
+  /** Whether this exact Agent is the currently authorized Orbit Executor. */
+  isMutationAuthorized(agent: unknown, cwd: string, tool: string): boolean
   otherMutationDrivers(cwd: string): Promise<string[]>
   changedFiles(cwd: string): string[]
 }

@@ -5,7 +5,7 @@ export const NS = 'orbit-model'
 
 /** English strings (the key-set source of truth for this pair). */
 export const en = {
-  triggerFallback: 'Orbit',
+  triggerFallback: 'Not configured',
   tooltip: 'Orbit model configuration',
   title: 'Orbit — Self-reviewing continuous execution',
   enableLongRun: 'Enable long-running execution',
@@ -31,7 +31,7 @@ export const en = {
 
 /** Chinese strings. */
 export const zh: Record<keyof typeof en, string> = {
-  triggerFallback: 'Orbit',
+  triggerFallback: '未配置',
   tooltip: 'Orbit 模型配置',
   title: 'Orbit 让AI自我审核连续执行',
   enableLongRun: '启用一键长执行',

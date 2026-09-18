@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -66,13 +66,21 @@ export class OrbitStateStore {
   }
 
   readRawState(): Record<string, unknown> | null {
+    if (!existsSync(this.statePath)) return null
+    let parsed: unknown
     try {
-      const parsed = JSON.parse(readFileSync(this.statePath, 'utf8')) as unknown
-      if (parsed !== null && typeof parsed === 'object') return parsed as Record<string, unknown>
-      return null
-    } catch {
-      return null
+      parsed = JSON.parse(readFileSync(this.statePath, 'utf8')) as unknown
+    } catch (error) {
+      throw new Error(`ORBIT_STATE_INVALID: 无法解析 ${this.statePath}：${error instanceof Error ? error.message : String(error)}`)
     }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`ORBIT_STATE_INVALID: ${this.statePath} 不是有效的对象状态。`)
+    }
+    const schema = (parsed as Record<string, unknown>)['schema_version']
+    if (typeof schema === 'number' && schema > ORBIT_SCHEMA_VERSION) {
+      throw new Error(`ORBIT_STATE_SCHEMA_UNSUPPORTED: ${this.statePath} 使用未来 schema_version=${schema}。`)
+    }
+    return parsed as Record<string, unknown>
   }
 
   readState(): OrbitState | null {

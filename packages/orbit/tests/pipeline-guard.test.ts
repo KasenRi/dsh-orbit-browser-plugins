@@ -9,6 +9,8 @@ function stubService(active: boolean, onBlock: (code: GuardCode) => void): Orbit
   return {
     hasActiveRun: () => active,
     githubAllowed: () => false,
+    browserToolNames: () => ['agent_browser'],
+    isMutationAuthorized: () => true,
     recordGuardBlock: async (code: GuardCode): Promise<GuardBlockOutcome> => {
       onBlock(code)
       return { disposition: 'block_continue', code, count: 1, watchdog_calls: 0, instruction: 'use a safer approach' }
@@ -74,4 +76,26 @@ test('cx_controller run is denied while another mutation driver is active', asyn
   const status = await handler({ name: 'cx_controller', arguments: { action: 'status' } }, async () => ({ kind: 'allow' }))
   assert.deepEqual(status, { kind: 'allow' })
   assert.equal(driverChecks, 1)
+})
+
+test('workspace mutation fence denies unrelated Agents but permits the owned Executor and read tools', async () => {
+  let blocked = 0
+  const service = stubService(true, () => { blocked += 1 })
+  Object.assign(service, {
+    browserToolNames: () => ['custom_browser'],
+    isMutationAuthorized: (agent: { id?: string }) => agent?.id === 'orbit-executor',
+  })
+  const handler = createOrbitPreExecuteHandler(service)
+  for (const name of ['bash', 'write', 'edit', 'str_replace_editor', 'custom_browser', 'create_goal', 'ralph', 'workflow']) {
+    const result = await handler({ name, agent: { id: 'other-subagent' }, arguments: {} }, async () => ({ kind: 'allow' }))
+    assert.equal(result.kind, 'deny')
+    if (result.kind === 'deny') assert.match(result.reason, /ORBIT_MUTATION_DRIVER_CONFLICT/)
+  }
+  assert.equal(blocked, 0, 'ownership denial must not alter guard recovery counters')
+  for (const name of ['write', 'bash', 'custom_browser']) {
+    assert.equal((await handler({ name, agent: { id: 'orbit-executor' }, arguments: {} }, async () => ({ kind: 'allow' }))).kind, 'allow')
+  }
+  for (const name of ['read', 'grep']) assert.equal((await handler({ name, agent: { id: 'parent' } }, async () => ({ kind: 'allow' }))).kind, 'allow')
+  const durableWrite = await handler({ name: 'custom_browser', agent: { id: 'orbit-executor' }, arguments: { outputPath: '.cx/state.json' } }, async () => ({ kind: 'allow' }))
+  assert.equal(durableWrite.kind, 'deny')
 })
