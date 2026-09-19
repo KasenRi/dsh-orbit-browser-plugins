@@ -112,9 +112,10 @@ provider/model provenance. The parent model and parent tools remain bypassed.
 
 ## Model configuration (Web)
 
-The Orbit model control sits immediately left of the native composer model
-seat (`conversation.input.right` renders before `conversation.input.model`).
-Its button names the Commander's model; the menu edits three roles:
+The Orbit model control is the final entry in `conversation.input.right`, so
+other composer-side controls (for example DSH's rollback control) stay to its
+left while the native `conversation.input.model` seat stays immediately to its
+right. Its button names the Commander's model; the menu edits three roles:
 
 - **Commander** and **Watchdog** pick from the same native model catalog and
   persist into the DSH `orbit` settings namespace (`settings.yaml`). Picking a
@@ -145,6 +146,11 @@ PLAN → EXECUTE → EVALUATE → SUCCESS
 ```
 
 - Only a normally completed Executor step consumes one loop from the budget.
+- Runs without an explicit user/tool budget start from the historical floor of
+  5 loops; after PLAN, Orbit deterministically reserves two extra bounded slots
+  beyond the accepted base plan (`max(5, steps + 2)`, therefore at most 7 for
+  the 1–5-step plan schema). Explicit `approved_loop_count` / `max_loops`
+  values are never enlarged automatically.
 - Corrections are limited per base step and reserve budget for the remaining
   planned steps.
 - Commander decisions are validated in code (`PASS_CURRENT_STEP` /

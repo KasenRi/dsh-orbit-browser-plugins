@@ -5,8 +5,9 @@
  * - Commander/Watchdog read and write the host `orbit` settings namespace.
  * - Executor reads and writes the SAME per-session ModelDirectory the native
  *   seat uses (`ctx.modelDirectories`), so one selection state backs both.
- * - The slot entry registers under `conversation.input.right`, which renders
- *   before `conversation.input.model`; the native seat stays untouched.
+ * - The slot entry registers as the final item in `conversation.input.right`,
+ *   so native/third-party right-side controls stay to its left while the
+ *   native `conversation.input.model` seat remains immediately to its right.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -27,6 +28,14 @@ import { routeFromSettingsValue, type OrbitModelInjected, type OrbitRouteValue, 
 
 /** The host settings namespace Orbit registers for its own two roles. */
 export const ORBIT_SETTINGS_NS = 'orbit'
+
+/**
+ * Keep Orbit as the final list entry in `conversation.input.right`.
+ * DSH renders the whole right list before the named model seat, so this gives
+ * the stable local order: other right-side controls → Orbit → model selector.
+ */
+export const ORBIT_INPUT_RIGHT_PRIORITY = Number.MAX_SAFE_INTEGER
+export const ORBIT_INPUT_RIGHT_ORDER = Number.MAX_SAFE_INTEGER
 
 /** Required client services: slots, the shared model directory, Remote (settings namespace), and locale. */
 export const inject = ['slots', 'modelDirectories', 'remote', 'remote.settings', 'locale']
@@ -157,7 +166,8 @@ export function apply(ctx: Context): void {
     scope.slots.inject('conversation.input.right', () => scope.slots.register({
       name: 'conversation.input.right',
       id: 'orbit-model',
-      order: 10,
+      priority: ORBIT_INPUT_RIGHT_PRIORITY,
+      order: ORBIT_INPUT_RIGHT_ORDER,
       locale: NS,
       inject: injected,
     }, OrbitModelSelect))

@@ -73,6 +73,8 @@ export interface OrbitState extends Record<string, unknown> {
   preset: string
   routes: OrbitRoutes
   loop: { used: number; max: number }
+  /** New runs record whether the loop cap came from Orbit or an explicit caller. Old states may omit it. */
+  loop_budget_mode?: 'automatic' | 'explicit'
   approved_loop_count: number
   remaining_budget: number
   loop_count: number
@@ -192,6 +194,9 @@ export const MAX_EXECUTOR_INTERRUPT_RETRIES = 2
 export const MAX_PLAN_STEPS = 5
 export const MIN_PLAN_STEPS = 1
 export const DEFAULT_LOOP_BUDGET = 5
+/** Automatic runs reserve two bounded execution slots beyond the accepted base plan. */
+export const AUTOMATIC_LOOP_RECOVERY_RESERVE = 2
+export const MAX_AUTOMATIC_LOOP_BUDGET = MAX_PLAN_STEPS + AUTOMATIC_LOOP_RECOVERY_RESERVE
 
 export const GUARD_FIRST_INSTRUCTION =
   '请改用更安全的方法继续当前任务，不要原样重试刚被阻断的操作。'

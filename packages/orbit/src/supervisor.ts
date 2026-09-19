@@ -39,6 +39,7 @@ import {
   createInitialState,
   enterBudgetExhausted,
   enterNeedsUser,
+  ensureAutomaticLoopBudgetForPlan,
   markStrategyChallengeUsed,
   normalizePlan,
   openWatchdogAttempt,
@@ -468,6 +469,7 @@ export class OrbitSupervisor {
     try {
       const plan = normalizePlan(outcome.structured as { summary?: unknown; steps?: unknown })
       applyPlan(state, plan)
+      ensureAutomaticLoopBudgetForPlan(state)
       this.store.writeState(state)
       return undefined
     } catch (error) {

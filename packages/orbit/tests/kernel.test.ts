@@ -20,6 +20,8 @@ import {
   createInitialState,
   enterBudgetExhausted,
   enterNeedsUser,
+  ensureAutomaticLoopBudgetForPlan,
+  automaticLoopBudgetForPlan,
   explicitLoopBudget,
   hashGoal,
   isBaseStepId,
@@ -127,7 +129,37 @@ test('uses one predictable default loop budget regardless of goal wording', () =
   for (const goal of ['production migration', 'UI integration', 'fix bug', 'say hello']) {
     const initial = createInitialState({ runId: goal, now: 0, goal, routes: ROUTES, githubAllowed: false })
     assert.equal(initial.loop.max, 5)
+    assert.equal(initial.loop_budget_mode, 'automatic')
   }
+})
+
+test('automatic loop budget follows accepted plan size with two bounded recovery slots', () => {
+  assert.equal(automaticLoopBudgetForPlan(1), 5)
+  assert.equal(automaticLoopBudgetForPlan(2), 5)
+  assert.equal(automaticLoopBudgetForPlan(3), 5)
+  assert.equal(automaticLoopBudgetForPlan(4), 6)
+  assert.equal(automaticLoopBudgetForPlan(5), 7)
+  assert.throws(() => automaticLoopBudgetForPlan(0), /ORBIT_PLAN_STEP_COUNT_INVALID/)
+  assert.throws(() => automaticLoopBudgetForPlan(6), /ORBIT_PLAN_STEP_COUNT_INVALID/)
+})
+
+test('only automatic budgets expand after PLAN; explicit and legacy budgets remain untouched', () => {
+  const automatic = createInitialState({ runId: 'a', now: 0, goal: 'g', routes: ROUTES, githubAllowed: false })
+  automatic.plan = { summary: 'four', steps: [step('P0'), step('P1'), step('P2'), step('P3')] }
+  ensureAutomaticLoopBudgetForPlan(automatic)
+  assert.deepEqual(automatic.loop, { used: 0, max: 6 })
+  assert.equal(automatic.approved_loop_count, 6)
+
+  const explicit = createInitialState({ runId: 'e', now: 0, goal: 'g', routes: ROUTES, approvedLoopCount: 3, githubAllowed: false })
+  explicit.plan = { summary: 'five', steps: [step('P0'), step('P1'), step('P2'), step('P3'), step('P4')] }
+  ensureAutomaticLoopBudgetForPlan(explicit)
+  assert.deepEqual(explicit.loop, { used: 0, max: 3 })
+  assert.equal(explicit.loop_budget_mode, 'explicit')
+
+  const legacy = state({ loop: { used: 0, max: 5 }, approved_loop_count: 5, loop_budget_mode: undefined })
+  legacy.plan = { summary: 'five', steps: [step('P0'), step('P1'), step('P2'), step('P3'), step('P4')] }
+  ensureAutomaticLoopBudgetForPlan(legacy)
+  assert.deepEqual(legacy.loop, { used: 0, max: 5 })
 })
 
 test('updates the loop budget without losing used slots', () => {
@@ -195,6 +227,7 @@ test('initial state follows the kernel rules', () => {
   assert.equal(initial.goal_hash, hashGoal('fix a bug'))
   assert.equal(initial.updated_at, '2026-01-02T03:04:05.000Z')
   assert.deepEqual(initial.loop, { used: 0, max: 4 })
+  assert.equal(initial.loop_budget_mode, 'explicit')
   assert.equal(initial.remaining_budget, 4)
   assert.equal(initial.loop_count, 0)
   assert.deepEqual(initial.plan, { summary: '', steps: [] })
@@ -203,9 +236,10 @@ test('initial state follows the kernel rules', () => {
   assert.equal(initial.interruption_retries, 0)
 })
 
-test('initial state uses the fixed default budget when none is explicit', () => {
+test('initial state uses the fixed pre-PLAN floor when none is explicit', () => {
   const initial = createInitialState({ runId: 'r', now: 0, goal: 'ship a UI integration', routes: ROUTES, githubAllowed: false })
   assert.equal(initial.loop.max, 5)
+  assert.equal(initial.loop_budget_mode, 'automatic')
 })
 
 test('resumeFromNeedsUser re-enters EXECUTE', () => {

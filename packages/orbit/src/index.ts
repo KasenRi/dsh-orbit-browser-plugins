@@ -13,12 +13,6 @@ import { createOrbitTool } from './tool.ts'
 import type { OrbitActionResult, OrbitRoute } from './types.ts'
 import type { OrbitConfiguredRoutes } from './routes.ts'
 
-/**
- * Fixed hard-activation budget. Explicit tool calls may still supply a bounded
- * user-owned budget; ordinary activation never guesses complexity from words.
- */
-const HARD_ACTIVATION_LOOP_BUDGET = 5
-
 export const name = 'dsh-orbit'
 export const inject = ['tools', 'agents', 'subagents']
 
@@ -162,10 +156,7 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
       try {
         // The initiator scope makes the run's children belong to this Agent;
         // the parent model is never asked to decide or to run the task.
-        result = await ctx.agents.withInitiator(agent, () => service.run({
-          goal,
-          approved_loop_count: HARD_ACTIVATION_LOOP_BUDGET,
-        }, cwd, signal))
+        result = await ctx.agents.withInitiator(agent, () => service.run({ goal }, cwd, signal))
       } catch (error) {
         appendOrbitNotice(agent.session, `Orbit 启动失败：${error instanceof Error ? error.message : String(error)}`)
         return

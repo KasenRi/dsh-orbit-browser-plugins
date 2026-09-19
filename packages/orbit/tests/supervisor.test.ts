@@ -126,6 +126,127 @@ test('loop budget reservation protects later steps', async () => {
   cleanup()
 })
 
+test('automatic budget lets a four-step plan absorb one correction and still finish', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([
+        { id: 'P0', goal: 'a' },
+        { id: 'P1', goal: 'b' },
+        { id: 'P2', goal: 'c' },
+        { id: 'P3', goal: 'd' },
+      ]) },
+      { structured: commander({ decision: 'CORRECT_CURRENT_STEP', next_step_goal: 'fix a' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { output: 'a needs correction', childId: 'e0' },
+      { output: 'a fixed', childId: 'e0-2' },
+      { output: 'b done', childId: 'e1' },
+      { output: 'c done', childId: 'e2' },
+      { output: 'd done', childId: 'e3' },
+    ])
+  const result = await make(host, dir).bootstrap({ goal: 'automatic four-step correction' })
+  assert.equal(result.phase, 'SUCCESS')
+  assert.deepEqual(result.data?.['loop'], { used: 5, max: 6 })
+  cleanup()
+})
+
+test('explicit low budget is never enlarged by the accepted plan', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([
+        { id: 'P0', goal: 'a' },
+        { id: 'P1', goal: 'b' },
+        { id: 'P2', goal: 'c' },
+        { id: 'P3', goal: 'd' },
+      ]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+    ])
+    .script('executor', [
+      { output: 'a', childId: 'e0' },
+      { output: 'b', childId: 'e1' },
+      { output: 'c', childId: 'e2' },
+    ])
+  const result = await make(host, dir).bootstrap({ goal: 'explicit budget stays exact', approved_loop_count: 3 })
+  assert.equal(result.phase, 'BUDGET_EXHAUSTED')
+  assert.deepEqual(result.data?.['loop'], { used: 3, max: 3 })
+  cleanup()
+})
+
+test('automatic budget keeps a five-step normal plan bounded with recovery reserve', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([
+        { id: 'P0', goal: 'a' },
+        { id: 'P1', goal: 'b' },
+        { id: 'P2', goal: 'c' },
+        { id: 'P3', goal: 'd' },
+        { id: 'P4', goal: 'e' },
+      ]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { output: 'a', childId: 'e0' },
+      { output: 'b', childId: 'e1' },
+      { output: 'c', childId: 'e2' },
+      { output: 'd', childId: 'e3' },
+      { output: 'e', childId: 'e4' },
+    ])
+  const result = await make(host, dir).bootstrap({ goal: 'automatic five-step plan' })
+  assert.equal(result.phase, 'SUCCESS')
+  assert.deepEqual(result.data?.['loop'], { used: 5, max: 7 })
+  cleanup()
+})
+
+test('automatic four-step plan survives one runtime watchdog recovery without spending extra loop slots', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([
+        { id: 'P0', goal: 'a' },
+        { id: 'P1', goal: 'b' },
+        { id: 'P2', goal: 'c' },
+        { id: 'P3', goal: 'd' },
+      ]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { output: '', interrupted: true, reason: 'controlled-timeout', childId: 'e0' },
+      { output: 'a recovered', childId: 'e0' },
+      { output: 'b', childId: 'e1' },
+      { output: 'c', childId: 'e2' },
+      { output: 'd', childId: 'e3' },
+    ])
+    .script('watchdog', [{ structured: commander({ decision: 'RESUME_CHILD' }) }])
+  const result = await make(host, dir).bootstrap({ goal: 'automatic four-step recovery' })
+  assert.equal(result.phase, 'SUCCESS')
+  assert.deepEqual(result.data?.['loop'], { used: 4, max: 6 })
+  assert.equal(host.scriptsFor('watchdog').length, 1)
+  cleanup()
+})
+
 test('strategy REPLACE_CURRENT_STEP replaces goal', async () => {
   const { dir, cleanup } = project()
   const host = new FakeHost()

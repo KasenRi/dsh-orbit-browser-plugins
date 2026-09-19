@@ -775,7 +775,8 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     assert.ok(state, 'the host must have written durable run state')
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.goal, 'create the hard activation proof')
-    assert.equal(Number(state.approved_loop_count), 5, 'hard activation uses one fixed predictable budget')
+    assert.equal(Number(state.approved_loop_count), 6, 'four-step hard activation reserves two bounded recovery slots')
+    assert.equal(state.loop_budget_mode, 'automatic')
     assert.equal(adapter.executorCalls, 4, 'all four Executor steps must run through the real Orbit chain')
     assert.ok(adapter.seen.some((entry) => entry.includes('Orbit 指挥官')), 'the Commander must actually plan')
 

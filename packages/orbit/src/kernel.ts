@@ -9,6 +9,8 @@
 import {
   MAX_CORRECTION_DEPTH,
   DEFAULT_LOOP_BUDGET,
+  AUTOMATIC_LOOP_RECOVERY_RESERVE,
+  MAX_AUTOMATIC_LOOP_BUDGET,
   MAX_PLAN_STEPS,
   MAX_WATCHDOG_CALLS_PER_STEP,
   MIN_PLAN_STEPS,
@@ -109,6 +111,32 @@ export function updateLoopBudget(state: OrbitState, budget: number): void {
   state.remaining_budget = Math.max(0, budget - state.loop.used)
 }
 
+/**
+ * Deterministic budget for an Orbit-owned run after PLAN is known.
+ * Small plans keep the historical floor of five; four/five-step plans gain two
+ * bounded recovery slots, with a hard automatic ceiling of seven.
+ */
+export function automaticLoopBudgetForPlan(stepCount: number): number {
+  if (!Number.isSafeInteger(stepCount) || stepCount < MIN_PLAN_STEPS || stepCount > MAX_PLAN_STEPS) {
+    throw new Error(`ORBIT_PLAN_STEP_COUNT_INVALID: expected ${MIN_PLAN_STEPS}-${MAX_PLAN_STEPS}, got ${stepCount}`)
+  }
+  return Math.min(
+    MAX_AUTOMATIC_LOOP_BUDGET,
+    Math.max(DEFAULT_LOOP_BUDGET, stepCount + AUTOMATIC_LOOP_RECOVERY_RESERVE),
+  )
+}
+
+/**
+ * Expand only Orbit-owned automatic budgets. Explicit user/tool budgets and
+ * old states without a recorded mode are never silently increased.
+ */
+export function ensureAutomaticLoopBudgetForPlan(state: OrbitState): void {
+  if (state.loop_budget_mode !== 'automatic') return
+  const baseSteps = state.plan.steps.filter((step) => isBaseStepId(step.id)).length
+  const target = automaticLoopBudgetForPlan(baseSteps)
+  if (target > state.loop.max) updateLoopBudget(state, target)
+}
+
 export function hashGoal(goal: string): string {
   let hash = 0
   for (let index = 0; index < goal.length; index += 1) {
@@ -179,9 +207,8 @@ export interface InitialStateInput {
 }
 
 export function createInitialState(input: InitialStateInput): OrbitState {
-  const max =
-    explicitLoopBudget({ approved_loop_count: input.approvedLoopCount, max_loops: input.maxLoops }) ??
-    DEFAULT_LOOP_BUDGET
+  const explicit = explicitLoopBudget({ approved_loop_count: input.approvedLoopCount, max_loops: input.maxLoops })
+  const max = explicit ?? DEFAULT_LOOP_BUDGET
   return {
     schema_version: ORBIT_SCHEMA_VERSION,
     active_run_id: input.runId,
@@ -196,6 +223,7 @@ export function createInitialState(input: InitialStateInput): OrbitState {
     preset: input.preset ?? 'orbit-lite',
     routes: structuredClone(input.routes),
     loop: { used: 0, max },
+    loop_budget_mode: explicit === undefined ? 'automatic' : 'explicit',
     approved_loop_count: max,
     remaining_budget: max,
     loop_count: 0,

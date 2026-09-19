@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { ModelDirectoryState } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { ModelSelection } from '@deepseek-ai/dsh-api-remotes/client'
-import { apply, inject, ORBIT_SETTINGS_NS } from '../index.ts'
+import { apply, inject, ORBIT_INPUT_RIGHT_ORDER, ORBIT_INPUT_RIGHT_PRIORITY, ORBIT_SETTINGS_NS } from '../index.ts'
 import type { OrbitModelInjected, OrbitRouteValue } from '../model-options.ts'
 
 interface Registration {
@@ -10,6 +10,7 @@ interface Registration {
   name: string
   id?: string
   order?: number
+  priority?: number
   locale?: string
   inject?: (sessionId: string) => OrbitModelInjected
   component?: unknown
@@ -89,6 +90,7 @@ function buildContext(options: {
               name: String(definition['name']),
               ...(typeof definition['id'] === 'string' ? { id: definition['id'] } : {}),
               ...(typeof definition['order'] === 'number' ? { order: definition['order'] } : {}),
+              ...(typeof definition['priority'] === 'number' ? { priority: definition['priority'] } : {}),
               ...(typeof definition['locale'] === 'string' ? { locale: definition['locale'] } : {}),
               ...(typeof definition['inject'] === 'function'
                 ? { inject: definition['inject'] as Registration['inject'] }
@@ -130,6 +132,8 @@ describe('Orbit client plugin wiring', () => {
     const entry = registrations[0]!
     expect(entry.name).toBe('conversation.input.right')
     expect(entry.id).toBe('orbit-model')
+    expect(entry.priority).toBe(ORBIT_INPUT_RIGHT_PRIORITY)
+    expect(entry.order).toBe(ORBIT_INPUT_RIGHT_ORDER)
     expect(entry.locale).toBe('orbit-model')
     expect(registrations.some((registration) => registration.name === 'conversation.input.model')).toBe(false)
   })
