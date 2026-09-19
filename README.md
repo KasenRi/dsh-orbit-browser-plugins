@@ -3,6 +3,54 @@
 Community plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Not affiliated with or endorsed by DeepSeek.
 
+> **让 AI 不只是回答问题，而是真的把任务做完。**
+>
+> 这是一组面向 DeepSeek Harness 的实用插件：Orbit 负责把一个完整目标拆成步骤、分配给不同模型执行并持续检查结果；Browser 负责让 AI 真正操作浏览器。两者可以独立使用，也可以组合成一个能够持续推进项目、自动处理网页任务的 AI 工作流。
+
+## 给普通用户看的介绍
+
+### @kasenri/dsh-orbit — 让 AI 项目在无人监管下持续推进
+
+你只需要告诉 AI 最终目标，Orbit 会负责把任务拆成多个步骤，安排执行、逐步检查，并在还有工作没完成时继续推进，而不是每做一步都等你重新下指令。
+
+Orbit 把工作分成不同角色：更强的模型可以负责规划和审核，价格更低的模型负责大量实际执行，因此可以在保证关键环节质量的同时，让低成本模型也真正参与到工程里，**降低整个项目使用 AI 的总成本**。
+
+同时，Smart Watchdog 会关注运行中的异常情况。如果执行器长时间没有进展、出现卡死、超时或中断，Watchdog 可以介入诊断，并尝试恢复任务，而不是让整个工程静默停在那里。
+
+适合的场景包括：代码修改、项目维护、批量文件处理、自动测试、需要多步骤推进的工程任务，以及你希望“交代完目标以后先让 AI 自己干”的工作。
+
+### @kasenri/dsh-browser — 让 AI 真正操作浏览器完成任务
+
+Browser 给 DSH 增加真实浏览器操作能力。AI 可以打开网页、点击按钮、输入内容、翻页、读取页面信息、下载文件，并把浏览器操作作为整个任务的一部分继续执行。
+
+它适合网页测试、信息采集、后台操作、表单处理和其他需要真实浏览器交互的自动化任务，同时提供域名限制等安全控制，避免浏览器能力无限制地访问不相关站点。
+
+### 两个插件一起使用
+
+组合后，一个典型任务可以变成：
+
+```text
+你给出最终目标
+      ↓
+Orbit 自动规划任务
+      ↓
+Commander 负责规划 / 审核
+      ↓
+Executor 负责实际执行
+      ↓
+需要网页时调用 Browser
+      ↓
+Watchdog 处理卡死 / 超时 / 中断
+      ↓
+逐步检查并继续推进
+      ↓
+完成目标并返回最终结果
+```
+
+Orbit 和 Browser 彼此独立：只需要自动工程编排时可以只安装 Orbit，只需要浏览器能力时可以只安装 Browser；当 Orbit 的某一步需要访问网页时，再组合使用 Browser。
+
+## Technical overview
+
 This monorepo publishes two independent Cordis plugins:
 
 | Package | Role |
@@ -10,22 +58,11 @@ This monorepo publishes two independent Cordis plugins:
 | [`@kasenri/dsh-orbit`](packages/orbit) | Deterministic engineering orchestration (`orbit_controller` tool + `OrbitService`). |
 | [`@kasenri/dsh-browser`](packages/browser) | Controlled browser automation (`agent_browser` tool + `BrowserAutomationService`). |
 
-Orbit is a deterministic engineering orchestration runtime for DeepSeek Harness.
-It coordinates planning, execution, evaluation, bounded correction, runtime
-recovery and durable state through a minimal Commander / Executor / Smart
-Watchdog architecture. Orbit 强调的是一个“有界、自我收敛的工程执行轨道”：
+Orbit uses a bounded Commander / Executor / Smart Watchdog architecture:
 
 ```text
 PLAN → EXECUTE → EVALUATE → CORRECT / RECOVER → SUCCESS
 ```
-
-Orbit is not a timer loop, an infinite auto-continue, a pure reviewer, a pure
-planner, or an agent swarm. It is a deterministic supervisor plus Commander,
-Executor, Smart Watchdog, durable state and bounded recovery.
-
-The two packages are decoupled: the browser plugin is a shared capability and
-Orbit works without it. Only a plan step that declares the `browser` capability
-needs the `agent_browser` tool to be registered.
 
 ```text
 DeepSeek Harness
