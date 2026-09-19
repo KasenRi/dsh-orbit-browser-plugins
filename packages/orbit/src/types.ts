@@ -166,6 +166,12 @@ export interface OrbitActionResult {
   phase?: OrbitPhase
   status?: OrbitStatus
   message?: string
+  /** Presentation-only Final Commander result; never persisted as state. */
+  final_output?: {
+    text: string
+    provider: string
+    model: string
+  }
   data?: Record<string, unknown>
 }
 

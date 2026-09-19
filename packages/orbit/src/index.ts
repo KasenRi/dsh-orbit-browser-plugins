@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-settings'
-import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { AssistantStreamAccumulator, boundContextSummary, createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { installOrbitGestureBoundary, registerOrbitCommand, registerOrbitToggleCommand } from './activation.ts'
@@ -156,7 +156,7 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
 
   installOrbitGestureBoundary(ctx, {
     sessionEnabled: (session) => orbitEnabledOf(ctx, session),
-    activate: async (agent, goal, signal) => {
+    activate: async (agent, goal, position, signal) => {
       const cwd = agent.session.header.cwd ?? process.cwd()
       let result: OrbitActionResult
       try {
@@ -168,6 +168,10 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
         }, cwd, signal))
       } catch (error) {
         appendOrbitNotice(agent.session, `Orbit 启动失败：${error instanceof Error ? error.message : String(error)}`)
+        return
+      }
+      if (result.ok && result.phase === 'SUCCESS' && result.final_output !== undefined) {
+        appendOrbitFinalOutput(agent.session, position, result.final_output)
         return
       }
       const notice = activationNotice(result)
@@ -200,6 +204,31 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
       },
     })
     ctx.on('tools/pre-execute', (exec, next) => handler(exec as never, next as never) as never)
+  }
+}
+
+/** Append the existing Final Commander answer as this consumed turn's sole assistant result. */
+function appendOrbitFinalOutput(
+  session: Session,
+  position: { turn: number; step: number },
+  output: NonNullable<OrbitActionResult['final_output']>,
+): void {
+  const message = createAssistantMessage({
+    content: [{ type: 'text', text: output.text }],
+    source: { provider: output.provider, model: output.model },
+  })
+  const stream = new AssistantStreamAccumulator()
+  const time = Date.now()
+  stream.push({ time, chunk: { type: 'block-start', index: 0, blockType: 'text' } })
+  stream.push({ time, chunk: { type: 'text-delta', index: 0, text: output.text } })
+  stream.push({ time, chunk: { type: 'block-end', index: 0, block: { type: 'text', text: output.text } } })
+  stream.push({ time, chunk: { type: 'finish', reason: { kind: 'stop' } } })
+
+  session.append('step/start', position)
+  try {
+    session.append('assistant/message', { ...position, message, stream: [...stream.snapshot()] }, { surfaceOp: 'append' })
+  } finally {
+    session.append('step/end', position)
   }
 }
 

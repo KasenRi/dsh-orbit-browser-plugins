@@ -242,7 +242,7 @@ const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extension
 遥测：${JSON.stringify(telemetry ?? {})}`
 
 type CommanderOutcome =
-  | { kind: 'decision'; decision: CommanderDecision }
+  | { kind: 'decision'; decision: CommanderDecision; output: string }
   | { kind: 'interrupted'; reason: string }
   | { kind: 'needs_user'; reason: string }
 
@@ -501,7 +501,7 @@ export class OrbitSupervisor {
     if (outcome.kind === 'interrupted') return { kind: 'interrupted', reason: outcome.reason }
     try {
       const decision = assertCommanderDecision(outcome.structured as CommanderDecision, mode)
-      return { kind: 'decision', decision }
+      return { kind: 'decision', decision, output: outcome.output }
     } catch (error) {
       // Invalid/temporary output is recoverable; it must not become NEEDS_USER.
       return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
@@ -565,7 +565,7 @@ export class OrbitSupervisor {
           if (raced.value.structured === undefined) {
             return { kind: 'interrupted', reason: `${mode}_STRUCTURED_OUTPUT_MISSING` }
           }
-          return { kind: 'output', output: raced.value.output, structured: raced.value.structured }
+          return { kind: 'output', output: raced.value.visibleOutput ?? raced.value.output, structured: raced.value.structured }
         }
         if (raced.kind === 'aborted' || signal?.aborted) {
           await this.cancelHandle(handle, 'ORBIT_ABORTED')
@@ -787,7 +787,7 @@ export class OrbitSupervisor {
     if (decision.decision === 'SUCCESS') {
       applyFinalSuccess(state, decision.summary)
       this.store.writeState(state)
-      return this.result(state, true)
+      return this.result(state, true, undefined, outcome.output)
     }
 
     if (decision.decision === 'PASS_CURRENT_STEP') {
@@ -1101,7 +1101,7 @@ export class OrbitSupervisor {
     return this.result(state, true)
   }
 
-  private result(state: OrbitState, ok: boolean, message?: string): OrbitActionResult {
+  private result(state: OrbitState, ok: boolean, message?: string, finalOutput?: string): OrbitActionResult {
     // Tool output must be lossless JSON: optional state fields are omitted, not
     // emitted as `undefined`.
     const data = {
@@ -1124,6 +1124,7 @@ export class OrbitSupervisor {
       driver_ownership: state.driver_ownership,
       state_revision: state.state_revision,
     }
+    const displayText = state.phase === 'SUCCESS' ? finalOutput?.trim() || state.commander?.summary?.trim() : undefined
     return {
       ok,
       action: 'run',
@@ -1131,6 +1132,13 @@ export class OrbitSupervisor {
       phase: state.phase,
       status: state.status,
       ...(message ? { message } : {}),
+      ...(displayText ? {
+        final_output: {
+          text: displayText,
+          provider: state.routes.commander.provider,
+          model: state.routes.commander.model,
+        },
+      } : {}),
       data: Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined)),
     }
   }

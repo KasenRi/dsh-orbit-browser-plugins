@@ -31,6 +31,8 @@ export interface RoleRunRequest {
 export interface RoleRunResult {
   childId?: string
   output: string
+  /** Text blocks only, excluding reasoning, tool calls, and structured output. */
+  visibleOutput?: string
   interrupted: boolean
   reason?: string
   capabilityUnavailable?: string

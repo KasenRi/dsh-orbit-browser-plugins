@@ -1,6 +1,6 @@
 {
   "name": "@kasenri/dsh-orbit",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "type": "module",
   "description": "Deterministic engineering orchestration for DeepSeek Harness with Commander, Executor, Smart Watchdog, bounded recovery and durable execution state.",
   "license": "MIT",

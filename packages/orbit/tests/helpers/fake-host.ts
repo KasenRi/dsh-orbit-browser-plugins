@@ -6,6 +6,7 @@ import type { OrbitRole, OrbitRoute } from '../../src/types.ts'
 
 export interface RoleScript {
   output?: string
+  visibleOutput?: string
   structured?: unknown
   interrupted?: boolean
   reason?: string
@@ -81,6 +82,7 @@ export class FakeHost implements OrbitHost {
         : Promise.resolve({
             childId,
             output: script.output ?? '',
+            ...(script.visibleOutput !== undefined ? { visibleOutput: script.visibleOutput } : {}),
             interrupted: script.interrupted === true,
             ...(script.structured !== undefined ? { structured: script.structured } : {}),
             ...(script.reason ? { reason: script.reason } : {}),

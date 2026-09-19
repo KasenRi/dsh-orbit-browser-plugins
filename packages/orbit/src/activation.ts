@@ -137,7 +137,7 @@ export interface OrbitGestureBoundaryOptions {
    * only after the run settles, so the consumed turn owns exactly one mutation
    * driver.
    */
-  activate?: (agent: Agent, goal: string, signal: AbortSignal) => Promise<void>
+  activate?: (agent: Agent, goal: string, position: { turn: number; step: number }, signal: AbortSignal) => Promise<void>
 }
 
 /**
@@ -149,7 +149,8 @@ export interface OrbitGestureBoundaryOptions {
  * call while the message stays in the conversation as durable history.
  */
 export function installOrbitGestureBoundary(ctx: Context, options: OrbitGestureBoundaryOptions = {}): void {
-  ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
+  ctx.on('agent/pre-step', async (payload, next): Promise<PreStepDecision> => {
+    const { agent, messages, signal } = payload
     const decision = await next()
     if (decision.kind === 'reject') return decision
 
@@ -166,7 +167,7 @@ export function installOrbitGestureBoundary(ctx: Context, options: OrbitGestureB
     // The claimed batch enters the conversation exactly once: the loop commits
     // `decision.messages`, which this path leaves empty.
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
-    await activate(agent, goal, signal)
+    await activate(agent, goal, { turn: payload.turn, step: payload.step }, signal)
     return { kind: 'enter', messages: [] }
   })
 }

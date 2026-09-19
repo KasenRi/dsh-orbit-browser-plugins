@@ -104,6 +104,9 @@ Orbit supports three activation styles:
 
 All three routes converge on the existing `orbit_controller` tool and
 `OrbitService`; the activation layer never starts a run of its own.
+After a hard-activated run reaches `SUCCESS`, the initiating Session displays
+the Final Commander's user-visible result directly, with the Commander's frozen
+provider/model provenance. The parent model and parent tools remain bypassed.
 
 ## Model configuration (Web)
 

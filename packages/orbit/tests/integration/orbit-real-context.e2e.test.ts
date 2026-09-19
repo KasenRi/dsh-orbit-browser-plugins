@@ -31,6 +31,8 @@ interface AdapterScript {
   /** Successive STEP_EVALUATE replies; the last one repeats. */
   stepEvaluates?: string[]
   finalEvaluate?: string
+  /** Visible text emitted before the FINAL_EVALUATE structured capture. */
+  finalVisibleText?: string
   strategyChallenge?: string
   strategyReconsider?: string
   runtimeDiagnose?: string
@@ -47,7 +49,7 @@ class ScriptedAdapter extends LlmAdapter {
   /** Every full prompt the adapter answered, in order. */
   readonly prompts: string[] = []
   /** The provider/model route of every request, in order, with a prompt head. */
-  readonly requests: Array<{ provider: string; model: string; reasoningEffort?: string; prompt: string }> = []
+  readonly requests: Array<{ sessionId?: string; provider: string; model: string; reasoningEffort?: string; prompt: string }> = []
   executorCalls = 0
   private stepEvaluateCalls = 0
   private readonly script: AdapterScript
@@ -90,6 +92,7 @@ class ScriptedAdapter extends LlmAdapter {
     this.seen.push(prompt.slice(0, 80))
     this.prompts.push(prompt)
     this.requests.push({
+      ...(options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) }),
       provider: options.provider,
       model: options.model,
       ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: String(options.reasoningEffort) }),
@@ -121,7 +124,7 @@ class ScriptedAdapter extends LlmAdapter {
       this.stepEvaluateCalls += 1
       structured = true
     } else if (prompt.includes('FINAL_EVALUATE')) {
-      reply = this.script.finalEvaluate ?? '{"decision":"SUCCESS"}'
+      reply = this.script.finalEvaluate ?? '{"decision":"SUCCESS","summary":"scripted final summary"}'
       structured = true
     } else if (prompt.includes('STRATEGY_CHALLENGE')) {
       reply = this.script.strategyChallenge ?? '{"question":"is this tunnel vision?"}'
@@ -141,10 +144,16 @@ class ScriptedAdapter extends LlmAdapter {
     }
 
     if (structured) {
+      if (prompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText) {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: this.script.finalVisibleText }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: this.script.finalVisibleText } }
+      }
       const callId = ToolCallId(`structured-${this.seen.length}`)
-      yield { type: 'block-start', index: 0, blockType: 'tool-call' }
-      yield { type: 'tool-call-delta', index: 0, id: callId, name: 'structured_output', argumentsDelta: reply }
-      yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'structured_output', arguments: reply } }
+      const index = prompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText ? 1 : 0
+      yield { type: 'block-start', index, blockType: 'tool-call' }
+      yield { type: 'tool-call-delta', index, id: callId, name: 'structured_output', argumentsDelta: reply }
+      yield { type: 'block-end', index, block: { type: 'tool-call', id: callId, name: 'structured_output', arguments: reply } }
       yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
       return
@@ -253,6 +262,12 @@ test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a comp
     )
     assert.equal(result.ok, true, result.message)
     assert.equal(result.phase, 'SUCCESS')
+    assert.equal(result.final_output?.text, 'scripted final summary', 'tool callers retain the final result as JSON data')
+    assert.equal(
+      assistantMessagesOf(parent.agent).filter((message) => textOf(message).includes('scripted final summary')).length,
+      0,
+      'direct service/tool-style calls never project the hard-activation final result',
+    )
     const state = JSON.parse(readFileSync(join(project.dir, '.cx', 'state.json'), 'utf8')) as { phase: string; driver_ownership: string }
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.driver_ownership, 'CLOSED')
@@ -463,6 +478,10 @@ interface SessionMessageLike {
   content: Array<{ type?: string; text?: string }>
 }
 
+interface AssistantMessageLike extends SessionMessageLike {
+  source: { kind?: string; provider?: string; model?: string }
+}
+
 function userMessagesOf(agent: {
   session?: { snapshotEvents?: () => readonly { type?: string; data?: unknown }[] }
 }): SessionMessageLike[] {
@@ -470,6 +489,19 @@ function userMessagesOf(agent: {
   return events
     .filter((event) => event.type === 'user/message')
     .map((event) => event.data as SessionMessageLike)
+}
+
+function assistantMessagesOf(agent: {
+  session?: { snapshotEvents?: () => readonly { type?: string; data?: unknown }[] }
+}): AssistantMessageLike[] {
+  const events = agent.session?.snapshotEvents?.() ?? []
+  return events
+    .filter((event) => event.type === 'assistant/message')
+    .map((event) => (event.data as { message: AssistantMessageLike }).message)
+}
+
+function parentModelCalls(adapter: ScriptedAdapter, parent: { agent: { session: { id: unknown } } }): number {
+  return adapter.requests.filter((request) => request.sessionId === String(parent.agent.session.id)).length
 }
 
 function textOf(message: SessionMessageLike): string {
@@ -480,7 +512,10 @@ function textOf(message: SessionMessageLike): string {
 }
 
 test('real host command: /agent-orbit is registered, preserved in history, and hard-activates once', { timeout: 120_000 }, async () => {
-  const adapter = new ScriptedAdapter()
+  const adapter = new ScriptedAdapter({
+    finalVisibleText: 'Explicit Final Commander result',
+    finalEvaluate: '{"decision":"SUCCESS","summary":"explicit durable summary"}',
+  })
   const root = await boot(adapter)
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-orbit-command')
@@ -513,16 +548,17 @@ test('real host command: /agent-orbit is registered, preserved in history, and h
     const state = readRunState(project.dir)
     assert.equal(state?.goal, 'implement the deterministic fix')
     assert.equal(state?.phase, 'SUCCESS')
-    assert.equal(
-      parent.agent.session.snapshotEvents().filter((event) => event.type === 'assistant/message').length,
-      0,
-      'the parent model must not run for an explicit /agent-orbit turn',
-    )
+    assert.equal(parentModelCalls(adapter, parent), 0, 'the parent model must not run for an explicit /agent-orbit turn')
     assert.equal(
       parent.agent.session.snapshotEvents().filter((event) => event.type === 'tool/call').length,
       0,
       'the parent must not run tools for an explicit /agent-orbit turn',
     )
+    const finals = assistantMessagesOf(parent.agent)
+    assert.equal(finals.length, 1, 'the explicit activation must surface exactly one final result')
+    assert.equal(textOf(finals[0] as SessionMessageLike), 'Explicit Final Commander result')
+    assert.equal(finals[0]?.source.provider, 'fake')
+    assert.equal(finals[0]?.source.model, 'fm')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -577,11 +613,8 @@ test('real host gesture: genuine /agent-orbit hard-activates while OFF; ordinary
     )
     // Only the ordinary turn reached the parent model: the /agent-orbit turn
     // was consumed by the host.
-    assert.equal(
-      parent.agent.session.snapshotEvents().filter((event) => event.type === 'assistant/message').length,
-      1,
-      'exactly the ordinary chat turn must reach the parent model',
-    )
+    assert.equal(parentModelCalls(adapter, parent), 1, 'only the ordinary chat turn must reach the parent model')
+    assert.equal(assistantMessagesOf(parent.agent).length, 2, 'native reply plus one Orbit final result must be visible')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -715,7 +748,14 @@ test('real session toggle: turning OFF during an active run never stops or mutat
 })
 
 test('real host hard activation: an enabled Session runs Orbit from an ordinary message without the parent model', { timeout: 120_000 }, async () => {
-  const adapter = new ScriptedAdapter()
+  const adapter = new ScriptedAdapter({
+    plan: JSON.stringify({
+      summary: 'four-step proof',
+      steps: [1, 2, 3, 4].map((index) => ({ id: `P${index}`, goal: `do step ${index}` })),
+    }),
+    finalVisibleText: '任务已完成。\n\n- 共执行 4 个 Step，全部通过\n- 最终状态：SUCCESS',
+    finalEvaluate: '{"decision":"SUCCESS","summary":"4 steps passed"}',
+  })
   const root = await boot(adapter)
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-hard-activation')
@@ -736,7 +776,7 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.goal, 'create the hard activation proof')
     assert.equal(Number(state.approved_loop_count), 5, 'hard activation uses one fixed predictable budget')
-    assert.equal(adapter.executorCalls, 1, 'the Executor must run through the real Orbit chain')
+    assert.equal(adapter.executorCalls, 4, 'all four Executor steps must run through the real Orbit chain')
     assert.ok(adapter.seen.some((entry) => entry.includes('Orbit 指挥官')), 'the Commander must actually plan')
 
     // The raw role prompts are Chinese; only machine identifiers stay English.
@@ -753,11 +793,7 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     // The parent turn was consumed: no parent model call, no parent tool call,
     // and the user message stays in the conversation.
     const parentEvents = parent.agent.session.snapshotEvents()
-    assert.equal(
-      parentEvents.filter((event) => event.type === 'assistant/message').length,
-      0,
-      'the parent model must not run for a hard-activated turn',
-    )
+    assert.equal(parentModelCalls(adapter, parent), 0, 'the parent model must not run for a hard-activated turn')
     assert.equal(
       parentEvents.filter((event) => event.type === 'tool/call').length,
       0,
@@ -765,6 +801,10 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     )
     const userTexts = userMessagesOf(parent.agent).filter((message) => message.source.kind === 'user').map(textOf)
     assert.deepEqual(userTexts, ['create the hard activation proof'], 'the message stays as durable history')
+    const finals = assistantMessagesOf(parent.agent)
+    assert.equal(finals.length, 1, 'four step reviews plus FINAL_EVALUATE must surface one final result')
+    assert.match(textOf(finals[0] as SessionMessageLike), /共执行 4 个 Step，全部通过/)
+    assert.doesNotMatch(textOf(finals[0] as SessionMessageLike), /reasoning|structured_output|tool-call/)
 
     // A second ordinary message starts the next run with the new goal.
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'second hard activation goal' }], source: { kind: 'user' } }))
@@ -773,7 +813,8 @@ test('real host hard activation: an enabled Session runs Orbit from an ordinary 
     assert.notEqual(next?.run_id, state.run_id, 'the finished run must be replaced by the next run')
     assert.equal(next?.goal, 'second hard activation goal')
     assert.equal(next?.phase, 'SUCCESS')
-    assert.equal(adapter.executorCalls, 2, 'the second run must execute again')
+    assert.equal(adapter.executorCalls, 8, 'the second four-step run must execute again')
+    assert.equal(assistantMessagesOf(parent.agent).length, 2, 'each successful hard activation emits exactly one final result')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -829,7 +870,8 @@ test('real host NEEDS_USER: an arbitrary user reply resumes the same run with th
 
     // The host stayed the only mutation driver.
     const events = parent.agent.session.snapshotEvents()
-    assert.equal(events.filter((event) => event.type === 'assistant/message').length, 0)
+    assert.equal(parentModelCalls(adapter, parent), 0)
+    assert.equal(events.filter((event) => event.type === 'assistant/message').length, 1)
     assert.equal(events.filter((event) => event.type === 'tool/call').length, 0)
   } finally {
     await parent.dispose()
@@ -858,11 +900,8 @@ test('real host: slashCommand=false keeps enabled-Session hard activation', { ti
     const state = readRunState(project.dir)
     assert.equal(state?.goal, 'create the disabled-slash proof')
     assert.equal(state?.phase, 'SUCCESS')
-    assert.equal(
-      parent.agent.session.snapshotEvents().filter((event) => event.type === 'assistant/message').length,
-      0,
-      'the parent model must not run with slashCommand=false',
-    )
+    assert.equal(parentModelCalls(adapter, parent), 0, 'the parent model must not run with slashCommand=false')
+    assert.equal(textOf(assistantMessagesOf(parent.agent)[0] as SessionMessageLike), 'scripted final summary')
 
     // A genuine `/agent-orbit` message still activates without the command.
     parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: '/agent-orbit second explicit goal' }], source: { kind: 'user' } }))
@@ -870,6 +909,32 @@ test('real host: slashCommand=false keeps enabled-Session hard activation', { ti
     const next = readRunState(project.dir)
     assert.equal(next?.goal, 'second explicit goal')
     assert.equal(next?.phase, 'SUCCESS')
+    assert.equal(assistantMessagesOf(parent.agent).length, 2)
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host hard activation: unavailable model keeps the error notice and never emits a false final result', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-unavailable-model')
+  try {
+    installTestModelSelection(root)
+    parent.agent.session.append('model/selection', { provider: 'missing-provider', model: 'missing-model' })
+    assert.ok(await root.commands.execute(parent.agent, '/orbit-toggle on', [], new AbortController().signal))
+
+    parent.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'must fail before starting' }], source: { kind: 'user' } }))
+    await parent.agent.whenIdle()
+
+    assert.equal(parentModelCalls(adapter, parent), 0)
+    assert.equal(parent.agent.session.snapshotEvents().filter((event) => event.type === 'tool/call').length, 0)
+    assert.equal(assistantMessagesOf(parent.agent).length, 0, 'a failed activation must not emit a SUCCESS final result')
+    const notices = userMessagesOf(parent.agent).filter((message) => (message.source as { form?: string }).form === 'notice')
+    assert.ok(notices.some((message) => /ORBIT_MODEL_UNAVAILABLE/.test(textOf(message as SessionMessageLike))))
   } finally {
     await parent.dispose()
     await root.fiber.dispose()

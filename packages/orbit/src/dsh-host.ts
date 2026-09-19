@@ -49,6 +49,10 @@ function contentToText(blocks: readonly ContentBlock[] | undefined): string {
     .join('\n')
 }
 
+function visibleContentToText(blocks: readonly ContentBlock[] | undefined): string {
+  return blocks?.flatMap((block) => block.type === 'text' && block.text.trim() !== '' ? [block.text] : []).join('\n') ?? ''
+}
+
 /**
  * Wire the Orbit supervisor to DeepSeek Harness native Agent/Subagent services.
  *
@@ -129,6 +133,7 @@ export class DshOrbitHost implements OrbitHost {
       .then((value) => ({
         childId: run.id,
         output: contentToText(value.output),
+        visibleOutput: visibleContentToText(value.output),
         interrupted: value.stopReason !== 'completed',
         ...(value.stopReason !== 'completed' ? { reason: value.stopReason } : {}),
         ...(value.diagnostic ? { testSummary: [value.diagnostic] } : {}),

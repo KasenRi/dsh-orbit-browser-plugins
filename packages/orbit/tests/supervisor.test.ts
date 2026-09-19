@@ -40,12 +40,21 @@ test('PLAN -> EXECUTE -> EVALUATE -> SUCCESS', async () => {
     .script('commander', [
       { structured: plan([{ id: 'P1', goal: 'do a' }]) },
       { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
-      { structured: commander({ decision: 'SUCCESS' }) },
+      {
+        output: '[reasoning]\n[tool-call]',
+        visibleOutput: 'Final Commander result',
+        structured: commander({ decision: 'SUCCESS', summary: 'Durable final summary' }),
+      },
     ])
     .script('executor', [{ output: 'did a', childId: 'e1' }])
   const result = await make(host, dir).bootstrap({ goal: 'ship feature', approved_loop_count: 5 })
   assert.equal(result.ok, true)
   assert.equal(result.phase, 'SUCCESS')
+  assert.deepEqual(result.final_output, {
+    text: 'Final Commander result',
+    provider: 'provider-a',
+    model: 'model-b',
+  })
   assert.equal(result.data?.['loop'] && (result.data['loop'] as { used: number }).used, 1)
   cleanup()
 })
