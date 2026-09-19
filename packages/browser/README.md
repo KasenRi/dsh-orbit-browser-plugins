@@ -3,7 +3,10 @@
 Community plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Not affiliated with or endorsed by DeepSeek.
 
-Exposes controlled **browser automation** to DSH as a Cordis plugin:
+**让 AI 真正操作浏览器完成任务。**
+支持打开网页、点击、输入、翻页、读取内容和下载文件等操作，可用于网页测试、信息采集和自动化流程，并提供域名限制等安全控制。
+
+Technical integration:
 
 - a `BrowserAutomationService` on `ctx.browserAutomation`
 - a model-facing `agent_browser` tool that drives the

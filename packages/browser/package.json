@@ -2,7 +2,7 @@
   "name": "@kasenri/dsh-browser",
   "version": "0.1.0",
   "type": "module",
-  "description": "Community DeepSeek Harness plugin: controlled browser automation via agent-browser (BrowserAutomationService + agent_browser tool).",
+  "description": "让 AI 真正操作浏览器完成任务。支持打开网页、点击、输入、翻页、读取内容和下载文件等操作，可用于网页测试、信息采集和自动化流程，并提供域名限制等安全控制。",
   "license": "MIT",
   "repository": {
     "type": "git",

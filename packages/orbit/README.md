@@ -3,10 +3,12 @@
 Community plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Not affiliated with or endorsed by DeepSeek.
 
+**让 AI 项目可以在无人监管下持续推进。**
+Orbit 会自动规划任务、分工执行、逐步检查并继续完成后续工作；不同环节可以使用不同模型，让低成本模型承担执行任务、强模型负责规划和审核，从而降低整体 AI 使用成本。Watchdog 还会监控运行异常，在任务卡死或中断时协助恢复。
+
 **Orbit — Deterministic Engineering Orchestration for DeepSeek Harness**
 
-Orbit is a deterministic engineering orchestration runtime for DSH, implemented
-as a Cordis plugin:
+Technical integration:
 
 - an `OrbitService` on `ctx.orbit`
 - a model-facing `orbit_controller` tool (`cx_controller` remains a legacy alias)
