@@ -24,7 +24,7 @@ import type { SettingsNamespaceView } from '@deepseek-ai/dsh-settings/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { OrbitModelSelect } from './OrbitModelSelect.tsx'
 import { NS, en, zh } from './locales.ts'
-import { routeFromSettingsValue, type OrbitModelInjected, type OrbitRouteValue, type OrbitSettingsState } from './model-options.ts'
+import { routeFromSettingsValue, type OrbitMoaSettingsValue, type OrbitModelInjected, type OrbitRoleName, type OrbitRouteValue, type OrbitSettingsState } from './model-options.ts'
 
 /** The host settings namespace Orbit registers for its own two roles. */
 export const ORBIT_SETTINGS_NS = 'orbit'
@@ -48,14 +48,28 @@ export const inject = ['slots', 'modelDirectories', 'remote', 'remote.settings',
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-orbit: model control dictionaries')
 
-  const settings = createSnapshotStore<OrbitSettingsState>({ status: 'loading' })
+  const settings = createSnapshotStore<OrbitSettingsState>({
+    status: 'loading',
+    moa: { enabled: false, candidateCount: 3, peerCritique: false, maxMoaSteps: 2, candidates: [] },
+  })
 
   const adoptView = (view: SettingsNamespaceView): void => {
-    const value = view.value as { commander?: unknown; watchdog?: unknown } | null
+    const value = view.value as { commander?: unknown; watchdog?: unknown; moa?: Record<string, unknown> } | null
+    const rawMoa = value?.moa
+    const rawCandidates = Array.isArray(rawMoa?.['candidates']) ? rawMoa?.['candidates'] as unknown[] : []
+    const moa: OrbitMoaSettingsValue = {
+      enabled: rawMoa?.['enabled'] === true,
+      candidateCount: typeof rawMoa?.['candidateCount'] === 'number' ? rawMoa['candidateCount'] : 3,
+      peerCritique: rawMoa?.['peerCritique'] === true,
+      maxMoaSteps: typeof rawMoa?.['maxMoaSteps'] === 'number' ? rawMoa['maxMoaSteps'] : 2,
+      candidates: rawCandidates.map(routeFromSettingsValue).filter((route): route is OrbitRouteValue => route !== undefined),
+      judge: routeFromSettingsValue(rawMoa?.['judge']),
+    }
     settings.set({
       status: 'ready',
       commander: routeFromSettingsValue(value?.commander),
       watchdog: routeFromSettingsValue(value?.watchdog),
+      moa,
       revision: view.revision,
     })
   }
@@ -99,19 +113,28 @@ export function apply(ctx: Context): void {
     })
   }, 'dsh-orbit: settings mirror')
 
-  const writeRole = async (role: 'commander' | 'watchdog', route: OrbitRouteValue): Promise<boolean> => {
+  const wireRoute = (route: OrbitRouteValue) => ({
+    provider: route.provider,
+    model: route.model,
+    reasoningEffort: route.reasoningEffort ?? '',
+  })
+
+  const moaWire = (moa: OrbitMoaSettingsValue) => ({
+    enabled: moa.enabled,
+    candidateCount: moa.candidateCount,
+    peerCritique: moa.peerCritique,
+    maxMoaSteps: moa.maxMoaSteps,
+    candidates: moa.candidates.map((route) => wireRoute(route)),
+    judge: moa.judge ? wireRoute(moa.judge) : { provider: '', model: '', reasoningEffort: '' },
+  })
+
+  const updateSettings = async (patch: Parameters<typeof ctx.remote.settings.update>[1]): Promise<boolean> => {
     const snapshot = settings.getSnapshot()
     if (snapshot.status !== 'ready' || snapshot.revision === undefined) return false
     try {
       const response = await ctx.remote.settings.update(
         ORBIT_SETTINGS_NS,
-        {
-          [role]: {
-            provider: route.provider,
-            model: route.model,
-            reasoningEffort: route.reasoningEffort ?? '',
-          },
-        },
+        patch,
         snapshot.revision,
       )
       if (!response.ok) {
@@ -133,6 +156,26 @@ export function apply(ctx: Context): void {
     }
   }
 
+  const writeRole = async (role: Exclude<OrbitRoleName, 'executor'>, route: OrbitRouteValue): Promise<boolean> => {
+    const snapshot = settings.getSnapshot()
+    if (role === 'commander' || role === 'watchdog') return updateSettings({ [role]: wireRoute(route) })
+    const nextMoa: OrbitMoaSettingsValue = { ...snapshot.moa, candidates: [...snapshot.moa.candidates] }
+    if (role === 'moa-judge') nextMoa.judge = route
+    else {
+      const index = Number(role.slice('moa-candidate-'.length)) - 1
+      if (!Number.isInteger(index) || index < 0 || index > 3) return false
+      while (nextMoa.candidates.length <= index) nextMoa.candidates.push({ provider: '', model: '' })
+      nextMoa.candidates[index] = route
+    }
+    return updateSettings({ moa: moaWire(nextMoa) })
+  }
+
+  const writeMoaPolicy = async (patch: Partial<Pick<OrbitMoaSettingsValue, 'enabled' | 'candidateCount' | 'peerCritique' | 'maxMoaSteps'>>): Promise<boolean> => {
+    const snapshot = settings.getSnapshot()
+    const nextMoa = { ...snapshot.moa, ...patch, candidates: [...snapshot.moa.candidates] }
+    return updateSettings({ moa: moaWire(nextMoa) })
+  }
+
   ctx.inject(['slots', 'modelDirectories', 'sessions'], (scope) => {
     const models = scope.modelDirectories
     const sessions = scope.sessions
@@ -150,6 +193,7 @@ export function apply(ctx: Context): void {
           ? directory.select(selection).then(() => true, () => false)
           : Promise.resolve(false),
         writeRole,
+        writeMoaPolicy,
         setOrbitEnabled: async (enabled) => {
           const session = sessions.binding(sessionId)?.session
           if (session === undefined) return false

@@ -7,7 +7,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { collectTurnToolFacts } from './evidence.ts'
-import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
+import type { ModelRunRequest, ModelRunResult, ModelRunUsage, OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import { classifyTurnSettlement } from './settlement.ts'
 import type { OrbitTelemetry } from './types.ts'
@@ -103,6 +103,28 @@ export class DshOrbitHost implements OrbitHost {
     return this.startOneShot(parent, request, prompt, agentOptions)
   }
 
+  async runModel(request: ModelRunRequest): Promise<ModelRunResult> {
+    const handle = await this.startRole({
+      role: 'commander',
+      label: request.label,
+      prompt: request.prompt,
+      route: request.route,
+      toolFilter: { allow: [] },
+      ...(request.signal ? { signal: request.signal } : {}),
+    })
+    try {
+      const result = await handle.result
+      return {
+        output: result.visibleOutput ?? result.output,
+        interrupted: result.interrupted,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.tokenUsage ? { usage: result.tokenUsage } : {}),
+      }
+    } finally {
+      await this.releaseRole(handle)
+    }
+  }
+
   private parent(): Agent {
     const initiator = this.ctx.agents.currentInitiator()
     if (initiator) return initiator
@@ -138,6 +160,7 @@ export class DshOrbitHost implements OrbitHost {
         ...(value.stopReason !== 'completed' ? { reason: value.stopReason } : {}),
         ...(value.diagnostic ? { testSummary: [value.diagnostic] } : {}),
         ...(value.structured !== undefined ? { structured: value.structured } : {}),
+        ...(this.readTokenUsage(run.localAgent as unknown as AgentLike | undefined) ? { tokenUsage: this.readTokenUsage(run.localAgent as unknown as AgentLike | undefined) } : {}),
       }))
       .catch((error: unknown) => ({
         childId: run.id,
@@ -327,6 +350,24 @@ export class DshOrbitHost implements OrbitHost {
     return events.filter((event) => event.type === 'turn/start').length > previousTurns
   }
 
+  private readTokenUsage(agent: AgentLike | undefined): ModelRunUsage | undefined {
+    const events = agent?.session?.snapshotEvents?.() ?? agent?.session?.ownEvents?.() ?? []
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (!event || event.type !== 'assistant/message') continue
+      const usage = (event.data as { usage?: Partial<ModelRunUsage> } | undefined)?.usage
+      if (typeof usage?.inputTokens !== 'number' || typeof usage.outputTokens !== 'number') continue
+      return {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        ...(typeof usage.totalTokens === 'number' ? { totalTokens: usage.totalTokens } : {}),
+        ...(typeof usage.cacheReadTokens === 'number' ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+        ...(typeof usage.cacheWriteTokens === 'number' ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
+      }
+    }
+    return undefined
+  }
+
   private readFinalOutput(agent: AgentLike): string {
     const events = agent.session?.snapshotEvents?.() ?? agent.session?.ownEvents?.() ?? []
     for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -402,11 +443,11 @@ export class DshOrbitHost implements OrbitHost {
     return this.ctx.tools.get(name, agent) !== undefined
   }
 
-  async validateRoutes(routes: Readonly<Record<OrbitRole, OrbitRoute>>, signal?: AbortSignal): Promise<string[]> {
+  async validateRoutes(routes: Readonly<Record<string, OrbitRoute>>, signal?: AbortSignal): Promise<string[]> {
     const issues: string[] = []
-    const labels = { commander: '指挥官', executor: '执行员', watchdog: '监控模型' }
-    for (const role of ['commander', 'executor', 'watchdog'] as const) {
-      const route = routes[role]
+    const labels: Record<string, string> = { commander: '指挥官', executor: '执行员', watchdog: '监控模型' }
+    for (const [role, route] of Object.entries(routes)) {
+      const label = labels[role] ?? role
       try {
         const llm = this.ctx.reflect.get('llm') as LlmRuntime | undefined
         if (!llm) throw new Error('DSH LLM registry 不可用')
@@ -415,17 +456,17 @@ export class DshOrbitHost implements OrbitHost {
         const info = await llm.resolveModelInfo(route.provider, route.model, activeSignal)
         const catalog = await llm.listModels(route.provider)
         if (catalog.length > 0 && !catalog.some((entry) => entry.id === route.model)) {
-          issues.push(`${labels[role]}：ORBIT_MODEL_UNAVAILABLE (${route.provider}/${route.model})，当前模型目录中不存在，请重新选择。`)
+          issues.push(`${label}：ORBIT_MODEL_UNAVAILABLE (${route.provider}/${route.model})，当前模型目录中不存在，请重新选择。`)
           continue
         }
         if (route.reasoningEffort !== undefined) {
           const efforts = info.reasoning?.efforts ?? []
           if (!efforts.some((effort) => effort.id === route.reasoningEffort)) {
-            issues.push(`${labels[role]}：ORBIT_REASONING_EFFORT_UNAVAILABLE (${route.provider}/${route.model}/${route.reasoningEffort})，当前模型未声明此推理等级。`)
+            issues.push(`${label}：ORBIT_REASONING_EFFORT_UNAVAILABLE (${route.provider}/${route.model}/${route.reasoningEffort})，当前模型未声明此推理等级。`)
           }
         }
       } catch (error) {
-        issues.push(`${labels[role]}：ORBIT_MODEL_UNAVAILABLE (${route.provider}/${route.model})，当前不可用，请重新选择：${truncateSafe(error instanceof Error ? error.message : String(error), 200)}`)
+        issues.push(`${label}：ORBIT_MODEL_UNAVAILABLE (${route.provider}/${route.model})，当前不可用，请重新选择：${truncateSafe(error instanceof Error ? error.message : String(error), 200)}`)
       }
     }
     return issues

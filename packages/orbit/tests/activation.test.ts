@@ -195,6 +195,36 @@ test('an explicit /agent-orbit wins over the enabled-Session ordinary path', asy
   assert.deepEqual(run.appended, [earlier, message])
 })
 
+test('an active Orbit ownership fence blocks /moa before downstream hooks can claim the turn', async () => {
+  let listener: PreStepListener | undefined
+  let downstreamCalled = false
+  const appended: UserMessage[] = []
+  const notices: string[] = []
+  const ctx = {
+    on: (_event: string, fn: PreStepListener) => { listener = fn },
+  } as unknown as Context
+  installOrbitGestureBoundary(ctx, {
+    competingMutationBlock: (_agent, messages) => invokedOrbitMessage(messages)?.goal.startsWith('/moa') === true
+      ? 'ORBIT_MUTATION_DRIVER_CONFLICT'
+      : undefined,
+    onBlocked: (_agent, reason) => { notices.push(reason) },
+  })
+  assert.ok(listener)
+  const session = { append: (_type: string, data: UserMessage) => { appended.push(data) } }
+  const message = userMessage('/moa solve this')
+  const decision = await listener(
+    { agent: { session: session as unknown as Session }, messages: [message], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => {
+      downstreamCalled = true
+      return { kind: 'enter', messages: [message] }
+    },
+  )
+  assert.deepEqual(enterMessages(decision), [])
+  assert.equal(downstreamCalled, false, 'MoA downstream pre-step hook must never see the blocked turn')
+  assert.deepEqual(appended, [message])
+  assert.deepEqual(notices, ['ORBIT_MUTATION_DRIVER_CONFLICT'])
+})
+
 test('/orbit-toggle validates its argument', () => {
   let definition: { name: string; handler: (invocation: { rawInput: string }) => { kind: string; text?: string } } | undefined
   const ctx = {

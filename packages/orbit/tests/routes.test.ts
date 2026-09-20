@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { OrbitStateStore } from '../src/state-store.ts'
 import { OrbitSupervisor, type OrbitSupervisorConfig } from '../src/supervisor.ts'
-import { agentDefaultSelectionOf, resolveEffectiveRoutes, routeFromSelection, sessionModelSelectionOf, sessionModelStateOf, sessionSelectionOf } from '../src/routes.ts'
+import { agentDefaultSelectionOf, resolveEffectiveRoutes, resolveMoaPolicy, routeFromSelection, sessionModelSelectionOf, sessionModelStateOf, sessionSelectionOf } from '../src/routes.ts'
 import type { OrbitRoutes } from '../src/types.ts'
 import { FakeHost } from './helpers/fake-host.ts'
 import { Config } from '../src/index.ts'
@@ -84,6 +84,36 @@ test('falls back per role when settings or session selection are absent or unusa
 
   assert.throws(() => resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: 'x' } }), /Executor 未选择/)
   assert.throws(() => resolveEffectiveRoutes({ configRoutes, sessionSelection: { provider: '', model: '' } }), /Executor 未选择/)
+})
+
+test('MoA policy uses only explicit DSH routes and never guesses models', () => {
+  assert.equal(resolveMoaPolicy({ settings: { enabled: false } }), undefined)
+  assert.deepEqual(resolveMoaPolicy({ settings: {
+    enabled: true,
+    candidateCount: 2,
+    peerCritique: true,
+    maxMoaSteps: 1,
+    candidates: [
+      { provider: 'p1', model: 'm1' },
+      { provider: 'p2', model: 'm2', reasoningEffort: 'high' },
+    ],
+    judge: { provider: 'pj', model: 'judge' },
+  } }), {
+    enabled: true,
+    candidate_count: 2,
+    peer_critique: true,
+    max_moa_steps: 1,
+    candidates: [
+      { provider: 'p1', model: 'm1' },
+      { provider: 'p2', model: 'm2', reasoningEffort: 'high' },
+    ],
+    judge: { provider: 'pj', model: 'judge' },
+  })
+  assert.throws(() => resolveMoaPolicy({ settings: {
+    enabled: true,
+    candidateCount: 3,
+    candidates: [{ provider: 'p', model: 'one' }],
+  } }), /ORBIT_MOA_MODEL_CONFIGURATION_REQUIRED/)
 })
 
 test('route candidates require a complete provider/model pair', () => {

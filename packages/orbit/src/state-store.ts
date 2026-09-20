@@ -27,9 +27,11 @@ function nowIso(): string {
 export class OrbitStateStore {
   readonly stateDir: string
   private lockDepth = 0
+  private readonly onWrite?: (state: OrbitState) => void
 
-  constructor(projectDir: string) {
+  constructor(projectDir: string, onWrite?: (state: OrbitState) => void) {
     this.stateDir = join(projectDir, '.cx')
+    this.onWrite = onWrite
   }
 
   get statePath(): string {
@@ -90,20 +92,22 @@ export class OrbitStateStore {
   }
 
   writeState(state: OrbitState): OrbitState {
-    return this.transact(() => {
+    const next = this.transact(() => {
       const current = this.readRawState()
       const revision = Number(current?.['state_revision'] ?? 0) + 1
-      const next = {
+      const updated = {
         ...state,
         schema_version: ORBIT_SCHEMA_VERSION,
         state_revision: revision,
         driver_ownership: driverOwnershipFor(state.phase, state.status),
         updated_at: nowIso(),
       } as OrbitState
-      Object.assign(state, next)
-      this.writeJson(this.statePath, next)
-      return next
+      Object.assign(state, updated)
+      this.writeJson(this.statePath, updated)
+      return updated
     })
+    try { this.onWrite?.(next) } catch { /* UI projection must never veto durable state. */ }
+    return next
   }
 
   writeJson(filePath: string, value: unknown): void {

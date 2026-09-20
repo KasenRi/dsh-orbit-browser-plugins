@@ -46,6 +46,29 @@ export interface RoleRunResult {
   /** Durable settlement of the child's final turn when the host can read one. */
   settlement?: TurnSettlement
   usage?: { turns?: number; tools?: number }
+  tokenUsage?: ModelRunUsage
+}
+
+export interface ModelRunUsage {
+  inputTokens: number
+  outputTokens: number
+  totalTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+}
+
+export interface ModelRunRequest {
+  label: string
+  prompt: string
+  route: OrbitRoute
+  signal?: AbortSignal
+}
+
+export interface ModelRunResult {
+  output: string
+  interrupted: boolean
+  reason?: string
+  usage?: ModelRunUsage
 }
 
 export interface RoleHandle {
@@ -68,11 +91,13 @@ export interface OrbitHost {
   now(): number
   sleep(ms: number, signal?: AbortSignal): Promise<void>
   startRole(request: RoleRunRequest): Promise<RoleHandle>
+  /** Tool-less one-shot model call used by the optional MoA adapter. */
+  runModel?(request: ModelRunRequest): Promise<ModelRunResult>
   interruptRole(handle: RoleHandle, reason: string): Promise<void>
   releaseRole(handle: RoleHandle): Promise<void>
   hasTool(name: string): boolean
   /** Validate frozen routes against the current DSH LLM registry. */
-  validateRoutes(routes: Readonly<Record<OrbitRole, OrbitRoute>>, signal?: AbortSignal): Promise<string[]>
+  validateRoutes(routes: Readonly<Record<string, OrbitRoute>>, signal?: AbortSignal): Promise<string[]>
   /** Whether this exact Agent is the currently authorized Orbit Executor. */
   isMutationAuthorized(agent: unknown, cwd: string, tool: string): boolean
   otherMutationDrivers(cwd: string): Promise<string[]>

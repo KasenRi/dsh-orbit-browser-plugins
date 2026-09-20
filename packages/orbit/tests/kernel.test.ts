@@ -22,12 +22,15 @@ import {
   enterNeedsUser,
   ensureAutomaticLoopBudgetForPlan,
   automaticLoopBudgetForPlan,
+  assertMoaPlanWithinPolicy,
   explicitLoopBudget,
   hashGoal,
   isBaseStepId,
   markStrategyChallengeUsed,
   normalizeAppend,
   normalizeCapabilities,
+  normalizeExecutionMode,
+  normalizeMoaPolicy,
   normalizePlan,
   openWatchdogAttempt,
   recordGuardRecovery,
@@ -50,7 +53,7 @@ const step = (id: string, goal = 'g'): OrbitPlanStep => ({ id, goal, status: 'pe
 
 function state(overrides: Partial<OrbitState> = {}): OrbitState {
   return {
-    schema_version: 2,
+    schema_version: 3,
     active_run_id: 'r1',
     run_id: 'r1',
     phase: 'EXECUTE',
@@ -88,6 +91,54 @@ test('normalizes plan steps and capabilities', () => {
   assert.equal(plan.steps[0]?.id, 'P0')
   assert.equal(plan.steps[1]?.id, 'P1')
   assert.deepEqual(plan.steps[1]?.capabilities, ['web', 'browser'])
+})
+
+test('normalizes execution mode and keeps SINGLE backward-compatible', () => {
+  const plan = normalizePlan({
+    steps: [
+      { id: 'P0', goal: 'single' },
+      { id: 'P1', goal: 'ensemble', execution_mode: 'MOA' },
+      { id: 'P2', goal: 'unknown', execution_mode: 'OTHER' },
+    ],
+  })
+  assert.equal(normalizeExecutionMode(plan.steps[0]?.execution_mode), 'SINGLE')
+  assert.equal(plan.steps[0]?.execution_mode, undefined)
+  assert.equal(plan.steps[1]?.execution_mode, 'MOA')
+  assert.equal(plan.steps[2]?.execution_mode, undefined)
+})
+
+test('MoA policy is bounded and plans cannot exceed its step budget', () => {
+  const policy = normalizeMoaPolicy({
+    enabled: true,
+    candidate_count: 3,
+    peer_critique: false,
+    max_moa_steps: 1,
+    candidates: [
+      { provider: 'p', model: 'a' },
+      { provider: 'p', model: 'b' },
+      { provider: 'p', model: 'c' },
+    ],
+    judge: { provider: 'p', model: 'judge' },
+  })
+  assert.equal(policy?.candidate_count, 3)
+  assert.equal(policy?.candidates.length, 3)
+  assert.doesNotThrow(() => assertMoaPlanWithinPolicy({ steps: [{ id: 'P0', goal: 'x', status: 'pending', execution_mode: 'MOA' }] }, policy))
+  assert.throws(
+    () => assertMoaPlanWithinPolicy({ steps: [
+      { id: 'P0', goal: 'x', status: 'pending', execution_mode: 'MOA' },
+      { id: 'P1', goal: 'y', status: 'pending', execution_mode: 'MOA' },
+    ] }, policy),
+    /ORBIT_MOA_STEP_BUDGET_EXCEEDED/,
+  )
+  assert.throws(() => normalizeMoaPolicy({
+    enabled: true,
+    candidate_count: 5,
+    peer_critique: false,
+    max_moa_steps: 1,
+    candidates: Array.from({ length: 5 }, (_, index) => ({ provider: 'p', model: String(index) })),
+    judge: { provider: 'p', model: 'judge' },
+  }), /ORBIT_MOA_CANDIDATE_COUNT_INVALID/)
+  assert.throws(() => assertMoaPlanWithinPolicy({ steps: [{ id: 'P0', goal: 'x', status: 'pending', execution_mode: 'MOA' }] }, undefined), /ORBIT_MOA_UNAVAILABLE/)
 })
 
 test('rejects plan with too many steps', () => {
@@ -218,7 +269,7 @@ test('initial state follows the kernel rules', () => {
     userHardConstraints: ['no push'],
     githubAllowed: true,
   })
-  assert.equal(initial.schema_version, 2)
+  assert.equal(initial.schema_version, 3)
   assert.equal(initial.run_id, 'run-1')
   assert.equal(initial.active_run_id, 'run-1')
   assert.equal(initial.phase, 'PLAN')

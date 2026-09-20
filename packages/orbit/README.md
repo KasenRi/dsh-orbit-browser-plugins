@@ -44,6 +44,7 @@ Executor, Smart Watchdog, durable state and bounded recovery.
 |---|---|
 | `@deepseek-ai/dsh` | `0.1.5-rc.2` |
 | `@deepseek-ai/cordis` | `4.0.2` |
+| `@goodandready/dsh-moa`（可选 MoA 集成） | `0.2.19` |
 | Node.js | `>= 22.19.0` |
 
 Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
@@ -56,6 +57,10 @@ mirror remains available when a Git source is preferred:
 
 ```bash
 dsh plugin --profile web add @kasenri/dsh-orbit
+
+# 可选：为 Orbit 的关键步骤启用多候选 MoA 选优
+dsh plugin --profile web add @goodandready/dsh-moa@0.2.19
+
 # Git source alternative, tracks the mirror repository HEAD:
 # dsh plugin --profile web add github:KasenRi/dsh-orbit
 ```
@@ -134,6 +139,40 @@ Commander/Watchdog use settings then explicit config; Executor uses the Session
 selection, with explicit config only when there is no Session. Missing or
 unavailable roles block creation of a Run before any child starts.
 
+### Optional MoA execution mode (v0.6.0)
+
+Orbit 可以把少量高不确定性步骤标记为 `execution_mode: "MOA"`。这不是新的顶层 Supervisor，也不会把状态机交给 MoA：
+
+```text
+Commander PLAN
+      ↓
+SINGLE ─────────────→ Executor
+      \
+       MOA → Candidate 1 ─┐
+             Candidate 2 ─┼→ Judge → Orbit controlled promotion → Executor verification
+             Candidate 3 ─┘
+                                              ↓
+                                      Commander STEP_EVALUATE
+```
+
+关键边界：
+
+- Candidate 和 Judge 都是**零工具**的一次性模型调用，不能直接 `write/edit/bash/subagent`。
+- 候选文件只写入 `.cx/moa/<run>/<step>/candidate-N/`，普通 Executor 不能修改 `.cx`。
+- Judge 只负责在已有候选中做相对选择，必须返回 `WINNER_CANDIDATE_INDEX`；它不能决定 `PASS_CURRENT_STEP`，也不能生成新的综合实现。
+- 胜出候选由 Orbit Supervisor 确定性提升到项目目录；之后仍由 Executor 运行真实测试，最后由 Commander 做绝对验收。
+- 整个 MoA Step 只消耗一个 Orbit loop；候选和 Judge 的内部调用受独立的候选数和 `maxMoaSteps` 限制。
+- 候选数固定为 2–4；至少需要 2 个成功候选。失败不会偷偷回退成单 Executor，也不会自动换 Judge 模型。
+- `peerCritique` 默认关闭；开启时只允许一轮有界互评。
+- 新 Run 会冻结 Candidate/Judge 的 provider、model、reasoningEffort、MoA policy，以及原版 MoA settings 中用户显式配置的价格表（如果存在）。中途修改 UI 只影响下一次 Run。
+- Candidate/Judge 的 input/output/cache Token 来自 DSH 子 Session 的真实 `assistant/message.usage`；如果冻结的价格表能匹配对应 Route，同时记录美元成本；没有价格时只展示 Token，并明确标记无法计算成本，不猜价格。
+- Orbit 会把一个不含目标正文、候选正文、Judge 推理或代码的有界运行快照写进所属 DSH Session projection。Web UI 可显示当前 Step、MoA 阶段、各候选模型/成败、Token、Judge、winner 和总计，刷新/重连后仍可恢复。
+- 冷恢复按 durable phase 继续：`JUDGE` 不重跑 Candidate，`SELECTED` 不重跑 Candidate/Judge，`PROMOTED` 不重跑 Candidate/Judge/Promotion。
+- Orbit ACTIVE 时会在下游 hook 之前阻止独立 `/moa`，避免原版 MoA 的自动 Promotion 与 Orbit 同时争夺 workspace。
+- `@goodandready/dsh-moa` 是可选依赖；未安装时普通 SINGLE 模式完全不受影响。
+
+当前兼容层针对 `@goodandready/dsh-moa@0.2.19`。Orbit 只依赖它公开的项目上下文接口；候选调度、Judge、持久化与 Promotion 权限均由 `moa-adapter.ts` 封装。未来 MoA 提供正式 integration/manual-promotion API 时，只需替换该适配层。
+
 ## State machine
 
 ```text
@@ -190,6 +229,13 @@ PLAN → EXECUTE → EVALUATE → SUCCESS
 | `routes.commander` | none | Explicit profile fallback; normally user-selected in Orbit settings. |
 | `routes.executor` | none | Explicit config only without a Session; otherwise follows DSH Session selection. |
 | `routes.watchdog` | none | Explicit profile fallback; normally user-selected in Orbit settings. |
+| `moa.enabled` | `false` | 允许 Commander 为关键步骤选择 `MOA` 执行模式。 |
+| `moa.candidateCount` | `3` | 固定候选数量，运行时只允许 2–4。 |
+| `moa.candidates` | none | 用户显式选择的 Candidate routes；不会从 Executor 猜测或继承。 |
+| `moa.judge` | none | 用户显式选择的 Judge route。 |
+| `moa.peerCritique` | `false` | 是否启用一轮有界候选互评。 |
+| `moa.maxMoaSteps` | `2` | 一个 Run 最多允许的 MoA 步骤数（上限受 1–5 步 Plan 约束）。 |
+| MoA prices | none | 若 `dsh-moa` settings 已配置 `prices`，Orbit 在新 Run 冻结该表并据真实 Token 计算成本；否则不估价。 |
 | `executorTools` | read/read_image/glob/grep | Base read-only subset; mutation tools require Step capabilities. |
 | `browserTools` | `["agent_browser"]` | Browser capability tool names. |
 | `commanderReadOnlyTools` | read/glob/grep/web… | Commander allowlist. |
@@ -224,7 +270,7 @@ dsh plugin --profile web add github:KasenRi/dsh-orbit
 | CX mode | Orbit mode (`orbit模式`; `cx模式` still works) |
 | `ctx.cx` | `ctx.orbit` (same `OrbitService` instance; `ctx.cx` remains an alias) |
 
-- `.cx/state.json` remains unchanged.
+- `.cx/state.json` 路径保持不变；v0.6.0 写入 schema 3，旧 schema 2 状态可继续读取，并在下一次正常持久化时升级。
 - Legacy `cx模式` remains supported.
 - Existing durable runs do not need migration: Orbit reads the same
   `.cx/state.json`, including historical `CX_*` error strings.

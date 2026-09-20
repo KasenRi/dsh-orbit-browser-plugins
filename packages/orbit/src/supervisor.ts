@@ -19,6 +19,7 @@ import {
   type EvaluationMode,
 } from './decisions.ts'
 import type { OrbitHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
+import { OrbitMoaAdapter, type OrbitMoaAdapterLike } from './moa-adapter.ts'
 import {
   applyCommanderNeedsUser,
   applyCorrectionStep,
@@ -42,6 +43,8 @@ import {
   ensureAutomaticLoopBudgetForPlan,
   markStrategyChallengeUsed,
   normalizePlan,
+  assertMoaPlanWithinPolicy,
+  normalizeExecutionMode,
   openWatchdogAttempt,
   recordGuardRecovery,
   recordPlanFailure,
@@ -73,6 +76,8 @@ import {
   type CommanderDecision,
   type CommanderMode,
   type OrbitActionResult,
+  type OrbitMoaPolicy,
+  type OrbitMoaUsage,
   type OrbitPlanStep,
   type OrbitState,
   type OrbitTelemetry,
@@ -92,6 +97,10 @@ export interface OrbitSupervisorConfig {
    * resumes from its frozen `state.routes` and never calls this.
    */
   resolveRoutes?: () => OrbitState['routes']
+  /** Resolve and freeze MoA policy/routes for a NEW run. */
+  resolveMoaPolicy?: () => OrbitMoaPolicy | undefined
+  /** Optional test seam; production uses the dsh-moa compatibility adapter. */
+  moaAdapter?: OrbitMoaAdapterLike
   /**
    * Resolve the DSH Session driving the current operation. A NEW run records
    * it as `owner_session_id`; a NEEDS_USER continuation is only accepted when
@@ -147,9 +156,10 @@ interface AuxRoleRequest {
   outputSchema?: ObjectJsonSchema
 }
 
-const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string) => `你是 Orbit 指挥官（Commander），当前阶段：PLAN。
- 请为下述目标制定最小化的 1-5 个逻辑工程步骤。
+const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string, moaPolicy?: OrbitMoaPolicy) => `你是 Orbit 指挥官（Commander），当前阶段：PLAN。
+请为下述目标制定最小化的 1-5 个逻辑工程步骤。
 规则：基础读取不声明 capabilities；修改文件使用 "filesystem"，执行命令使用 "shell"，访问网页/API 使用 "web"，驱动真实浏览器使用 "browser"。只选择当前步骤真正需要的能力，可组合，保持最小化。
+execution_mode 只能是 SINGLE 或 MOA。普通、确定性步骤使用 SINGLE；只有存在明显多解、高不确定性且独立候选比较能提高质量时才使用 MOA。${moaPolicy ? `当前 Run 已启用 MoA，最多 ${moaPolicy.max_moa_steps} 个 MOA 步骤，候选数固定为 ${moaPolicy.candidate_count}。` : '当前 Run 未启用 MoA，所有步骤必须使用 SINGLE。'}
 请通过结构化结果协议提交最终计划。
 你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、capability id、代码、命令、路径、provider/model ID 等机器标识保持原样。
 目标：${goal}
@@ -168,6 +178,7 @@ const COMMANDER_STEP_PROMPT = (
 你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
 原始目标：${goal}
 当前步骤 ${step.id}：${step.goal}
+执行模式：${normalizeExecutionMode(step.execution_mode)}
 迭代计数：loop ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
 执行员证据：
 ${evidence}`
@@ -181,7 +192,7 @@ const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence
 你的自然语言输出、推理说明和总结默认全部使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
 原始目标：${goal}
 计划摘要：${plan.summary}
-步骤：${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}]`).join('; ')}
+步骤：${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}/${normalizeExecutionMode(step.execution_mode)}]`).join('; ')}
 Loop：${state.loop.used}/${state.loop.max}${userReplyLine(state)}
 执行员证据：
 ${evidence}`
@@ -190,6 +201,21 @@ ${evidence}`
  * The durable user reply line for role prompts. The reply is the user's answer
  * to a NEEDS_USER question and never replaces the original goal.
  */
+function sumMoaUsage(items: Array<OrbitMoaUsage | undefined>): OrbitMoaUsage | undefined {
+  const present = items.filter((item): item is OrbitMoaUsage => item !== undefined)
+  if (present.length === 0) return undefined
+  const costItems = present.filter((item) => item.cost_usd !== undefined)
+  const completeCost = costItems.length === present.length
+  return {
+    input_tokens: present.reduce((sum, item) => sum + item.input_tokens, 0),
+    output_tokens: present.reduce((sum, item) => sum + item.output_tokens, 0),
+    total_tokens: present.reduce((sum, item) => sum + item.total_tokens, 0),
+    ...(present.some((item) => item.cache_read_tokens !== undefined) ? { cache_read_tokens: present.reduce((sum, item) => sum + (item.cache_read_tokens ?? 0), 0) } : {}),
+    ...(present.some((item) => item.cache_write_tokens !== undefined) ? { cache_write_tokens: present.reduce((sum, item) => sum + (item.cache_write_tokens ?? 0), 0) } : {}),
+    ...(completeCost ? { cost_usd: Number(costItems.reduce((sum, item) => sum + (item.cost_usd ?? 0), 0).toFixed(6)) } : {}),
+  }
+}
+
 function userReplyLine(state: OrbitState): string {
   return state.pending_user_reply ? `\n用户回复（对上一个问题的回答）：${state.pending_user_reply}` : ''
 }
@@ -251,6 +277,7 @@ export class OrbitSupervisor {
   private readonly store: OrbitStateStore
   private readonly host: OrbitHost
   private readonly config: OrbitSupervisorConfig
+  private readonly moa: OrbitMoaAdapterLike
   /** Evidence for the step that just settled; never persisted into state.json. */
   private stepEvidence?: { stepId: string; bundle: OrbitEvidenceBundle }
 
@@ -258,6 +285,7 @@ export class OrbitSupervisor {
     this.store = store
     this.host = host
     this.config = config
+    this.moa = config.moaAdapter ?? new OrbitMoaAdapter(host)
   }
 
   private now(): number {
@@ -266,12 +294,14 @@ export class OrbitSupervisor {
 
   createState(input: OrbitRunInput): OrbitState {
     const ownerSessionId = this.config.resolveOwnerSessionId?.()
+    const moaPolicy = this.config.resolveMoaPolicy?.()
     return createInitialState({
       runId: typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID(),
       now: this.now(),
       goal: (input.goal ?? '').trim(),
       ...(input.preset !== undefined ? { preset: input.preset } : {}),
       routes: this.resolveNewRoutes(),
+      ...(moaPolicy ? { moaPolicy } : {}),
       ...(input.approved_loop_count !== undefined ? { approvedLoopCount: input.approved_loop_count } : {}),
       ...(input.max_loops !== undefined ? { maxLoops: input.max_loops } : {}),
       ...(input.user_hard_constraints ? { userHardConstraints: input.user_hard_constraints } : {}),
@@ -285,9 +315,20 @@ export class OrbitSupervisor {
     return resolveEffectiveRoutes({ configRoutes: this.config.defaultRoutes })
   }
 
-  private async preflightRoutes(routes: OrbitState['routes'], signal?: AbortSignal): Promise<string | undefined> {
+  private async preflightRoutes(state: Pick<OrbitState, 'routes' | 'moa_policy'>, signal?: AbortSignal): Promise<string | undefined> {
+    const routes: Record<string, import('./types.ts').OrbitRoute> = { ...state.routes }
+    const policy = state.moa_policy
+    if (policy) {
+      policy.candidates.forEach((route, index) => { routes['moa_candidate_' + (index + 1)] = route })
+      routes.moa_judge = policy.judge
+    }
     const issues = await this.host.validateRoutes(routes, signal)
-    return issues.length === 0 ? undefined : `ORBIT_ROLE_MODEL_UNAVAILABLE: ${issues.join('；')}。请重新选择可用模型。`
+    if (issues.length > 0) return `ORBIT_ROLE_MODEL_UNAVAILABLE: ${issues.join('；')}。请重新选择可用模型。`
+    if (policy) {
+      const availability = await this.moa.availability()
+      if (!availability.available) return availability.reason ?? 'ORBIT_MOA_UNAVAILABLE'
+    }
+    return undefined
   }
 
   async bootstrap(input: OrbitRunInput, signal?: AbortSignal): Promise<OrbitActionResult> {
@@ -299,14 +340,14 @@ export class OrbitSupervisor {
     const requestedGoal = (input.goal ?? '').trim()
     let state = this.store.readState()
     const raw = this.store.readRawState()
-    const legacy = raw !== null && raw['schema_version'] !== 2
+    const legacy = raw !== null && Number(raw['schema_version'] ?? 0) < 2
 
     if (legacy && requestedGoal) {
       let created: OrbitState
       try { created = this.createState(input) } catch (error) {
         return { ok: false, action: 'run', message: error instanceof Error ? error.message : String(error) }
       }
-      const invalid = await this.preflightRoutes(created.routes, signal)
+      const invalid = await this.preflightRoutes(created, signal)
       if (invalid) return { ok: false, action: 'run', message: invalid }
       state = this.store.writeState(created)
     } else if (!state) {
@@ -315,7 +356,7 @@ export class OrbitSupervisor {
       try { created = this.createState(input) } catch (error) {
         return { ok: false, action: 'run', message: error instanceof Error ? error.message : String(error) }
       }
-      const invalid = await this.preflightRoutes(created.routes, signal)
+      const invalid = await this.preflightRoutes(created, signal)
       if (invalid) return { ok: false, action: 'run', message: invalid }
       state = this.store.writeState(created)
     } else if (input.run_id && input.run_id !== state.run_id && !legacy) {
@@ -327,7 +368,7 @@ export class OrbitSupervisor {
       try { created = this.createState(input) } catch (error) {
         return { ok: false, action: 'run', message: error instanceof Error ? error.message : String(error) }
       }
-      const invalid = await this.preflightRoutes(created.routes, signal)
+      const invalid = await this.preflightRoutes(created, signal)
       if (invalid) return { ok: false, action: 'run', message: invalid }
       state = this.store.writeState(created)
     }
@@ -389,7 +430,7 @@ export class OrbitSupervisor {
     if (state.phase === 'BUDGET_EXHAUSTED') return this.result(state, true)
 
     if (preflight) {
-      const routeIssue = await this.preflightRoutes(state.routes, signal)
+      const routeIssue = await this.preflightRoutes(state, signal)
       if (routeIssue) return this.result(state, false, routeIssue)
     }
 
@@ -456,7 +497,7 @@ export class OrbitSupervisor {
     const outcome = await this.runCommander(
       state,
       'PLAN',
-      COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints, userReplyLine(state)),
+      COMMANDER_PLAN_PROMPT(state.goal, state.user_hard_constraints, userReplyLine(state), state.moa_policy),
       COMMANDER_PLAN_SCHEMA,
       signal,
     )
@@ -468,6 +509,7 @@ export class OrbitSupervisor {
     }
     try {
       const plan = normalizePlan(outcome.structured as { summary?: unknown; steps?: unknown })
+      assertMoaPlanWithinPolicy(plan, state.moa_policy)
       applyPlan(state, plan)
       ensureAutomaticLoopBudgetForPlan(state)
       this.store.writeState(state)
@@ -625,6 +667,118 @@ export class OrbitSupervisor {
     step: OrbitPlanStep,
     signal?: AbortSignal,
   ): Promise<{ done: boolean; ok: boolean; message?: string }> {
+    if (normalizeExecutionMode(step.execution_mode) === 'MOA') {
+      const prepared = await this.prepareMoaStep(state, step, signal)
+      if (!prepared.ready) return { done: prepared.done, ok: false, ...(prepared.message ? { message: prepared.message } : {}) }
+      return this.executeExecutorStep(state, step, signal, true)
+    }
+    return this.executeExecutorStep(state, step, signal, false)
+  }
+
+  private async prepareMoaStep(
+    state: OrbitState,
+    step: OrbitPlanStep,
+    signal?: AbortSignal,
+  ): Promise<{ ready: boolean; done: boolean; message?: string }> {
+    const policy = state.moa_policy
+    if (!policy) {
+      enterNeedsUser(state, 'ORBIT_MOA_UNAVAILABLE: 当前 Run 没有冻结的 MoA 配置。')
+      this.store.writeState(state)
+      return { ready: false, done: true, message: state.last_error ?? undefined }
+    }
+    const availability = await this.moa.availability()
+    if (!availability.available) {
+      enterNeedsUser(state, availability.reason ?? 'ORBIT_MOA_UNAVAILABLE')
+      this.store.writeState(state)
+      return { ready: false, done: true, message: state.last_error ?? undefined }
+    }
+    const workspace = join(this.store.stateDir, '..')
+    if (state.moa_step?.step_id !== step.id) {
+      state.moa_step = {
+        step_id: step.id,
+        phase: 'FANOUT',
+        ...(availability.version ? { adapter_version: availability.version } : {}),
+        candidates: [],
+        successful_candidates: 0,
+        failed_candidates: 0,
+      }
+      this.store.writeState(state)
+    }
+    try {
+      if (state.moa_step.phase === 'FANOUT') {
+        const fanout = await this.moa.fanout({ workspace, runId: state.run_id, step, policy, ...(signal ? { signal } : {}) })
+        state.moa_step = {
+          ...state.moa_step,
+          phase: fanout.successful >= 2 ? 'JUDGE' : 'FAILED',
+          adapter_version: fanout.adapterVersion,
+          candidates: fanout.candidates,
+          successful_candidates: fanout.successful,
+          failed_candidates: fanout.failed,
+          ...(sumMoaUsage(fanout.candidates.map((candidate) => candidate.usage)) ? { total_usage: sumMoaUsage(fanout.candidates.map((candidate) => candidate.usage)) } : {}),
+          ...(fanout.successful >= 2 ? {} : { last_error: 'ORBIT_MOA_QUORUM_FAILED: 至少需要 2 个成功候选。' }),
+        }
+        this.store.writeState(state)
+      }
+      if (state.moa_step.phase === 'FAILED') {
+        applyExecutorSuccess(state, {
+          summary: state.moa_step.last_error ?? 'ORBIT_MOA_FAILED',
+          changedFiles: this.host.changedFiles(workspace),
+          testSummary: [state.moa_step.last_error ?? 'ORBIT_MOA_FAILED'],
+        })
+        upsertStepResult(state, buildStepResult(step.id, state.current_step?.attempt ?? 1, buildEvidenceBundle({ executorOutput: state.moa_step.last_error ?? 'ORBIT_MOA_FAILED' }), state.test_summary))
+        this.store.writeState(state)
+        return { ready: false, done: false }
+      }
+      if (state.moa_step.phase === 'JUDGE') {
+        const judged = await this.moa.judge({ workspace, runId: state.run_id, step, policy, candidates: state.moa_step.candidates, ...(signal ? { signal } : {}) })
+        state.moa_step = {
+          ...state.moa_step,
+          phase: 'SELECTED',
+          winning_candidate: judged.winningCandidate,
+          winner_model: judged.winnerModel,
+          judge_summary: judged.summary,
+          ...(judged.usage ? { judge_usage: judged.usage } : {}),
+          ...(sumMoaUsage([...state.moa_step.candidates.map((candidate) => candidate.usage), judged.usage]) ? { total_usage: sumMoaUsage([...state.moa_step.candidates.map((candidate) => candidate.usage), judged.usage]) } : {}),
+        }
+        this.store.writeState(state)
+      }
+      if (state.moa_step.phase === 'SELECTED') {
+        state.moa_step.phase = 'PROMOTING'
+        this.store.writeState(state)
+      }
+      if (state.moa_step.phase === 'PROMOTING') {
+        const winner = state.moa_step.winning_candidate
+        if (!winner) throw new Error('ORBIT_MOA_WINNER_MISSING')
+        const receipt = await this.moa.promote({ workspace, runId: state.run_id, stepId: step.id, winningCandidate: winner })
+        state.moa_step = { ...state.moa_step, phase: 'PROMOTED', promotion_receipt: receipt }
+        this.store.writeState(state)
+      }
+      return { ready: state.moa_step.phase === 'PROMOTED', done: false }
+    } catch (error) {
+      const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      if (state.moa_step) state.moa_step = { ...state.moa_step, phase: 'FAILED', last_error: reason }
+      applyExecutorSuccess(state, {
+        summary: reason,
+        changedFiles: this.host.changedFiles(workspace),
+        testSummary: [reason],
+      })
+      upsertStepResult(state, buildStepResult(
+        step.id,
+        state.current_step?.attempt ?? 1,
+        buildEvidenceBundle({ executorOutput: reason }),
+        state.test_summary,
+      ))
+      this.store.writeState(state)
+      return { ready: false, done: false, message: reason }
+    }
+  }
+
+  private async executeExecutorStep(
+    state: OrbitState,
+    step: OrbitPlanStep,
+    signal: AbortSignal | undefined,
+    moaVerification: boolean,
+  ): Promise<{ done: boolean; ok: boolean; message?: string }> {
     const capabilities = normalizeCapabilities(step.capabilities) ?? []
     if (capabilities.includes('browser') && !this.config.browserTools.some((tool) => this.host.hasTool(tool))) {
       applyExecutorCapabilityUnavailable(state, step.id)
@@ -650,7 +804,7 @@ export class OrbitSupervisor {
       handle = await this.host.startRole({
         role: 'executor',
         label: `executor-${step.id}`,
-        prompt: this.executorPrompt(state, step),
+        prompt: this.executorPrompt(state, step, moaVerification),
         route: state.routes.executor,
         workspace: join(this.store.stateDir, '..'),
         toolFilter,
@@ -706,9 +860,12 @@ export class OrbitSupervisor {
       return { done: false, ok: false }
     }
 
+    const moaPrefix = moaVerification && state.moa_step
+      ? `MoA Judge 选择：${state.moa_step.winner_model ?? 'unknown'}（候选 ${state.moa_step.winning_candidate ?? '?'}）。\nJudge：${state.moa_step.judge_summary ?? ''}\n`
+      : ''
     applyExecutorSuccess(state, {
       ...(result.childId ? { childId: result.childId } : {}),
-      summary: truncateSafe(result.output, 2000),
+      summary: truncateSafe(moaPrefix + result.output, 2000),
       changedFiles: result.changedFiles ?? this.host.changedFiles(join(this.store.stateDir, '..')),
       testSummary: result.testSummary ?? [],
     })
@@ -716,7 +873,7 @@ export class OrbitSupervisor {
       stepId: step.id,
       bundle: buildEvidenceBundle({
         settlement: result.settlement,
-        executorOutput: result.output,
+        executorOutput: moaPrefix + result.output,
         changedFiles: state.changed_files,
         tools: result.toolEvidence,
         telemetry: result.telemetry,
@@ -744,7 +901,7 @@ export class OrbitSupervisor {
     }
   }
 
-  private executorPrompt(state: OrbitState, step: OrbitPlanStep): string {
+  private executorPrompt(state: OrbitState, step: OrbitPlanStep, moaVerification = false): string {
     const lines = [
       '你是 Orbit 执行员（Executor）。',
       '你只负责执行当前步骤：不要重新规划整个任务，也不要自行改变当前步骤的目标。',
@@ -752,6 +909,12 @@ export class OrbitSupervisor {
       '完成后用简体中文提交简洁的执行证据：做了什么、运行了哪些命令/测试、验证结果以及仍存在的风险。',
       '你的自然语言输出、执行说明和总结默认全部使用简体中文；代码、命令、路径、provider/model ID 等机器标识保持原样。',
       `当前步骤 ${step.id}：${step.goal}`,
+      ...(moaVerification ? [
+        '该步骤已由 MoA 生成多个候选并由 Judge 选出胜者，Supervisor 已确定性地把胜出文件提升到项目目录。',
+        '你的职责是对已应用结果做真实验证：检查 diff、运行必要测试，并只在验证发现明确小问题时做最小修正。不要重新运行 MoA，也不要自行选择另一个候选。',
+        `MoA 胜出：${state.moa_step?.winner_model ?? 'unknown'} / candidate-${state.moa_step?.winning_candidate ?? '?'}`,
+        `胜出候选摘要：${state.moa_step?.candidates.find((candidate) => candidate.index === state.moa_step?.winning_candidate)?.summary ?? '无'}`,
+      ] : []),
       `工作目录：${join(this.store.stateDir, '..')}`,
       `硬性约束：${state.user_hard_constraints.join('；') || '无'}`,
     ]
@@ -849,9 +1012,19 @@ export class OrbitSupervisor {
       if (reconsider.kind === 'replace') nextGoal = reconsider.replacementGoal
     }
 
+    const correctionMode = decision.next_step_execution_mode === undefined
+      ? normalizeExecutionMode(step.execution_mode)
+      : normalizeExecutionMode(decision.next_step_execution_mode)
+    if (correctionMode === 'MOA') {
+      const currentMoa = state.plan.steps.filter((candidate) => normalizeExecutionMode(candidate.execution_mode) === 'MOA').length
+      if (state.moa_policy === undefined || currentMoa >= state.moa_policy.max_moa_steps) {
+        return this.setNeedsUser(state, 'ORBIT_MOA_STEP_BUDGET_EXCEEDED')
+      }
+    }
     applyCorrectionStep(state, step, {
       nextGoal,
       capabilities: decision.next_step_capabilities,
+      executionMode: correctionMode,
     })
     this.store.writeState(state)
     return undefined
@@ -1121,6 +1294,8 @@ export class OrbitSupervisor {
       last_error: state.last_error,
       pending_user_reply: state.pending_user_reply,
       step_results: state.step_results,
+      moa_policy: state.moa_policy,
+      moa_step: state.moa_step,
       changed_files: state.changed_files,
       test_summary: state.test_summary,
       driver_ownership: state.driver_ownership,

@@ -1,6 +1,6 @@
 /** Durable Orbit state and decision vocabulary. */
 
-export const ORBIT_SCHEMA_VERSION = 2 as const
+export const ORBIT_SCHEMA_VERSION = 3 as const
 
 export type OrbitPhase =
   | 'PLAN'
@@ -15,17 +15,80 @@ export type OrbitStatus = 'running' | 'success' | 'stopped' | 'needs_user' | 'bu
 
 export type OrbitDriverOwnership = 'ACTIVE' | 'PAUSED' | 'AWAITING_USER' | 'CLOSED'
 
-export type OrbitRole = 'commander' | 'executor' | 'watchdog'
+export type OrbitRole = 'commander' | 'executor' | 'watchdog' | 'moa_candidate' | 'moa_judge'
 
 export type OrbitCapability = 'filesystem' | 'shell' | 'web' | 'browser'
 
 export type OrbitStepStatus = 'pending' | 'running' | 'passed' | 'needs_correction' | 'skipped'
 
+export type OrbitExecutionMode = 'SINGLE' | 'MOA'
+
 export interface OrbitPlanStep {
   id: string
   goal: string
   capabilities?: OrbitCapability[]
+  execution_mode?: OrbitExecutionMode
   status: OrbitStepStatus
+}
+
+export interface OrbitMoaPriceRow {
+  input: number
+  output: number
+  cacheHit?: number
+}
+
+export interface OrbitMoaUsage {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cost_usd?: number
+}
+
+export interface OrbitMoaPolicy {
+  enabled: boolean
+  candidate_count: number
+  peer_critique: boolean
+  max_moa_steps: number
+  candidates: OrbitRoute[]
+  judge: OrbitRoute
+  /** Optional user-configured dsh-moa prices, frozen with the Run for stable accounting. */
+  prices?: Record<string, OrbitMoaPriceRow>
+}
+
+export type OrbitMoaPhase = 'FANOUT' | 'JUDGE' | 'SELECTED' | 'PROMOTING' | 'PROMOTED' | 'FAILED'
+
+export interface OrbitMoaCandidateResult {
+  index: number
+  provider: string
+  model: string
+  ok: boolean
+  summary: string
+  files: string[]
+  usage?: OrbitMoaUsage
+  error?: string
+}
+
+export interface OrbitMoaPromotionReceipt {
+  files: Array<{ path: string; candidate_sha256: string; promoted_sha256: string }>
+  promoted_at: string
+}
+
+export interface OrbitMoaStepState {
+  step_id: string
+  phase: OrbitMoaPhase
+  adapter_version?: string
+  candidates: OrbitMoaCandidateResult[]
+  successful_candidates: number
+  failed_candidates: number
+  judge_summary?: string
+  winning_candidate?: number
+  winner_model?: string
+  judge_usage?: OrbitMoaUsage
+  total_usage?: OrbitMoaUsage
+  promotion_receipt?: OrbitMoaPromotionReceipt
+  last_error?: string
 }
 
 export type GuardCode =
@@ -72,6 +135,10 @@ export interface OrbitState extends Record<string, unknown> {
   goal_hash: string
   preset: string
   routes: OrbitRoutes
+  /** Frozen MoA policy for this Run. Absent on legacy states and when MoA is disabled. */
+  moa_policy?: OrbitMoaPolicy
+  /** Durable state for the currently or most recently executed MoA step. */
+  moa_step?: OrbitMoaStepState
   loop: { used: number; max: number }
   /** New runs record whether the loop cap came from Orbit or an explicit caller. Old states may omit it. */
   loop_budget_mode?: 'automatic' | 'explicit'
@@ -127,7 +194,8 @@ export interface CommanderDecision {
   summary?: string
   next_step_goal?: string
   next_step_capabilities?: unknown
-  next_steps?: Array<string | { goal: string; capabilities?: unknown }>
+  next_step_execution_mode?: unknown
+  next_steps?: Array<string | { goal: string; capabilities?: unknown; execution_mode?: unknown }>
 }
 
 export interface StrategyDecision {
@@ -193,6 +261,10 @@ export const MAX_WATCHDOG_CALLS_PER_STEP = 2
 export const MAX_EXECUTOR_INTERRUPT_RETRIES = 2
 export const MAX_PLAN_STEPS = 5
 export const MIN_PLAN_STEPS = 1
+export const MIN_MOA_CANDIDATES = 2
+export const MAX_MOA_CANDIDATES = 4
+export const DEFAULT_MOA_CANDIDATES = 3
+export const DEFAULT_MAX_MOA_STEPS = 2
 export const DEFAULT_LOOP_BUDGET = 5
 /** Automatic runs reserve two bounded execution slots beyond the accepted base plan. */
 export const AUTOMATIC_LOOP_RECOVERY_RESERVE = 2

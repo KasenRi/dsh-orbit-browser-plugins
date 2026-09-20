@@ -17,7 +17,7 @@ export interface OrbitRouteValue {
 }
 
 /** The roles the Orbit control edits. */
-export type OrbitRoleName = 'commander' | 'executor' | 'watchdog'
+export type OrbitRoleName = 'commander' | 'executor' | 'watchdog' | 'moa-candidate-1' | 'moa-candidate-2' | 'moa-candidate-3' | 'moa-candidate-4' | 'moa-judge'
 
 type ModelEntry = ModelDirectoryState['groups'][number]['models'][number]
 
@@ -26,22 +26,69 @@ export interface OrbitSessionState {
   readonly enabled: boolean
 }
 
+export interface OrbitRuntimeUsage {
+  readonly input_tokens: number
+  readonly output_tokens: number
+  readonly total_tokens: number
+  readonly cache_read_tokens?: number
+  readonly cache_write_tokens?: number
+  readonly cost_usd?: number
+}
+
+export interface OrbitRuntimeState {
+  readonly runId: string
+  readonly phase: string
+  readonly status: string
+  readonly loop: { readonly used: number; readonly max: number }
+  readonly currentStep?: { readonly id: string; readonly attempt: number; readonly executionMode: 'SINGLE' | 'MOA' }
+  readonly moa?: {
+    readonly phase: string
+    readonly candidates: ReadonlyArray<{
+      readonly index: number
+      readonly provider: string
+      readonly model: string
+      readonly ok: boolean
+      readonly files: number
+      readonly usage?: OrbitRuntimeUsage
+    }>
+    readonly judgeModel?: string
+    readonly winningCandidate?: number
+    readonly winnerModel?: string
+    readonly totalUsage?: OrbitRuntimeUsage
+  }
+  readonly updatedAt: string
+}
+
 declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionStateMap {
     /** Per-Session Orbit enable state folded from `/orbit-toggle` records. */
     orbitSession: OrbitSessionState
+    /** Bounded Orbit runtime state for the owning Session. */
+    orbitRuntime: OrbitRuntimeState | null
   }
   interface SessionProjectionMap {
     /** Per-Session Orbit enable state as this control reads it. */
     orbitSession: OrbitSessionState
+    /** Bounded Orbit runtime state as this control reads it. */
+    orbitRuntime: OrbitRuntimeState | null
   }
 }
 
 /** Mirror of the `orbit` settings namespace, React-free. */
+export interface OrbitMoaSettingsValue {
+  enabled: boolean
+  candidateCount: number
+  peerCritique: boolean
+  maxMoaSteps: number
+  candidates: OrbitRouteValue[]
+  judge?: OrbitRouteValue
+}
+
 export interface OrbitSettingsState {
   status: 'loading' | 'ready' | 'error'
   commander?: OrbitRouteValue
   watchdog?: OrbitRouteValue
+  moa: OrbitMoaSettingsValue
   revision?: number
   error?: string
 }
@@ -58,8 +105,10 @@ export interface OrbitModelInjected {
   loadModels: () => void
   /** Submit one selection through the shared directory (native two-way sync). */
   selectModel: (selection: ModelSelection) => Promise<boolean>
-  /** Persist one Commander/Watchdog route; never touches the Session model. */
-  writeRole: (role: 'commander' | 'watchdog', route: OrbitRouteValue) => Promise<boolean>
+  /** Persist one non-Executor route; never touches the Session model. */
+  writeRole: (role: Exclude<OrbitRoleName, 'executor'>, route: OrbitRouteValue) => Promise<boolean>
+  /** Persist bounded MoA policy values. */
+  writeMoaPolicy: (patch: Partial<Pick<OrbitMoaSettingsValue, 'enabled' | 'candidateCount' | 'peerCritique' | 'maxMoaSteps'>>) => Promise<boolean>
   /** Toggle the current Session's Orbit default (host command, durable record). */
   setOrbitEnabled: (enabled: boolean) => Promise<boolean>
   /** Re-read the `orbit` settings namespace after a failure. */

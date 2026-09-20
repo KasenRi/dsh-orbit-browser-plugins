@@ -1,5 +1,5 @@
 import type { EvidenceToolFact } from '../../src/evidence.ts'
-import type { OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult, RoleToolFilter } from '../../src/host.ts'
+import type { ModelRunRequest, ModelRunResult, OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult, RoleToolFilter } from '../../src/host.ts'
 import type { TurnSettlement } from '../../src/settlement.ts'
 import type { OrbitTelemetry } from '../../src/types.ts'
 import type { OrbitRole, OrbitRoute } from '../../src/types.ts'
@@ -35,6 +35,7 @@ export class FakeHost implements OrbitHost {
   readonly disposed: Array<string | undefined> = []
   readonly snapshots: Array<{ childId?: string; telemetry: OrbitTelemetry }> = []
   readonly started: StartedRole[] = []
+  readonly modelCalls: ModelRunRequest[] = []
   readonly tools = new Set<string>(['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser'])
   drivers: string[] = []
   changed: string[] = []
@@ -112,6 +113,18 @@ export class FakeHost implements OrbitHost {
     return handle
   }
 
+  async runModel(request: ModelRunRequest): Promise<ModelRunResult> {
+    const queue = this.queues.get('model')
+    const script = queue?.shift()
+    if (!script) throw new Error(`FakeHost: no script left for model (${request.label})`)
+    this.modelCalls.push(request)
+    return {
+      output: script.output ?? '',
+      interrupted: script.interrupted === true,
+      ...(script.reason ? { reason: script.reason } : {}),
+    }
+  }
+
   async interruptRole(handle: RoleHandle, reason: string): Promise<void> {
     this.interruptCalls.push({ childId: handle.childId, reason })
   }
@@ -122,7 +135,7 @@ export class FakeHost implements OrbitHost {
     return this.tools.has(name)
   }
 
-  async validateRoutes(_routes: Readonly<Record<OrbitRole, OrbitRoute>>): Promise<string[]> {
+  async validateRoutes(_routes: Readonly<Record<string, OrbitRoute>>): Promise<string[]> {
     return [...this.routeIssues]
   }
 

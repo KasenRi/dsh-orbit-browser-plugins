@@ -132,6 +132,10 @@ export function registerOrbitToggleCommand(ctx: Context): void {
 export interface OrbitGestureBoundaryOptions {
   /** Whether the current Session defaults ordinary messages into Orbit. */
   sessionEnabled?: (session: Session) => boolean
+  /** Early ownership fence evaluated before downstream pre-step hooks. */
+  competingMutationBlock?: (agent: Agent, messages: readonly UserMessage[]) => string | undefined
+  /** Surface an ownership-fence notice without invoking the parent model. */
+  onBlocked?: (agent: Agent, reason: string) => void
   /**
    * Host-side activation: start or resume the existing `OrbitService`. Returns
    * only after the run settles, so the consumed turn owns exactly one mutation
@@ -151,6 +155,12 @@ export interface OrbitGestureBoundaryOptions {
 export function installOrbitGestureBoundary(ctx: Context, options: OrbitGestureBoundaryOptions = {}): void {
   ctx.on('agent/pre-step', async (payload, next): Promise<PreStepDecision> => {
     const { agent, messages, signal } = payload
+    const blocked = options.competingMutationBlock?.(agent, messages)
+    if (blocked !== undefined) {
+      for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' })
+      options.onBlocked?.(agent, blocked)
+      return { kind: 'enter', messages: [] }
+    }
     const decision = await next()
     if (decision.kind === 'reject') return decision
 

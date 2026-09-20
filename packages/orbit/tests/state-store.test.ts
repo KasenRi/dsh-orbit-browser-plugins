@@ -90,6 +90,20 @@ test('active run with a different goal is rejected', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('schema 2 durable state remains readable and upgrades to schema 3 on the next write', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-schema2-state-'))
+  const store = new OrbitStateStore(dir)
+  const state = new OrbitSupervisor(store, new FakeHost(), config).createState({ goal: 'legacy', approved_loop_count: 3 })
+  mkdirSync(join(dir, '.cx'), { recursive: true })
+  writeFileSync(store.statePath, JSON.stringify({ ...state, schema_version: 2 }))
+  const legacy = store.readState()
+  assert.equal((legacy as unknown as { schema_version: number }).schema_version, 2)
+  assert.equal(legacy?.goal, 'legacy')
+  store.writeState(legacy!)
+  assert.equal(store.readState()?.schema_version, 3)
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('invalid and future state are never treated as an empty run', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-invalid-state-'))
   const store = new OrbitStateStore(dir)

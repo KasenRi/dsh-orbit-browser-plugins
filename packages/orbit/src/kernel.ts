@@ -14,10 +14,15 @@ import {
   MAX_PLAN_STEPS,
   MAX_WATCHDOG_CALLS_PER_STEP,
   MIN_PLAN_STEPS,
+  MIN_MOA_CANDIDATES,
+  MAX_MOA_CANDIDATES,
+  DEFAULT_MAX_MOA_STEPS,
   ORBIT_SCHEMA_VERSION,
   type CommanderDecision,
   type GuardCode,
   type OrbitCapability,
+  type OrbitExecutionMode,
+  type OrbitMoaPolicy,
   type OrbitPlanStep,
   type OrbitRoutes,
   type OrbitState,
@@ -30,6 +35,54 @@ export const ORBIT_CAPABILITIES: readonly OrbitCapability[] = ['filesystem', 'sh
 const STEP_CAPABILITIES = new Set<string>(ORBIT_CAPABILITIES)
 
 const PLAN_STEP_ID = /^P\d+$/u
+
+export function normalizeExecutionMode(value: unknown): OrbitExecutionMode {
+  return value === 'MOA' ? 'MOA' : 'SINGLE'
+}
+
+export function normalizeMoaPolicy(policy: OrbitMoaPolicy | undefined): OrbitMoaPolicy | undefined {
+  if (policy === undefined || policy.enabled !== true) return undefined
+  if (!Number.isSafeInteger(policy.candidate_count) || policy.candidate_count < MIN_MOA_CANDIDATES || policy.candidate_count > MAX_MOA_CANDIDATES) {
+    throw new Error(`ORBIT_MOA_CANDIDATE_COUNT_INVALID: expected ${MIN_MOA_CANDIDATES}-${MAX_MOA_CANDIDATES}`)
+  }
+  if (!Number.isSafeInteger(policy.max_moa_steps) || policy.max_moa_steps < 1 || policy.max_moa_steps > MAX_PLAN_STEPS) {
+    throw new Error(`ORBIT_MOA_STEP_BUDGET_INVALID: expected 1-${MAX_PLAN_STEPS}`)
+  }
+  if (policy.candidates.length < policy.candidate_count) {
+    throw new Error('ORBIT_MOA_ROUTES_INCOMPLETE: 候选模型数量不足。')
+  }
+  const candidates = policy.candidates.slice(0, policy.candidate_count).map((route) => structuredClone(route))
+  if (candidates.some((route) => !route.provider || !route.model) || !policy.judge?.provider || !policy.judge.model) {
+    throw new Error('ORBIT_MOA_ROUTES_INCOMPLETE: 候选模型或 Judge 未完整配置。')
+  }
+  const prices = policy.prices === undefined
+    ? undefined
+    : Object.fromEntries(Object.entries(policy.prices).flatMap(([key, row]) => {
+        const input = Number(row?.input)
+        const output = Number(row?.output)
+        const cacheHit = row?.cacheHit === undefined ? undefined : Number(row.cacheHit)
+        if (!Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0 || (cacheHit !== undefined && (!Number.isFinite(cacheHit) || cacheHit < 0))) return []
+        return [[key, { input, output, ...(cacheHit === undefined ? {} : { cacheHit }) }]]
+      }))
+  return {
+    enabled: true,
+    candidate_count: policy.candidate_count,
+    peer_critique: policy.peer_critique === true,
+    max_moa_steps: policy.max_moa_steps || DEFAULT_MAX_MOA_STEPS,
+    candidates,
+    judge: structuredClone(policy.judge),
+    ...(prices && Object.keys(prices).length > 0 ? { prices } : {}),
+  }
+}
+
+export function assertMoaPlanWithinPolicy(plan: { steps: OrbitPlanStep[] }, policy: OrbitMoaPolicy | undefined): void {
+  const moaSteps = plan.steps.filter((step) => normalizeExecutionMode(step.execution_mode) === 'MOA').length
+  if (moaSteps === 0) return
+  if (policy === undefined) throw new Error('ORBIT_MOA_UNAVAILABLE: 当前 Run 未启用或未完整配置 MoA。')
+  if (moaSteps > policy.max_moa_steps) {
+    throw new Error(`ORBIT_MOA_STEP_BUDGET_EXCEEDED: plan requests ${moaSteps}, max is ${policy.max_moa_steps}`)
+  }
+}
 
 export function normalizeCapabilities(value: unknown): OrbitCapability[] | undefined {
   if (!Array.isArray(value)) return undefined
@@ -61,10 +114,12 @@ export function normalizePlan(plan: CommanderPlan): { summary: string; steps: Or
     const id = PLAN_STEP_ID.test(rawId) ? rawId : `P${index}`
     const goal = String(record.goal ?? '').trim()
     const capabilities = normalizeCapabilities(record.capabilities)
+    const execution_mode = normalizeExecutionMode(record.execution_mode)
     return {
       id,
       goal,
       ...(capabilities ? { capabilities } : {}),
+      ...(execution_mode === 'MOA' ? { execution_mode } : {}),
       status: 'pending' as const,
     }
   })
@@ -148,6 +203,7 @@ export function hashGoal(goal: string): string {
 export interface AppendedStep {
   goal: string
   capabilities?: OrbitCapability[]
+  execution_mode?: OrbitExecutionMode
 }
 
 /** Normalize an APPEND decision into bounded, deduplicated new plan steps. */
@@ -160,14 +216,16 @@ export function normalizeAppend(decision: CommanderDecision): AppendedStep[] {
         const goal = String((entry as { goal?: unknown }).goal ?? '').trim()
         if (goal) {
           const capabilities = normalizeCapabilities((entry as { capabilities?: unknown }).capabilities)
-          items.push({ goal, ...(capabilities ? { capabilities } : {}) })
+          const execution_mode = normalizeExecutionMode((entry as { execution_mode?: unknown }).execution_mode)
+          items.push({ goal, ...(capabilities ? { capabilities } : {}), ...(execution_mode === 'MOA' ? { execution_mode } : {}) })
         }
       }
     }
   }
   if (items.length === 0 && decision.next_step_goal?.trim()) {
     const capabilities = normalizeCapabilities(decision.next_step_capabilities)
-    items.push({ goal: decision.next_step_goal.trim(), ...(capabilities ? { capabilities } : {}) })
+    const execution_mode = normalizeExecutionMode(decision.next_step_execution_mode)
+    items.push({ goal: decision.next_step_goal.trim(), ...(capabilities ? { capabilities } : {}), ...(execution_mode === 'MOA' ? { execution_mode } : {}) })
   }
   return items
 }
@@ -198,6 +256,7 @@ export interface InitialStateInput {
   goal: string
   preset?: string
   routes: OrbitRoutes
+  moaPolicy?: OrbitMoaPolicy
   approvedLoopCount?: number
   maxLoops?: number
   userHardConstraints?: readonly string[]
@@ -209,6 +268,7 @@ export interface InitialStateInput {
 export function createInitialState(input: InitialStateInput): OrbitState {
   const explicit = explicitLoopBudget({ approved_loop_count: input.approvedLoopCount, max_loops: input.maxLoops })
   const max = explicit ?? DEFAULT_LOOP_BUDGET
+  const moaPolicy = normalizeMoaPolicy(input.moaPolicy)
   return {
     schema_version: ORBIT_SCHEMA_VERSION,
     active_run_id: input.runId,
@@ -222,6 +282,7 @@ export function createInitialState(input: InitialStateInput): OrbitState {
     goal_hash: hashGoal(input.goal),
     preset: input.preset ?? 'orbit-lite',
     routes: structuredClone(input.routes),
+    ...(moaPolicy ? { moa_policy: moaPolicy } : {}),
     loop: { used: 0, max },
     loop_budget_mode: explicit === undefined ? 'automatic' : 'explicit',
     approved_loop_count: max,
@@ -376,6 +437,9 @@ export function applyFinalAppend(state: OrbitState, decision: CommanderDecision)
   const remaining = state.loop.max - state.loop.used
   const appended = normalizeAppend(decision)
   if (appended.length === 0) return 'invalid'
+  const currentMoa = state.plan.steps.filter((step) => normalizeExecutionMode(step.execution_mode) === 'MOA').length
+  const addedMoa = appended.filter((step) => normalizeExecutionMode(step.execution_mode) === 'MOA').length
+  if (addedMoa > 0 && (state.moa_policy === undefined || currentMoa + addedMoa > state.moa_policy.max_moa_steps)) return 'invalid'
   if (remaining <= 0) {
     enterBudgetExhausted(state)
     return 'budget_exhausted'
@@ -387,6 +451,7 @@ export function applyFinalAppend(state: OrbitState, decision: CommanderDecision)
       id: `P${index}`,
       goal: item.goal,
       ...(item.capabilities ? { capabilities: item.capabilities } : {}),
+      ...(item.execution_mode === 'MOA' ? { execution_mode: 'MOA' as const } : {}),
       status: 'pending',
     })
   }
@@ -401,6 +466,8 @@ export interface CorrectionStepInput {
   nextGoal: string
   /** Raw capabilities from the Commander decision; falls back to the corrected step. */
   capabilities?: unknown
+  /** Raw execution mode; falls back to the corrected step. */
+  executionMode?: unknown
 }
 
 /** CORRECT_CURRENT_STEP: insert the next correction step after the corrected one. */
@@ -412,10 +479,14 @@ export function applyCorrectionStep(state: OrbitState, step: OrbitPlanStep, inpu
   const correctionCapabilities = input.capabilities === undefined
     ? step.capabilities
     : normalizeCapabilities(input.capabilities)
+  const correctionMode = input.executionMode === undefined
+    ? normalizeExecutionMode(step.execution_mode)
+    : normalizeExecutionMode(input.executionMode)
   state.plan.steps.splice(insertAt, 0, {
     id: `${base}-${number}`,
     goal: input.nextGoal,
     ...(correctionCapabilities ? { capabilities: correctionCapabilities } : {}),
+    ...(correctionMode === 'MOA' ? { execution_mode: 'MOA' as const } : {}),
     status: 'pending',
   })
   state.phase = 'EXECUTE'

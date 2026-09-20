@@ -3,11 +3,14 @@ import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { DshOrbitHost } from './dsh-host.ts'
+import { OrbitMoaAdapter } from './moa-adapter.ts'
 import { OrbitStateStore } from './state-store.ts'
 import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome } from './supervisor.ts'
-import type { OrbitActionResult, OrbitRoutes, GuardCode } from './types.ts'
+import type { OrbitActionResult, OrbitMoaPolicy, OrbitRoutes, GuardCode } from './types.ts'
 import type { OrbitConfiguredRoutes } from './routes.ts'
+import { orbitRuntimeFromState } from './session-state.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -26,6 +29,8 @@ export interface OrbitPluginConfig {
    * Optional so minimal/headless compositions keep using `routes` unchanged.
    */
   resolveRoutes?: () => OrbitRoutes
+  /** Freeze optional MoA candidates/Judge and bounded policy for a NEW run. */
+  resolveMoaPolicy?: () => OrbitMoaPolicy | undefined
   /**
    * Resolve the DSH Session driving the current operation. A new run records
    * it and only that Session may answer its NEEDS_USER question.
@@ -45,20 +50,31 @@ export interface OrbitDoctorReport {
 }
 
 export class OrbitService extends Service {
+  private readonly root: Context
   private readonly host: DshOrbitHost
   private readonly config: OrbitPluginConfig
   private readonly executions = new Map<string, { controller: AbortController; result: Promise<OrbitActionResult> }>()
 
   constructor(ctx: Context, config: OrbitPluginConfig) {
     super(ctx, 'orbit')
+    this.root = ctx
     this.host = new DshOrbitHost(ctx)
     this.config = config
   }
 
+  private publishRuntime(state: import('./types.ts').OrbitState): void {
+    const owner = state.owner_session_id
+    if (!owner) return
+    const session = this.root.sessions.get(SessionId(owner))
+    if (!session) return
+    session.append('orbit/runtime', orbitRuntimeFromState(state))
+  }
+
   supervisorFor(projectDir: string): OrbitSupervisor {
-    return new OrbitSupervisor(new OrbitStateStore(projectDir), this.host, {
+    return new OrbitSupervisor(new OrbitStateStore(projectDir, (state) => this.publishRuntime(state)), this.host, {
       defaultRoutes: this.config.routes,
       ...(this.config.resolveRoutes ? { resolveRoutes: this.config.resolveRoutes } : {}),
+      ...(this.config.resolveMoaPolicy ? { resolveMoaPolicy: this.config.resolveMoaPolicy } : {}),
       ...(this.config.resolveOwnerSessionId ? { resolveOwnerSessionId: this.config.resolveOwnerSessionId } : {}),
       browserTools: this.config.browserTools,
       commanderReadOnlyTools: this.config.commanderReadOnlyTools,
@@ -193,10 +209,25 @@ export class OrbitService extends Service {
     })
     const reflect = this.ctx.reflect
     checks.push({ name: 'model-registry', status: reflect.get('llm') ? 'pass' : 'fail', detail: '使用 DSH 当前 LLM registry 校验模型，不内置角色模型。' })
-    checks.push({ name: 'orbit-settings', status: reflect.get('settings') ? 'pass' : 'warn', detail: 'Commander / Watchdog 使用用户 Orbit 设置或显式 profile routes。' })
+    checks.push({ name: 'orbit-settings', status: reflect.get('settings') ? 'pass' : 'warn', detail: 'Commander / Watchdog / MoA 使用用户 Orbit 设置或显式 profile routes。' })
+    try {
+      const policy = this.config.resolveMoaPolicy?.()
+      const availability = await new OrbitMoaAdapter(this.host).availability()
+      checks.push({
+        name: 'moa-integration',
+        status: policy && !availability.available ? 'warn' : 'pass',
+        detail: availability.available
+          ? `@goodandready/dsh-moa ${availability.version ?? ''} 可用；Orbit 使用隔离候选、Judge 选优和受控 Promotion。`
+          : policy
+            ? availability.reason ?? 'MoA 不可用'
+            : 'MoA 未启用；Orbit 单 Executor 模式不受影响。',
+      })
+    } catch (error) {
+      checks.push({ name: 'moa-integration', status: 'warn', detail: String(error) })
+    }
     try {
       const routes = this.config.resolveRoutes?.()
-      const issues = routes ? await this.host.validateRoutes(routes) : ['未配置模型解析来源']
+      const issues = routes ? await this.host.validateRoutes({ ...routes }) : ['未配置模型解析来源']
       checks.push({ name: 'role-model-configuration', status: issues.length ? 'warn' : 'pass', detail: issues.join('；') || '三角色用户模型配置可用。' })
     } catch (error) {
       checks.push({ name: 'role-model-configuration', status: 'warn', detail: String(error) })

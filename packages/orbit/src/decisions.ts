@@ -37,6 +37,7 @@ export const COMMANDER_PLAN_SCHEMA: ObjectJsonSchema = {
           id: { type: 'string', description: '稳定标识，例如 P0。' },
           goal: { type: 'string' },
           capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+          execution_mode: { type: 'string', enum: ['SINGLE', 'MOA'] },
         },
       },
     },
@@ -52,6 +53,7 @@ export const COMMANDER_STEP_EVALUATE_SCHEMA: ObjectJsonSchema = {
     reason: { type: 'string' },
     next_step_goal: { type: 'string' },
     next_step_capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+    next_step_execution_mode: { type: 'string', enum: ['SINGLE', 'MOA'] },
   },
 }
 
@@ -64,6 +66,7 @@ export const COMMANDER_FINAL_EVALUATE_SCHEMA: ObjectJsonSchema = {
     summary: { type: 'string' },
     next_step_goal: { type: 'string' },
     next_step_capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+    next_step_execution_mode: { type: 'string', enum: ['SINGLE', 'MOA'] },
     next_steps: {
       type: 'array',
       items: {
@@ -76,6 +79,7 @@ export const COMMANDER_FINAL_EVALUATE_SCHEMA: ObjectJsonSchema = {
             properties: {
               goal: { type: 'string' },
               capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
+              execution_mode: { type: 'string', enum: ['SINGLE', 'MOA'] },
             },
           },
         ],

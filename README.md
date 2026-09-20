@@ -14,6 +14,8 @@ Not affiliated with or endorsed by DeepSeek.
 
 Orbit 把工作分成不同角色：更强的模型可以负责规划和审核，价格更低的模型负责大量实际执行，因此可以在保证关键环节质量的同时，让低成本模型也真正参与到工程里，**降低整个项目使用 AI 的总成本**。
 
+从 v0.6.0 开始，Orbit 还可以选择性配合 `@goodandready/dsh-moa@0.2.19`：对于存在多种合理实现路线的关键步骤，让 2–4 个候选模型独立提出方案，由 Judge 做相对选优，再由 Orbit 受控写回、真实测试并交给 Commander 最终审核。MoA 不接管 Orbit 状态机，也不能直接决定 Step 通过。
+
 同时，Smart Watchdog 会关注运行中的异常情况。如果执行器长时间没有进展、出现卡死、超时或中断，Watchdog 可以介入诊断，并尝试恢复任务，而不是让整个工程静默停在那里。
 
 适合的场景包括：代码修改、项目维护、批量文件处理、自动测试、需要多步骤推进的工程任务，以及你希望“交代完目标以后先让 AI 自己干”的工作。
@@ -104,6 +106,9 @@ dsh plugin --profile web add @kasenri/dsh-browser
 # Both (Orbit browser-capability steps may then use the browser plugin)
 dsh plugin --profile web add @kasenri/dsh-orbit
 dsh plugin --profile web add @kasenri/dsh-browser
+
+# Optional MoA integration for Orbit v0.6.0
+dsh plugin --profile web add @goodandready/dsh-moa@0.2.19
 ```
 
 The dedicated Git distribution mirrors (`github:KasenRi/dsh-orbit` and
@@ -125,6 +130,8 @@ The most deterministic way to start Orbit is the slash command:
 ```text
 /agent-orbit 修复当前项目的 TypeScript 错误并运行测试
 ```
+
+Orbit v0.6.0 的可选 MoA 模式保持同一顶层 Supervisor：Candidate/Judge 使用冻结的 DSH routes、零工具运行，候选只写入 `.cx/moa/` 隔离区；胜出结果由 Orbit Supervisor 受控提升，Executor 真实验证，Commander 最终验收。运行态通过 DSH Session projection 显示 Candidate/Judge 进度与真实 Token；有显式价格表时同时显示成本。当 Orbit Run 为 ACTIVE 时，Orbit 会先于下游 hook 阻止独立 `/moa`，避免原版 MoA 的自动 Promotion 与 Orbit 同时争夺 workspace。
 
 Orbit supports three activation styles:
 

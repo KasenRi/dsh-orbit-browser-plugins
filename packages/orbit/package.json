@@ -1,6 +1,6 @@
 {
   "name": "@kasenri/dsh-orbit",
-  "version": "0.5.10",
+  "version": "0.6.0",
   "type": "module",
   "description": "让 AI 项目可以在无人监管下持续推进。Orbit 会自动规划任务、分工执行、逐步检查并继续完成后续工作；不同环节可以使用不同模型，让低成本模型承担执行任务、强模型负责规划和审核，从而降低整体 AI 使用成本。Watchdog 还会监控运行异常，在任务卡死或中断时协助恢复。",
   "license": "MIT",
@@ -61,13 +61,17 @@
     "@deepseek-ai/dsh-commands": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-llm": "^0.1.5-rc.2",
     "@deepseek-ai/dsh-subagent": "^0.1.5-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@goodandready/dsh-moa": "0.2.19"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-commands": {
       "optional": true
     },
     "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@goodandready/dsh-moa": {
       "optional": true
     }
   }

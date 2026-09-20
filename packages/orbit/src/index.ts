@@ -6,7 +6,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { installOrbitGestureBoundary, registerOrbitCommand, registerOrbitToggleCommand } from './activation.ts'
 import { createOrbitPreExecuteHandler } from './pipeline-guard.ts'
-import { agentDefaultSelectionOf, resolveEffectiveRoutes, sessionModelSelectionOf, sessionModelStateOf, type OrbitRouteSettings } from './routes.ts'
+import { agentDefaultSelectionOf, resolveEffectiveRoutes, resolveMoaPolicy, sessionModelSelectionOf, sessionModelStateOf, type OrbitMoaRouteSettings, type OrbitRouteSettings } from './routes.ts'
 import { installOrbitSessionProjection, orbitEnabledOf } from './session-state.ts'
 import { OrbitService, type OrbitPluginConfig } from './service.ts'
 import { createOrbitTool } from './tool.ts'
@@ -14,7 +14,7 @@ import type { OrbitActionResult, OrbitRoute } from './types.ts'
 import type { OrbitConfiguredRoutes } from './routes.ts'
 
 export const name = 'dsh-orbit'
-export const inject = ['tools', 'agents', 'subagents']
+export const inject = ['tools', 'agents', 'subagents', 'sessions']
 
 const Route = z.object({
   provider: z.string(),
@@ -29,9 +29,19 @@ const RoleRoute = z.object({
 })
 
 /** `orbit` settings namespace: the two role routes Orbit persists itself. */
+export const OrbitMoaSettingsSchema = z.object({
+  enabled: z.boolean().default(false),
+  candidateCount: z.natural().default(3),
+  peerCritique: z.boolean().default(false),
+  maxMoaSteps: z.natural().default(2),
+  candidates: z.array(RoleRoute).default([]),
+  judge: RoleRoute,
+})
+
 export const OrbitRouteSettingsSchema = z.object({
   commander: RoleRoute,
   watchdog: RoleRoute,
+  moa: OrbitMoaSettingsSchema,
 })
 
 export const Config = z.object({
@@ -43,6 +53,7 @@ export const Config = z.object({
       watchdog: Route,
     })
     .default({} as never),
+  moa: OrbitMoaSettingsSchema.default({} as never),
   browserTools: z.array(z.string()).default(['agent_browser']),
   commanderReadOnlyTools: z.array(z.string()).default(['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch']),
   watchdogTools: z.array(z.string()).default(['read', 'read_image', 'glob', 'grep']),
@@ -58,6 +69,7 @@ export const Config = z.object({
 export interface OrbitConfigShape {
   projectDir?: string
   routes: OrbitConfiguredRoutes
+  moa: OrbitMoaRouteSettings
   browserTools: string[]
   commanderReadOnlyTools: string[]
   watchdogTools: string[]
@@ -76,15 +88,37 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
   // Orbit settings bridge. The package ships no model defaults; only explicit
   // profile routes can act as a headless compatibility fallback.
   let readRouteSettings: () => OrbitRouteSettings | undefined = () => undefined
+  let readMoaPrices: () => Record<string, { input: number; output: number; cacheHit?: number }> | undefined = () => undefined
   ctx.inject(['settings'], (settingsCtx) => {
     const scope = settingsCtx.settings.register('orbit', OrbitRouteSettingsSchema, {
       base: {
         commander: { provider: '', model: '', reasoningEffort: '' },
         watchdog: { provider: '', model: '', reasoningEffort: '' },
+        moa: {
+          enabled: config.moa.enabled ?? false,
+          candidateCount: config.moa.candidateCount ?? 3,
+          peerCritique: config.moa.peerCritique ?? false,
+          maxMoaSteps: config.moa.maxMoaSteps ?? 2,
+          candidates: (config.moa.candidates ?? []).map((route) => ({
+            provider: route.provider,
+            model: route.model,
+            reasoningEffort: route.reasoningEffort ?? '',
+          })),
+          judge: config.moa.judge
+            ? { provider: config.moa.judge.provider, model: config.moa.judge.model, reasoningEffort: config.moa.judge.reasoningEffort ?? '' }
+            : { provider: '', model: '', reasoningEffort: '' },
+        },
       },
     })
     readRouteSettings = () => scope.get()
-    settingsCtx.effect(() => () => { readRouteSettings = () => undefined })
+    readMoaPrices = () => {
+      const value = settingsCtx.settings.get('dsh-moa') as { prices?: Record<string, { input: number; output: number; cacheHit?: number }> } | undefined
+      return value?.prices
+    }
+    settingsCtx.effect(() => () => {
+      readRouteSettings = () => undefined
+      readMoaPrices = () => undefined
+    })
   })
 
   // A NEW run resolves its three routes exactly once: Commander/Watchdog from
@@ -108,6 +142,12 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
 
   // The DSH Session driving the current operation: a new run records it, and
   // only that Session may answer the run's NEEDS_USER question.
+  const resolveMoaPolicyForRun = () => resolveMoaPolicy({
+    settings: readRouteSettings()?.moa,
+    config: config.moa,
+    ...(readMoaPrices() ? { prices: readMoaPrices() } : {}),
+  })
+
   const resolveOwnerSessionId = (): string | undefined => {
     const agent = ctx.agents.currentInitiator()
     return agent === undefined ? undefined : String(agent.session.id)
@@ -116,6 +156,7 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
   const serviceConfig: OrbitPluginConfig = {
     routes: config.routes,
     resolveRoutes,
+    resolveMoaPolicy: resolveMoaPolicyForRun,
     resolveOwnerSessionId,
     browserTools: config.browserTools,
     commanderReadOnlyTools: config.commanderReadOnlyTools,
@@ -150,6 +191,16 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
 
   installOrbitGestureBoundary(ctx, {
     sessionEnabled: (session) => orbitEnabledOf(ctx, session),
+    competingMutationBlock: (agent, messages) => {
+      const cwd = agent.session.header.cwd ?? process.cwd()
+      if (!service.hasActiveRun(cwd)) return undefined
+      const latest = [...messages].reverse().find((message) => message.source.kind === 'user')
+      const text = latest?.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n').trimStart() ?? ''
+      return /^\/moa(?=$|[\t\n\r ])/u.test(text)
+        ? 'ORBIT_MUTATION_DRIVER_CONFLICT: 当前 workspace 已由 Orbit 持有，不能同时启动独立 /moa。请先完成或停止当前 Orbit Run。'
+        : undefined
+    },
+    onBlocked: (agent, reason) => appendOrbitNotice(agent.session, reason),
     activate: async (agent, goal, position, signal) => {
       const cwd = agent.session.header.cwd ?? process.cwd()
       let result: OrbitActionResult

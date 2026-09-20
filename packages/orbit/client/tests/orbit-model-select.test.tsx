@@ -8,7 +8,7 @@ import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client
 import type { ModelDirectoryState } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import { OrbitModelSelect } from '../OrbitModelSelect.tsx'
 import { zh } from '../locales.ts'
-import type { OrbitRouteValue, OrbitSessionState, OrbitSettingsState } from '../model-options.ts'
+import type { OrbitRouteValue, OrbitRuntimeState, OrbitSessionState, OrbitSettingsState } from '../model-options.ts'
 import { lastAnchoredMaxHeight, lastAnchoredPosition } from './helpers/primitives-stub.tsx'
 
 const t: ComponentProps<typeof OrbitModelSelect>['t'] = (key) => (zh as Record<string, string>)[key] ?? key
@@ -48,6 +48,7 @@ function settingsState(overrides: Partial<OrbitSettingsState> = {}): OrbitSettin
     status: 'ready',
     commander: { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' },
     watchdog: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'low' },
+    moa: { enabled: false, candidateCount: 3, peerCritique: false, maxMoaSteps: 2, candidates: [] },
     revision: 3,
     ...overrides,
   }
@@ -57,8 +58,10 @@ interface Harness {
   directory: SnapshotStore<ModelDirectoryState>
   settings: SnapshotStore<OrbitSettingsState>
   projection: SnapshotStore<OrbitSessionState | undefined>
+  runtimeProjection: SnapshotStore<OrbitRuntimeState | null>
   selectModel: Mock<(selection: ModelSelection) => Promise<boolean>>
-  writeRole: Mock<(role: 'commander' | 'watchdog', route: OrbitRouteValue) => Promise<boolean>>
+  writeRole: Mock<(role: Exclude<import('../model-options.ts').OrbitRoleName, 'executor'>, route: OrbitRouteValue) => Promise<boolean>>
+  writeMoaPolicy: Mock<(patch: Partial<Pick<import('../model-options.ts').OrbitMoaSettingsValue, 'enabled' | 'candidateCount' | 'peerCritique' | 'maxMoaSteps'>>) => Promise<boolean>>
   setOrbitEnabled: Mock<(enabled: boolean) => Promise<boolean>>
   loadModels: Mock<() => void>
 }
@@ -67,39 +70,45 @@ function harness(
   directoryInit: ModelDirectoryState = directoryState(),
   settingsInit: OrbitSettingsState = settingsState(),
   enabledInit?: boolean,
+  runtimeInit: OrbitRuntimeState | null = null,
 ): Harness {
   const directory = createSnapshotStore<ModelDirectoryState>(directoryInit)
   const settings = createSnapshotStore<OrbitSettingsState>(settingsInit)
   const projection = createSnapshotStore<OrbitSessionState | undefined>(
     enabledInit === undefined ? undefined : { enabled: enabledInit },
   )
+  const runtimeProjection = createSnapshotStore<OrbitRuntimeState | null>(runtimeInit)
   const selectModel = vi.fn(async (selection: ModelSelection) => {
     // The real directory commits through `session.selectModel` and replays the
     // durable projection: mirror that by updating the SAME store.
     directory.set(directoryState({ current: selection }))
     return true
   })
-  const writeRole = vi.fn(async (_role: 'commander' | 'watchdog', _route: OrbitRouteValue) => true)
+  const writeRole = vi.fn(async (_role: Exclude<import('../model-options.ts').OrbitRoleName, 'executor'>, _route: OrbitRouteValue) => true)
+  const writeMoaPolicy = vi.fn(async (_patch: Partial<Pick<import('../model-options.ts').OrbitMoaSettingsValue, 'enabled' | 'candidateCount' | 'peerCritique' | 'maxMoaSteps'>>) => true)
   const setOrbitEnabled = vi.fn(async (enabled: boolean) => {
     // The real command logs a `command/run` record the host projection folds;
     // mirror that by updating the same store the control reads.
     projection.set({ enabled })
     return true
   })
-  return { directory, settings, projection, selectModel, writeRole, setOrbitEnabled, loadModels: vi.fn() }
+  return { directory, settings, projection, runtimeProjection, selectModel, writeRole, writeMoaPolicy, setOrbitEnabled, loadModels: vi.fn() }
 }
 
 /** The session slot's projection hook, bound to one harness's store. */
-function useTestProjection(store: SnapshotStore<OrbitSessionState | undefined>): UseProjection {
-  return (() => useSyncExternalStore(
-    (listener) => store.subscribe(listener),
-    () => store.getSnapshot(),
+function useTestProjection(
+  sessionStore: SnapshotStore<OrbitSessionState | undefined>,
+  runtimeStore: SnapshotStore<OrbitRuntimeState | null>,
+): UseProjection {
+  return ((key: string) => useSyncExternalStore(
+    (listener) => key === 'orbitRuntime' ? runtimeStore.subscribe(listener) : sessionStore.subscribe(listener),
+    () => key === 'orbitRuntime' ? runtimeStore.getSnapshot() : sessionStore.getSnapshot(),
   )) as UseProjection
 }
 
 function renderControl(parts: Harness) {
   function HarnessControl() {
-    const useProjection = useTestProjection(parts.projection)
+    const useProjection = useTestProjection(parts.projection, parts.runtimeProjection)
     return (
       <OrbitModelSelect
         available
@@ -108,6 +117,7 @@ function renderControl(parts: Harness) {
         loadModels={parts.loadModels}
         selectModel={parts.selectModel}
         writeRole={parts.writeRole}
+        writeMoaPolicy={parts.writeMoaPolicy}
         setOrbitEnabled={parts.setOrbitEnabled}
         reloadSettings={vi.fn()}
         useProjection={useProjection}
@@ -415,6 +425,136 @@ describe('Orbit executor shares the session model directory', () => {
   })
 })
 
+describe('Orbit MoA configuration', () => {
+  it('shows the durable MoA runtime phase, candidates, winner, tokens, and cost', () => {
+    const parts = harness(
+      directoryState(),
+      settingsState(),
+      true,
+      {
+        runId: 'run-1',
+        phase: 'EXECUTE',
+        status: 'running',
+        loop: { used: 1, max: 5 },
+        currentStep: { id: 'P2', attempt: 1, executionMode: 'MOA' },
+        moa: {
+          phase: 'PROMOTED',
+          candidates: [
+            { index: 1, provider: 'provider-a', model: 'model-a', ok: true, files: 1, usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150, cost_usd: 0.001 } },
+            { index: 2, provider: 'provider-a', model: 'model-b', ok: true, files: 2, usage: { input_tokens: 120, output_tokens: 60, total_tokens: 180, cost_usd: 0.002 } },
+          ],
+          judgeModel: 'provider-a/model-b',
+          winningCandidate: 2,
+          winnerModel: 'provider-a/model-b',
+          totalUsage: { input_tokens: 260, output_tokens: 130, total_tokens: 390, cost_usd: 0.004 },
+        },
+        updatedAt: '2026-09-20T00:00:00.000Z',
+      },
+    )
+    renderControl(parts)
+    openRoot()
+
+    expect(screen.getByText('当前运行')).toBeTruthy()
+    expect(screen.getByText('P2')).toBeTruthy()
+    expect(screen.getByText('PROMOTED')).toBeTruthy()
+    expect(screen.getByText(/✓ provider-a\/model-a/)).toBeTruthy()
+    expect(screen.getByText(/150 Token/)).toBeTruthy()
+    expect(screen.getByText(/390 Token · \$0\.0040/)).toBeTruthy()
+    expect(screen.getAllByText('provider-a/model-b').length).toBeGreaterThan(0)
+  })
+
+  it('marks cost unavailable when runtime token usage has no frozen price data', () => {
+    const parts = harness(directoryState(), settingsState(), true, {
+      runId: 'run-2', phase: 'EXECUTE', status: 'running', loop: { used: 0, max: 5 },
+      currentStep: { id: 'P1', attempt: 1, executionMode: 'MOA' },
+      moa: {
+        phase: 'JUDGE', candidates: [], judgeModel: 'provider-a/model-b',
+        totalUsage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
+      },
+      updatedAt: '2026-09-20T00:00:00.000Z',
+    })
+    renderControl(parts)
+    openRoot()
+    expect(screen.getByText(/未配置价格，无法计算成本/)).toBeTruthy()
+  })
+
+  it('shows bounded MoA policy controls and persists changes without touching the Session model', async () => {
+    const parts = harness(directoryState(), settingsState({
+      moa: {
+        enabled: true,
+        candidateCount: 3,
+        peerCritique: false,
+        maxMoaSteps: 2,
+        candidates: [{ provider: 'provider-a', model: 'model-a' }],
+        judge: { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' },
+      },
+    }))
+    renderControl(parts)
+    openRoot()
+
+    expect(screen.getByRole('switch', { name: '允许关键步骤使用 MoA' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('menuitem', { name: /候选数量/ }).textContent).toContain('3')
+    expect(screen.getByRole('menuitem', { name: /每个 Run 最多 MoA 步骤/ }).textContent).toContain('2')
+    expect(screen.getByRole('menuitem', { name: /Judge 评审模型/ }).textContent).toContain('Model B')
+
+    fireEvent.click(screen.getByRole('switch', { name: '候选互评' }))
+    await waitFor(() => {
+      expect(parts.writeMoaPolicy).toHaveBeenCalledWith({ peerCritique: true })
+    })
+    expect(parts.selectModel).not.toHaveBeenCalled()
+  })
+
+  it('persists a Candidate model and effort through Orbit settings, not the Session model', async () => {
+    const parts = harness(directoryState(), settingsState({
+      moa: {
+        enabled: true,
+        candidateCount: 2,
+        peerCritique: false,
+        maxMoaSteps: 1,
+        candidates: [{ provider: 'provider-a', model: 'model-a' }, { provider: 'provider-a', model: 'model-a' }],
+        judge: { provider: 'provider-a', model: 'model-b' },
+      },
+    }))
+    renderControl(parts)
+    openRoot()
+    fireEvent.click(screen.getByRole('menuitem', { name: /候选模型 1/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /^模型/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Model B/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'High' }))
+
+    await waitFor(() => {
+      expect(parts.writeRole).toHaveBeenCalledWith('moa-candidate-1', {
+        provider: 'provider-a',
+        model: 'model-b',
+        reasoningEffort: 'high',
+      })
+    })
+    expect(parts.selectModel).not.toHaveBeenCalled()
+  })
+
+  it('maps Provider default for the MoA Judge to an absent reasoning effort', async () => {
+    const parts = harness(directoryState(), settingsState({
+      moa: {
+        enabled: true,
+        candidateCount: 2,
+        peerCritique: false,
+        maxMoaSteps: 1,
+        candidates: [{ provider: 'provider-a', model: 'model-a' }, { provider: 'provider-a', model: 'model-b' }],
+        judge: { provider: 'provider-a', model: 'model-b', reasoningEffort: 'high' },
+      },
+    }))
+    renderControl(parts)
+    openRoot()
+    fireEvent.click(screen.getByRole('menuitem', { name: /Judge 评审模型/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /^推理等级/ }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /^提供方默认/ }))
+
+    await waitFor(() => {
+      expect(parts.writeRole).toHaveBeenCalledWith('moa-judge', { provider: 'provider-a', model: 'model-b' })
+    })
+  })
+})
+
 describe('Orbit model control failure surfaces', () => {
   it('keeps the trigger readable while the catalog fails and retries in place', () => {
     const parts = harness(directoryState({ status: 'error', error: 'catalog down' }))
@@ -437,9 +577,10 @@ describe('Orbit model control failure surfaces', () => {
         loadModels={parts.loadModels}
         selectModel={parts.selectModel}
         writeRole={parts.writeRole}
+        writeMoaPolicy={parts.writeMoaPolicy}
         setOrbitEnabled={parts.setOrbitEnabled}
         reloadSettings={vi.fn()}
-        useProjection={useTestProjection(parts.projection)}
+        useProjection={useTestProjection(parts.projection, parts.runtimeProjection)}
         t={t}
       />,
     )

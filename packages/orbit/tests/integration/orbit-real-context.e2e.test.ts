@@ -110,6 +110,10 @@ class ScriptedAdapter extends LlmAdapter {
     if (prompt.includes('当前阶段：PLAN')) {
       reply = this.script.plan ?? '{"summary":"e2e","steps":[{"id":"P1","goal":"do the thing"}]}'
       structured = true
+    } else if (prompt.includes('你是 Orbit 的 MoA Judge')) {
+      reply = '候选 2 更完整。\nWINNER_CANDIDATE_INDEX: 2'
+    } else if (prompt.includes('你是 Orbit 的 MoA 独立候选模型') || prompt.includes('你是 Orbit 的 MoA 候选模型')) {
+      reply = '候选方案 ' + options.model + '\n```text file="result.txt"\n' + options.model + '\n```'
     } else if (prompt.includes('你是 Orbit 执行员')) {
       this.executorCalls += 1
       if (this.script.hangFirstExecutor && this.executorCalls === 1) {
@@ -190,7 +194,7 @@ const ORBIT_CONFIG = {
   registerGuards: true,
 }
 
-async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number; slashCommand?: boolean; providers?: string[] } = {}): Promise<Context> {
+async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: number; slashCommand?: boolean; providers?: string[]; moa?: Record<string, unknown> } = {}): Promise<Context> {
   const root = new Context()
   const storage = mkdtempSync(join(tmpdir(), 'dsh-orbit-e2e-store-'))
   const plugins: Array<[unknown, unknown]> = [
@@ -214,6 +218,7 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
     ...ORBIT_CONFIG,
     ...(options.executorTimeoutMs ? { executorTimeoutMs: options.executorTimeoutMs } : {}),
     ...(options.slashCommand === undefined ? {} : { slashCommand: options.slashCommand }),
+    ...(options.moa ? { moa: options.moa } : {}),
   } as never)
   return root
 }
@@ -272,6 +277,11 @@ test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a comp
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.driver_ownership, 'CLOSED')
     assert.ok(adapter.executorCalls >= 1, 'the real Executor child must have run')
+    const runtimeEvents = parent.agent.session.snapshotEvents().filter((event) => event.type === 'orbit/runtime')
+    assert.ok(runtimeEvents.length > 0, 'Orbit must publish durable runtime snapshots into the owning Session')
+    const lastRuntime = runtimeEvents.at(-1)?.data as { phase?: string; status?: string }
+    assert.equal(lastRuntime.phase, 'SUCCESS')
+    assert.equal(lastRuntime.status, 'success')
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -358,6 +368,99 @@ test('real host runtime watchdog: executor timeout -> RUNTIME_DIAGNOSE -> RESTAR
     assert.match(watchdogPrompt, /你是 Orbit 监控模型/)
     assert.doesNotMatch(watchdogPrompt, /You are the Orbit Smart Watchdog/)
     assert.doesNotMatch(watchdogPrompt, /Runtime anomaly:/)
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host MoA one-shot scope: an empty allow filter exposes no inherited tools', { timeout: 120_000 }, async () => {
+  const adapter = new ScriptedAdapter()
+  const root = await boot(adapter)
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-moa-tools')
+  try {
+    const host = new DshOrbitHost(root)
+    await root.agents.withInitiator(parent.agent, async () => {
+      const candidate = await host.startRole({
+        role: 'commander',
+        label: 'e2e-moa-tool-less',
+        prompt: 'MoA candidate without tools',
+        route: ROUTE,
+        toolFilter: { allow: [] },
+      })
+      const child = root.agents.get(candidate.childId as SessionId)
+      assert.ok(child)
+      for (const tool of ['read', 'write', 'bash', 'subagent', 'agent_browser']) {
+        assert.equal(root.tools.get(tool, child), undefined, `MoA child must not inherit ${tool}`)
+      }
+      await candidate.result
+      await host.releaseRole(candidate)
+      const modelResult = await host.runModel({ label: 'e2e-moa-usage', prompt: 'plain MoA candidate', route: ROUTE })
+      assert.deepEqual(modelResult.usage, { inputTokens: 1, outputTokens: 1 })
+    })
+  } finally {
+    await parent.dispose()
+    await root.fiber.dispose()
+    project.cleanup()
+  }
+})
+
+test('real host optional MoA integration: three candidates -> Judge -> Orbit promotion -> verification', {
+  timeout: 120_000,
+  skip: process.env['ORBIT_MOA_OPTIONAL_E2E'] !== '1',
+}, async () => {
+  const adapter = new ScriptedAdapter({
+    plan: '{"summary":"moa-e2e","steps":[{"id":"P0","goal":"produce the best result","execution_mode":"MOA"}]}',
+  })
+  const root = await boot(adapter, {
+    moa: {
+      enabled: true,
+      candidateCount: 3,
+      peerCritique: false,
+      maxMoaSteps: 1,
+      candidates: [
+        { provider: 'fake', model: 'candidate-a', reasoningEffort: 'off' },
+        { provider: 'fake', model: 'candidate-b', reasoningEffort: 'high' },
+        { provider: 'fake', model: 'candidate-c', reasoningEffort: 'low' },
+      ],
+      judge: { provider: 'fake', model: 'judge', reasoningEffort: 'high' },
+    },
+  })
+  const project = tempProject()
+  const parent = await makeParent(root, project.dir, 'e2e-parent-moa-full')
+  try {
+    const result = await root.agents.withInitiator(parent.agent, () =>
+      root.orbit.run({ goal: 'full MoA integration e2e' }, project.dir, new AbortController().signal),
+    )
+    assert.equal(result.phase, 'SUCCESS', result.message)
+    assert.equal(readFileSync(join(project.dir, 'result.txt'), 'utf8').trim(), 'candidate-b')
+
+    const state = JSON.parse(readFileSync(join(project.dir, '.cx', 'state.json'), 'utf8')) as {
+      moa_step?: {
+        phase?: string
+        winning_candidate?: number
+        winner_model?: string
+        total_usage?: { total_tokens?: number }
+      }
+    }
+    assert.equal(state.moa_step?.phase, 'PROMOTED')
+    assert.equal(state.moa_step?.winning_candidate, 2)
+    assert.equal(state.moa_step?.winner_model, 'fake/candidate-b')
+    assert.equal(state.moa_step?.total_usage?.total_tokens, 8)
+
+    const candidateRequests = adapter.prompts.filter((prompt) => prompt.includes('你是 Orbit 的 MoA 独立候选模型'))
+    assert.equal(candidateRequests.length, 3)
+    assert.equal(adapter.prompts.filter((prompt) => prompt.includes('你是 Orbit 的 MoA Judge')).length, 1)
+    assert.equal(adapter.executorCalls, 1, 'the winner must still pass through the normal Executor verification')
+
+    const runtimeEvents = parent.agent.session.snapshotEvents().filter((event) => event.type === 'orbit/runtime')
+    const moaRuntime = runtimeEvents.map((event) => event.data as { moa?: { phase?: string; winningCandidate?: number } })
+      .filter((entry) => entry.moa)
+      .at(-1)
+    assert.equal(moaRuntime?.moa?.phase, 'PROMOTED')
+    assert.equal(moaRuntime?.moa?.winningCandidate, 2)
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
