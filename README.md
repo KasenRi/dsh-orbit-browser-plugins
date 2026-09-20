@@ -7,7 +7,6 @@ Not affiliated with or endorsed by DeepSeek.
 >
 > 这是一组面向 DeepSeek Harness 的实用插件：Orbit 负责把一个完整目标拆成步骤、分配给不同模型执行并持续检查结果；Browser 负责让 AI 真正操作浏览器。两者可以独立使用，也可以组合成一个能够持续推进项目、自动处理网页任务的 AI 工作流。
 
-## 给普通用户看的介绍
 
 ### @kasenri/dsh-orbit — 让 AI 项目在无人监管下持续推进
 
