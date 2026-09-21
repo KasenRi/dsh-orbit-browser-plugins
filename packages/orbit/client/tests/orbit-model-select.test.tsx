@@ -85,7 +85,11 @@ function harness(
     return true
   })
   const writeRole = vi.fn(async (_role: Exclude<import('../model-options.ts').OrbitRoleName, 'executor'>, _route: OrbitRouteValue) => true)
-  const writeMoaPolicy = vi.fn(async (_patch: Partial<Pick<import('../model-options.ts').OrbitMoaSettingsValue, 'enabled' | 'candidateCount' | 'peerCritique' | 'maxMoaSteps'>>) => true)
+  const writeMoaPolicy = vi.fn(async (patch: Partial<Pick<import('../model-options.ts').OrbitMoaSettingsValue, 'enabled' | 'candidateCount' | 'peerCritique' | 'maxMoaSteps'>>) => {
+    const current = settings.getSnapshot()
+    settings.set({ ...current, moa: { ...current.moa, ...patch } })
+    return true
+  })
   const setOrbitEnabled = vi.fn(async (enabled: boolean) => {
     // The real command logs a `command/run` record the host projection folds;
     // mirror that by updating the same store the control reads.
@@ -153,6 +157,11 @@ function openRole(name: string): void {
   fireEvent.click(screen.getByRole('menuitem', { name: new RegExp(name) }))
 }
 
+function openMoa(): void {
+  openRoot()
+  fireEvent.click(screen.getByRole('menuitem', { name: 'MoA 多候选模式' }))
+}
+
 /** Open one role's model list from its role page. */
 function openRoleModels(name: string): void {
   openRole(name)
@@ -176,7 +185,7 @@ describe('Orbit panel placement', () => {
 })
 
 describe('Orbit role pages offer model and reasoning effort as separate entries', () => {
-  it.each(ROLE_ROWS)('%s shows the merged model row with no duplicate role title', (role, modelLabel, modelName, effortName) => {
+  it.each(ROLE_ROWS)('%s shows the model row and a single navigation title', (role, modelLabel, modelName, effortName) => {
     renderControl(harness())
     openRole(role)
 
@@ -185,9 +194,8 @@ describe('Orbit role pages offer model and reasoning effort as separate entries'
     const effortRow = screen.getByRole('menuitem', { name: /^推理等级/ })
     expect(effortRow.textContent).toContain(effortName)
 
-    // The old standalone role heading is gone: the label only lives inside a menuitem.
     const headings = screen.queryAllByText(role).filter((element) => element.closest('[role="menuitem"]') === null)
-    expect(headings).toHaveLength(0)
+    expect(headings).toHaveLength(1)
   })
 
   it('shows Provider default for a role without a stored effort', () => {
@@ -426,10 +434,10 @@ describe('Orbit executor shares the session model directory', () => {
 })
 
 describe('Orbit MoA configuration', () => {
-  it('shows the durable MoA runtime phase, candidates, winner, tokens, and cost', () => {
+  it('keeps the root menu compact even while a MoA run is active', () => {
     const parts = harness(
       directoryState(),
-      settingsState(),
+      settingsState({ moa: { enabled: true, candidateCount: 3, peerCritique: false, maxMoaSteps: 2, candidates: [] } }),
       true,
       {
         runId: 'run-1',
@@ -441,12 +449,11 @@ describe('Orbit MoA configuration', () => {
           phase: 'PROMOTED',
           candidates: [
             { index: 1, provider: 'provider-a', model: 'model-a', ok: true, files: 1, usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150, cost_usd: 0.001 } },
-            { index: 2, provider: 'provider-a', model: 'model-b', ok: true, files: 2, usage: { input_tokens: 120, output_tokens: 60, total_tokens: 180, cost_usd: 0.002 } },
           ],
           judgeModel: 'provider-a/model-b',
-          winningCandidate: 2,
-          winnerModel: 'provider-a/model-b',
-          totalUsage: { input_tokens: 260, output_tokens: 130, total_tokens: 390, cost_usd: 0.004 },
+          winningCandidate: 1,
+          winnerModel: 'provider-a/model-a',
+          totalUsage: { input_tokens: 100, output_tokens: 50, total_tokens: 150, cost_usd: 0.001 },
         },
         updatedAt: '2026-09-20T00:00:00.000Z',
       },
@@ -454,31 +461,15 @@ describe('Orbit MoA configuration', () => {
     renderControl(parts)
     openRoot()
 
-    expect(screen.getByText('当前运行')).toBeTruthy()
-    expect(screen.getByText('P2')).toBeTruthy()
-    expect(screen.getByText('PROMOTED')).toBeTruthy()
-    expect(screen.getByText(/✓ provider-a\/model-a/)).toBeTruthy()
-    expect(screen.getByText(/150 Token/)).toBeTruthy()
-    expect(screen.getByText(/390 Token · \$0\.0040/)).toBeTruthy()
-    expect(screen.getAllByText('provider-a/model-b').length).toBeGreaterThan(0)
+    expect(screen.getByRole('menuitem', { name: 'MoA 多候选模式' })).toBeTruthy()
+    expect(screen.getByRole('switch', { name: '启用 MoA' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.queryByText('当前运行')).toBeNull()
+    expect(screen.queryByText('PROMOTED')).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: /候选数量/ })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: /Judge 评审模型/ })).toBeNull()
   })
 
-  it('marks cost unavailable when runtime token usage has no frozen price data', () => {
-    const parts = harness(directoryState(), settingsState(), true, {
-      runId: 'run-2', phase: 'EXECUTE', status: 'running', loop: { used: 0, max: 5 },
-      currentStep: { id: 'P1', attempt: 1, executionMode: 'MOA' },
-      moa: {
-        phase: 'JUDGE', candidates: [], judgeModel: 'provider-a/model-b',
-        totalUsage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
-      },
-      updatedAt: '2026-09-20T00:00:00.000Z',
-    })
-    renderControl(parts)
-    openRoot()
-    expect(screen.getByText(/未配置价格，无法计算成本/)).toBeTruthy()
-  })
-
-  it('shows bounded MoA policy controls and persists changes without touching the Session model', async () => {
+  it('opens MoA details only in the second-level menu', () => {
     const parts = harness(directoryState(), settingsState({
       moa: {
         enabled: true,
@@ -490,12 +481,45 @@ describe('Orbit MoA configuration', () => {
       },
     }))
     renderControl(parts)
-    openRoot()
+    openMoa()
 
-    expect(screen.getByRole('switch', { name: '允许关键步骤使用 MoA' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText('MoA 多候选模式')).toBeTruthy()
+    expect(screen.getByRole('switch', { name: '启用 MoA' }).getAttribute('aria-checked')).toBe('true')
     expect(screen.getByRole('menuitem', { name: /候选数量/ }).textContent).toContain('3')
     expect(screen.getByRole('menuitem', { name: /每个 Run 最多 MoA 步骤/ }).textContent).toContain('2')
+    expect(screen.getByRole('menuitem', { name: /候选模型 1/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /候选模型 2/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /候选模型 3/ })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /候选模型 4/ })).toBeNull()
     expect(screen.getByRole('menuitem', { name: /Judge 评审模型/ }).textContent).toContain('Model B')
+    expect(screen.getByText('更改将会在下一次发送时生效')).toBeTruthy()
+  })
+
+  it('uses explicit selectors for candidate count and max MoA steps', async () => {
+    const parts = harness(directoryState(), settingsState())
+    renderControl(parts)
+    openMoa()
+
+    fireEvent.click(screen.getByRole('menuitem', { name: /候选数量/ }))
+    expect(screen.getByRole('menuitemradio', { name: /2 个候选/ }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('menuitemradio', { name: /3 个候选/ }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('menuitemradio', { name: /4 个候选/ }).getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /4 个候选/ }))
+
+    await waitFor(() => expect(parts.writeMoaPolicy).toHaveBeenCalledWith({ candidateCount: 4 }))
+    await waitFor(() => expect(screen.getByRole('menuitem', { name: /候选模型 4/ })).toBeTruthy())
+
+    fireEvent.click(screen.getByRole('menuitem', { name: /每个 Run 最多 MoA 步骤/ }))
+    expect(screen.getAllByRole('menuitemradio')).toHaveLength(5)
+    const maxChoices = screen.getAllByRole('menuitemradio')
+    fireEvent.click(maxChoices[maxChoices.length - 1] as HTMLElement)
+    await waitFor(() => expect(parts.writeMoaPolicy).toHaveBeenCalledWith({ maxMoaSteps: 5 }))
+  })
+
+  it('persists the peer critique switch without touching the Session model', async () => {
+    const parts = harness()
+    renderControl(parts)
+    openMoa()
 
     fireEvent.click(screen.getByRole('switch', { name: '候选互评' }))
     await waitFor(() => {
@@ -516,7 +540,7 @@ describe('Orbit MoA configuration', () => {
       },
     }))
     renderControl(parts)
-    openRoot()
+    openMoa()
     fireEvent.click(screen.getByRole('menuitem', { name: /候选模型 1/ }))
     fireEvent.click(screen.getByRole('menuitem', { name: /^模型/ }))
     fireEvent.click(screen.getByRole('menuitem', { name: /Model B/ }))
@@ -544,7 +568,7 @@ describe('Orbit MoA configuration', () => {
       },
     }))
     renderControl(parts)
-    openRoot()
+    openMoa()
     fireEvent.click(screen.getByRole('menuitem', { name: /Judge 评审模型/ }))
     fireEvent.click(screen.getByRole('menuitem', { name: /^推理等级/ }))
     fireEvent.click(screen.getByRole('menuitem', { name: /^提供方默认/ }))
@@ -676,17 +700,19 @@ describe('Orbit per-Session enable toggle', () => {
 })
 
 describe('Orbit menu copy and hierarchy', () => {
-  it('shows the refined root copy and drops the old footer', () => {
+  it('keeps the root menu limited to the approved first-level entries', () => {
     renderControl(harness())
     openRoot()
 
-    expect(screen.getByText('Orbit 让AI自我审核连续执行')).toBeTruthy()
     expect(screen.getByText('启用一键长执行')).toBeTruthy()
     expect(screen.getByText('更改将会在下一次发送时生效')).toBeTruthy()
-    expect(screen.queryByText('更改应用于下一个新的 Orbit 运行')).toBeNull()
     expect(screen.getByRole('menuitem', { name: /指挥官/ })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /执行员/ })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /监控模型/ })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'MoA 多候选模式' })).toBeTruthy()
+    expect(screen.queryByText('Orbit 让AI自我审核连续执行')).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: /候选数量/ })).toBeNull()
+    expect(screen.queryByRole('menuitem', { name: /Judge 评审模型/ })).toBeNull()
   })
 
   it('never renders a duplicated watchdog label', () => {

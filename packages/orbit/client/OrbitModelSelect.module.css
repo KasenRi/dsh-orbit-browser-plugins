@@ -60,6 +60,45 @@
   padding: 4px 8px 6px;
 }
 
+.switchNavRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 2px 8px;
+}
+
+.switchNavLabel {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chevronButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.switchNavLabel:hover,
+.chevronButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
 .switchControl {
   margin-left: auto;
 }
@@ -120,11 +159,17 @@
   font-size: 12px;
 }
 
+.navHeader {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  min-height: 32px;
+}
+
 .back {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
   padding: 6px 8px 8px;
   border: 0;
   background: transparent;
@@ -133,4 +178,22 @@
   font-size: 12px;
   text-align: left;
   cursor: pointer;
+}
+
+.navTitle {
+  grid-column: 2;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.choiceMark {
+  width: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  text-align: center;
+  flex: none;
 }

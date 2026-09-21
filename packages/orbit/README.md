@@ -44,7 +44,7 @@ Executor, Smart Watchdog, durable state and bounded recovery.
 |---|---|
 | `@deepseek-ai/dsh` | `0.1.5-rc.2` |
 | `@deepseek-ai/cordis` | `4.0.2` |
-| `@goodandready/dsh-moa`（可选 MoA 集成） | `0.2.19` |
+| `@goodandready/dsh-moa`（可选 MoA 集成） | `0.2.19–0.2.20` |
 | Node.js | `>= 22.19.0` |
 
 Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
@@ -59,7 +59,7 @@ mirror remains available when a Git source is preferred:
 dsh plugin --profile web add @kasenri/dsh-orbit
 
 # 可选：为 Orbit 的关键步骤启用多候选 MoA 选优
-dsh plugin --profile web add @goodandready/dsh-moa@0.2.19
+dsh plugin --profile web add @goodandready/dsh-moa@0.2.20
 
 # Git source alternative, tracks the mirror repository HEAD:
 # dsh plugin --profile web add github:KasenRi/dsh-orbit
@@ -166,12 +166,12 @@ SINGLE ─────────────→ Executor
 - `peerCritique` 默认关闭；开启时只允许一轮有界互评。
 - 新 Run 会冻结 Candidate/Judge 的 provider、model、reasoningEffort、MoA policy，以及原版 MoA settings 中用户显式配置的价格表（如果存在）。中途修改 UI 只影响下一次 Run。
 - Candidate/Judge 的 input/output/cache Token 来自 DSH 子 Session 的真实 `assistant/message.usage`；如果冻结的价格表能匹配对应 Route，同时记录美元成本；没有价格时只展示 Token，并明确标记无法计算成本，不猜价格。
-- Orbit 会把一个不含目标正文、候选正文、Judge 推理或代码的有界运行快照写进所属 DSH Session projection。Web UI 可显示当前 Step、MoA 阶段、各候选模型/成败、Token、Judge、winner 和总计，刷新/重连后仍可恢复。
+- Orbit 会把一个不含目标正文、候选正文、Judge 推理或代码的有界运行快照写进所属 DSH Session projection。v0.6.1 的配置首页不再直接展开这些运行详情，而是保持紧凑；运行快照仍保留给会话恢复与后续运行态界面使用。
 - 冷恢复按 durable phase 继续：`JUDGE` 不重跑 Candidate，`SELECTED` 不重跑 Candidate/Judge，`PROMOTED` 不重跑 Candidate/Judge/Promotion。
 - Orbit ACTIVE 时会在下游 hook 之前阻止独立 `/moa`，避免原版 MoA 的自动 Promotion 与 Orbit 同时争夺 workspace。
 - `@goodandready/dsh-moa` 是可选依赖；未安装时普通 SINGLE 模式完全不受影响。
 
-当前兼容层针对 `@goodandready/dsh-moa@0.2.19`。Orbit 只依赖它公开的项目上下文接口；候选调度、Judge、持久化与 Promotion 权限均由 `moa-adapter.ts` 封装。未来 MoA 提供正式 integration/manual-promotion API 时，只需替换该适配层。
+当前兼容层已在 `@goodandready/dsh-moa@0.2.19` 与 `0.2.20` 上完成真实 DSH 烟雾验证。Orbit 只依赖它公开的项目上下文接口；候选调度、Judge、持久化与 Promotion 权限均由 `moa-adapter.ts` 封装。未来 MoA 提供正式 integration/manual-promotion API 时，只需替换该适配层。
 
 ## State machine
 

@@ -34,6 +34,9 @@ export interface OrbitModelSelectProps extends OrbitModelInjected {
 
 type Pane =
   | { kind: 'root' }
+  | { kind: 'moa' }
+  | { kind: 'moa-candidate-count' }
+  | { kind: 'moa-max-steps' }
   | { kind: 'role'; role: OrbitRoleName }
   | { kind: 'models'; role: OrbitRoleName }
   | { kind: 'efforts'; role: OrbitRoleName; draft?: OrbitRouteValue }
@@ -68,7 +71,6 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   // Canonical enable state comes from the Session's own projection; the local
   // value only bridges the click-to-projection round trip (never the source).
   const orbitSession = useProjection('orbitSession')
-  const orbitRuntime = useProjection('orbitRuntime')
   const [orbitOverride, setOrbitOverride] = useState<boolean | null>(null)
   const [orbitPending, setOrbitPending] = useState(false)
   const orbitEnabled = orbitOverride ?? orbitSession?.enabled === true
@@ -127,12 +129,6 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
   const watchdogLabel = watchdogRoute === undefined ? undefined : routeLabelOf(dir, watchdogRoute) ?? watchdogRoute.model
   const watchdogEffort = effortLabelOf(watchdogModel, watchdogRoute?.reasoningEffort)
 
-  const usageText = (usage: { total_tokens: number; cost_usd?: number } | undefined): string | undefined => {
-    if (!usage) return undefined
-    const tokens = `${usage.total_tokens.toLocaleString()} ${t('moaTokens')}`
-    return usage.cost_usd === undefined ? tokens : `${tokens} · $${usage.cost_usd.toFixed(4)}`
-  }
-
   const moaRouteOf = (role: OrbitRoleName): OrbitRouteValue | undefined => {
     if (role === 'moa-judge') return config.moa.judge
     if (!role.startsWith('moa-candidate-')) return undefined
@@ -152,12 +148,12 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
     }
   }
 
-  const commitMoaPolicy = async (patch: Parameters<typeof writeMoaPolicy>[0]): Promise<void> => {
-    if (submitting.current || config.status !== 'ready') return
+  const commitMoaPolicy = async (patch: Parameters<typeof writeMoaPolicy>[0]): Promise<boolean> => {
+    if (submitting.current || config.status !== 'ready') return false
     submitting.current = true
     setBusy(true)
     try {
-      await writeMoaPolicy(patch)
+      return await writeMoaPolicy(patch)
     } finally {
       submitting.current = false
       setBusy(false)
@@ -193,6 +189,25 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
     if (role === 'watchdog') return t('watchdog')
     if (role === 'moa-judge') return t('moaJudge')
     return `${t('moaCandidate')} ${role.slice('moa-candidate-'.length)}`
+  }
+
+  const isMoaRole = (role: OrbitRoleName): boolean => role === 'moa-judge' || role.startsWith('moa-candidate-')
+
+  const paneTitle = (): string => {
+    if (pane.kind === 'moa') return t('moa')
+    if (pane.kind === 'moa-candidate-count') return t('moaCandidateCount')
+    if (pane.kind === 'moa-max-steps') return t('moaMaxSteps')
+    if (pane.kind === 'role' || pane.kind === 'models' || pane.kind === 'efforts') return roleTitleOf(pane.role)
+    return ''
+  }
+
+  const parentPane = (): Pane => {
+    if (pane.kind === 'moa' || pane.kind === 'moa-candidate-count' || pane.kind === 'moa-max-steps') {
+      return pane.kind === 'moa' ? { kind: 'root' } : { kind: 'moa' }
+    }
+    if (pane.kind === 'role') return isMoaRole(pane.role) ? { kind: 'moa' } : { kind: 'root' }
+    if (pane.kind === 'models' || pane.kind === 'efforts') return { kind: 'role', role: pane.role }
+    return { kind: 'root' }
   }
 
   const roleModelLabelOf = (role: OrbitRoleName): string => {
@@ -280,18 +295,19 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
             style={{ ...(position ?? MEASURE_STYLE), maxHeight }}
             role="menu"
           >
-            {pane.kind === 'root' ? (
-              <div className={css.title}>{t('title')}</div>
-            ) : (
-              <button
-                type="button"
-                className={css.back}
-                onClick={() => {
-                  setPane(pane.kind === 'role' ? { kind: 'root' } : { kind: 'role', role: pane.role })
-                }}
-              >
-                {`${BACK} ${pane.kind === 'role' ? t('back') : roleTitleOf(pane.role)}`}
-              </button>
+            {pane.kind === 'root' ? null : (
+              <div className={css.navHeader}>
+                <button
+                  type="button"
+                  className={css.back}
+                  onClick={() => {
+                    setPane(parentPane())
+                  }}
+                >
+                  {`${BACK} ${t('back')}`}
+                </button>
+                <span className={css.navTitle}>{paneTitle()}</span>
+              </div>
             )}
 
             {settingsError === undefined ? null : (
@@ -339,51 +355,7 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   />
                 </div>
                 <div className={css.separator} />
-                {orbitRuntime ? (
-                  <>
-                    <div className={css.group}>{t('runtime')}</div>
-                    <div className={css.row}>
-                      <span className={css.rowLabel}>{orbitRuntime.currentStep?.id ?? orbitRuntime.phase}</span>
-                      <span className={css.rowValue}>
-                        {orbitRuntime.currentStep?.executionMode ?? orbitRuntime.phase}
-                        {` · ${orbitRuntime.loop.used}/${orbitRuntime.loop.max}`}
-                      </span>
-                    </div>
-                    {orbitRuntime.moa ? (
-                      <>
-                        <div className={css.row}>
-                          <span className={css.rowLabel}>{t('moaRuntimePhase')}</span>
-                          <span className={css.rowValue}>{orbitRuntime.moa.phase}</span>
-                        </div>
-                        {orbitRuntime.moa.candidates.map((candidate) => (
-                          <div key={candidate.index} className={css.row}>
-                            <span className={css.rowLabel}>{`${t('moaCandidate')} ${candidate.index}`}</span>
-                            <span className={css.rowValue}>
-                              {`${candidate.ok ? '✓' : '✗'} ${candidate.provider}/${candidate.model}`}
-                              {usageText(candidate.usage) ? ` · ${usageText(candidate.usage)}` : ''}
-                            </span>
-                          </div>
-                        ))}
-                        <div className={css.row}>
-                          <span className={css.rowLabel}>{t('moaJudge')}</span>
-                          <span className={css.rowValue}>
-                            {orbitRuntime.moa.winnerModel ?? orbitRuntime.moa.judgeModel ?? t('moaWaiting')}
-                          </span>
-                        </div>
-                        {orbitRuntime.moa.totalUsage ? (
-                          <div className={css.row}>
-                            <span className={css.rowLabel}>{t('moaTotalUsage')}</span>
-                            <span className={css.rowValue}>
-                              {usageText(orbitRuntime.moa.totalUsage)}
-                              {orbitRuntime.moa.totalUsage.cost_usd === undefined ? ` · ${t('moaCostUnavailable')}` : ''}
-                            </span>
-                          </div>
-                        ) : null}
-                      </>
-                    ) : null}
-                    <div className={css.separator} />
-                  </>
-                ) : null}
+
                 <button
                   type="button"
                   role="menuitem"
@@ -434,8 +406,40 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   <span className={css.chevron}>{CHEVRON}</span>
                 </button>
                 <div className={css.separator} />
+                <div className={css.switchNavRow}>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className={css.switchNavLabel}
+                    disabled={busy}
+                    onClick={() => { setPane({ kind: 'moa' }) }}
+                  >
+                    {t('moa')}
+                  </button>
+                  <Switch
+                    className={css.switchControl}
+                    checked={config.moa.enabled}
+                    disabled={busy}
+                    label={t('moaEnable')}
+                    onChange={(next) => { void commitMoaPolicy({ enabled: next }) }}
+                  />
+                  <button
+                    type="button"
+                    className={css.chevronButton}
+                    aria-label={t('moaOpenSettings')}
+                    disabled={busy}
+                    onClick={() => { setPane({ kind: 'moa' }) }}
+                  >
+                    {CHEVRON}
+                  </button>
+                </div>
+              </>
+            ) : null}
+
+            {pane.kind === 'moa' ? (
+              <>
                 <div className={css.switchRow}>
-                  <span className={css.rowLabel}>{t('moa')}</span>
+                  <span className={css.rowLabel}>{t('moaEnable')}</span>
                   <Switch
                     className={css.switchControl}
                     checked={config.moa.enabled}
@@ -449,10 +453,11 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   role="menuitem"
                   className={css.row}
                   disabled={busy}
-                  onClick={() => { void commitMoaPolicy({ candidateCount: config.moa.candidateCount >= 4 ? 2 : config.moa.candidateCount + 1 }) }}
+                  onClick={() => { setPane({ kind: 'moa-candidate-count' }) }}
                 >
                   <span className={css.rowLabel}>{t('moaCandidateCount')}</span>
                   <span className={css.rowValue}>{config.moa.candidateCount}</span>
+                  <span className={css.chevron}>{CHEVRON}</span>
                 </button>
                 <div className={css.switchRow}>
                   <span className={css.rowLabel}>{t('moaPeerCritique')}</span>
@@ -469,11 +474,13 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   role="menuitem"
                   className={css.row}
                   disabled={busy}
-                  onClick={() => { void commitMoaPolicy({ maxMoaSteps: config.moa.maxMoaSteps >= 5 ? 1 : config.moa.maxMoaSteps + 1 }) }}
+                  onClick={() => { setPane({ kind: 'moa-max-steps' }) }}
                 >
                   <span className={css.rowLabel}>{t('moaMaxSteps')}</span>
                   <span className={css.rowValue}>{config.moa.maxMoaSteps}</span>
+                  <span className={css.chevron}>{CHEVRON}</span>
                 </button>
+                <div className={css.separator} />
                 {Array.from({ length: config.moa.candidateCount }, (_, offset) => {
                   const role = (`moa-candidate-${offset + 1}`) as OrbitRoleName
                   return (
@@ -502,6 +509,52 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
                   <span className={css.rowValue}>{roleLabelOf('moa-judge') ?? t('triggerFallback')}</span>
                   <span className={css.chevron}>{CHEVRON}</span>
                 </button>
+              </>
+            ) : null}
+
+            {pane.kind === 'moa-candidate-count' ? (
+              <>
+                {[2, 3, 4].map((count) => (
+                  <button
+                    key={count}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={config.moa.candidateCount === count}
+                    className={css.row}
+                    disabled={busy}
+                    onClick={() => {
+                      void commitMoaPolicy({ candidateCount: count }).then((ok) => {
+                        if (ok) setPane({ kind: 'moa' })
+                      })
+                    }}
+                  >
+                    <span className={css.choiceMark}>{config.moa.candidateCount === count ? '\u25CF' : '\u25CB'}</span>
+                    <span className={css.rowLabel}>{`${count} ${t('moaCandidatesUnit')}`}</span>
+                  </button>
+                ))}
+              </>
+            ) : null}
+
+            {pane.kind === 'moa-max-steps' ? (
+              <>
+                {[1, 2, 3, 4, 5].map((count) => (
+                  <button
+                    key={count}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={config.moa.maxMoaSteps === count}
+                    className={css.row}
+                    disabled={busy}
+                    onClick={() => {
+                      void commitMoaPolicy({ maxMoaSteps: count }).then((ok) => {
+                        if (ok) setPane({ kind: 'moa' })
+                      })
+                    }}
+                  >
+                    <span className={css.choiceMark}>{config.moa.maxMoaSteps === count ? '\u25CF' : '\u25CB'}</span>
+                    <span className={css.rowLabel}>{count}</span>
+                  </button>
+                ))}
               </>
             ) : null}
 
@@ -579,8 +632,12 @@ export function OrbitModelSelect({ t, available, directory, settings, loadModels
               )
               : null}
 
-            <div className={css.separator} />
-            <div className={css.hint}>{t('applyOnNextSend')}</div>
+            {pane.kind === 'root' || pane.kind === 'moa' ? (
+              <>
+                <div className={css.separator} />
+                <div className={css.hint}>{t('applyOnNextSend')}</div>
+              </>
+            ) : null}
           </div>,
           document.body,
         )
