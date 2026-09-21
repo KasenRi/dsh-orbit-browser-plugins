@@ -7,7 +7,20 @@ import type { ModelRunRequest, ModelRunUsage, OrbitHost } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import type { OrbitMoaCandidateResult, OrbitMoaPolicy, OrbitMoaPromotionReceipt, OrbitMoaUsage, OrbitPlanStep, OrbitRoute } from './types.ts'
 
-const SUPPORTED_MOA_VERSIONS = new Set(['0.2.19', '0.2.20'])
+const MIN_SUPPORTED_MOA_VERSION = [0, 2, 19] as const
+
+function isSupportedMoaVersion(version: string): boolean {
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/u)
+  if (!match) return false
+  const current = [Number(match[1]), Number(match[2]), Number(match[3])] as const
+  for (let index = 0; index < MIN_SUPPORTED_MOA_VERSION.length; index += 1) {
+    const actual = current[index] ?? 0
+    const minimum = MIN_SUPPORTED_MOA_VERSION[index] ?? 0
+    if (actual > minimum) return true
+    if (actual < minimum) return false
+  }
+  return true
+}
 const MAX_CONTEXT_CHARS = 16_000
 const MAX_CANDIDATE_TEXT = 12_000
 const MAX_JUDGE_TEXT = 8_000
@@ -251,8 +264,8 @@ export class OrbitMoaAdapter implements OrbitMoaAdapterLike {
       }
       const pkg = JSON.parse(await readFile(packageJsonPath, 'utf8')) as { version?: string }
       const version = String(pkg.version ?? '')
-      if (!SUPPORTED_MOA_VERSIONS.has(version)) {
-        throw new Error('ORBIT_MOA_VERSION_UNSUPPORTED: 当前支持 0.2.19–0.2.20，检测到 ' + (version || 'unknown') + '。')
+      if (!isSupportedMoaVersion(version)) {
+        throw new Error('ORBIT_MOA_VERSION_UNSUPPORTED: 当前要求 @goodandready/dsh-moa >= 0.2.19，检测到 ' + (version || 'unknown') + '。')
       }
       const entry = require.resolve('@goodandready/dsh-moa')
       const api = await import(pathToFileURL(entry).href) as unknown as MoaPublicModule

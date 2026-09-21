@@ -44,7 +44,7 @@ Executor, Smart Watchdog, durable state and bounded recovery.
 |---|---|
 | `@deepseek-ai/dsh` | `0.1.5-rc.2` |
 | `@deepseek-ai/cordis` | `4.0.2` |
-| `@goodandready/dsh-moa`（可选 MoA 集成） | `0.2.19–0.2.20` |
+| `@goodandready/dsh-moa`（可选 MoA 集成） | `>=0.2.19`（已验证 0.2.19、0.2.20） |
 | Node.js | `>= 22.19.0` |
 
 Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
@@ -171,7 +171,7 @@ SINGLE ─────────────→ Executor
 - Orbit ACTIVE 时会在下游 hook 之前阻止独立 `/moa`，避免原版 MoA 的自动 Promotion 与 Orbit 同时争夺 workspace。
 - `@goodandready/dsh-moa` 是可选依赖；未安装时普通 SINGLE 模式完全不受影响。
 
-当前兼容层已在 `@goodandready/dsh-moa@0.2.19` 与 `0.2.20` 上完成真实 DSH 烟雾验证。Orbit 只依赖它公开的项目上下文接口；候选调度、Judge、持久化与 Promotion 权限均由 `moa-adapter.ts` 封装。未来 MoA 提供正式 integration/manual-promotion API 时，只需替换该适配层。
+当前兼容层接受 `@goodandready/dsh-moa >=0.2.19`，并已在 0.2.19 与 0.2.20 上完成真实 DSH 烟雾验证。更高版本不再被 Orbit 主动版本上限拦截；若上游未来发生实际 API 不兼容，再按真实故障修正。Orbit 只依赖它公开的项目上下文接口；候选调度、Judge、持久化与 Promotion 权限均由 `moa-adapter.ts` 封装。
 
 ## State machine
 
