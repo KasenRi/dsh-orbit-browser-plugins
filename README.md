@@ -3,52 +3,158 @@
 Community plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Not affiliated with or endorsed by DeepSeek.
 
-> **让 AI 不只是回答问题，而是真的把任务做完。**
->
-> 这是一组面向 DeepSeek Harness 的实用插件：Orbit 负责把一个完整目标拆成步骤、分配给不同模型执行并持续检查结果；Browser 负责让 AI 真正操作浏览器。两者可以独立使用，也可以组合成一个能够持续推进项目、自动处理网页任务的 AI 工作流。
+> **让 AI 不只是回答问题，而是能持续执行、比较方案、验证结果，直到把任务真正做完。**
 
+这个仓库包含两个独立插件：
 
-### @kasenri/dsh-orbit — 让 AI 项目在无人监管下持续推进
+- **`@kasenri/dsh-orbit`**：确定性的长任务编排与审核系统。
+- **`@kasenri/dsh-browser`**：受控浏览器自动化能力。
 
-你只需要告诉 AI 最终目标，Orbit 会负责把任务拆成多个步骤，安排执行、逐步检查，并在还有工作没完成时继续推进，而不是每做一步都等你重新下指令。
+Orbit 可以独立使用；Browser 和 MoA 都是按需增强能力，不安装也不会影响 Orbit 的基础 SINGLE 执行模式。
 
-Orbit 把工作分成不同角色：更强的模型可以负责规划和审核，价格更低的模型负责大量实际执行，因此可以在保证关键环节质量的同时，让低成本模型也真正参与到工程里，**降低整个项目使用 AI 的总成本**。
+## Orbit 是什么
 
-从 v0.6.0 开始，Orbit 还可以选择性配合 `@goodandready/dsh-moa`；v0.6.1 要求版本不低于 0.2.19，并已实际验证 0.2.19 与 0.2.20：对于存在多种合理实现路线的关键步骤，让 2–4 个候选模型独立提出方案，由 Judge 做相对选优，再由 Orbit 受控写回、真实测试并交给 Commander 最终审核。MoA 不接管 Orbit 状态机，也不能直接决定 Step 通过。
+Orbit 的目标不是做一个“无限自动继续”的 Loop，而是给 DSH 增加一个**有状态、有边界、可恢复、会自我审核的工程执行轨道**。
 
-同时，Smart Watchdog 会关注运行中的异常情况。如果执行器长时间没有进展、出现卡死、超时或中断，Watchdog 可以介入诊断，并尝试恢复任务，而不是让整个工程静默停在那里。
+你只需要给出最终目标，Orbit 会：
 
-适合的场景包括：代码修改、项目维护、批量文件处理、自动测试、需要多步骤推进的工程任务，以及你希望“交代完目标以后先让 AI 自己干”的工作。
+- 让 **Commander（指挥官）**规划 1–5 个明确步骤；
+- 让 **Executor（执行员）**一次只执行当前步骤；
+- 每个步骤完成后重新交给 Commander 审核；
+- 发现问题时进入有界修正，而不是直接宣告成功；
+- 发生超时、卡死或中断时，让 **Smart Watchdog（监控模型）**参与恢复；
+- 将运行状态持久化到项目的 `.cx/state.json`，支持中断后继续；
+- 在最终成功前再次执行 Final Evaluation，而不是只相信 Executor 的自述。
 
-### @kasenri/dsh-browser — 让 AI 真正操作浏览器完成任务
-
-Browser 给 DSH 增加真实浏览器操作能力。AI 可以打开网页、点击按钮、输入内容、翻页、读取页面信息、下载文件，并把浏览器操作作为整个任务的一部分继续执行。
-
-它适合网页测试、信息采集、后台操作、表单处理和其他需要真实浏览器交互的自动化任务，同时提供域名限制等安全控制，避免浏览器能力无限制地访问不相关站点。
-
-### 两个插件一起使用
-
-组合后，一个典型任务可以变成：
+核心流程：
 
 ```text
-你给出最终目标
-      ↓
-Orbit 自动规划任务
-      ↓
-Commander 负责规划 / 审核
-      ↓
-Executor 负责实际执行
-      ↓
-需要网页时调用 Browser
-      ↓
-Watchdog 处理卡死 / 超时 / 中断
-      ↓
-逐步检查并继续推进
-      ↓
-完成目标并返回最终结果
+用户目标
+   ↓
+Commander 规划
+   ↓
+当前 Step
+   ↓
+SINGLE / MOA
+   ↓
+真实执行与验证
+   ↓
+Commander 审核
+   ↓
+PASS / CORRECT / NEEDS_USER
+   ↓
+下一步
+   ↓
+Final Evaluation
+   ↓
+SUCCESS
 ```
 
-Orbit 和 Browser 彼此独立：只需要自动工程编排时可以只安装 Orbit，只需要浏览器能力时可以只安装 Browser；当 Orbit 的某一步需要访问网页时，再组合使用 Browser。
+## v0.6.x：Orbit 接入 MoA 多候选执行
+
+从 v0.6.0 开始，Orbit 可以把少量高不确定性步骤交给 **MoA 多候选模式**。
+
+这不是让 MoA 接管 Orbit，也不是启动另一套顶层工作流。Orbit 仍然是唯一的 Supervisor；MoA 只负责在某个 Step 内：
+
+1. 让 2–4 个 Candidate 独立提出方案；
+2. 让 Judge 比较已有候选并选出一个 Winner；
+3. 由 Orbit Supervisor 受控写回胜出候选；
+4. 再交给普通 Executor 做真实测试和验证；
+5. 最后仍由 Commander 判断当前 Step 是否真正通过。
+
+```text
+                         Orbit Supervisor
+                                │
+                   ┌────────────┴────────────┐
+                   │                         │
+                SINGLE                     MOA
+                   │                         │
+               Executor          ┌───────────┼───────────┐
+                   │             ↓           ↓           ↓
+                   │        Candidate 1 Candidate 2 Candidate 3
+                   │             └───────────┼───────────┘
+                   │                         ↓
+                   │                       Judge
+                   │                         ↓
+                   │                    Winner
+                   │                         ↓
+                   │              Orbit 受控 Promotion
+                   │                         ↓
+                   └──────────────────── Executor
+                                             ↓
+                                          真验证
+                                             ↓
+                                         Commander
+                                             ↓
+                               PASS / CORRECT / NEEDS_USER
+```
+
+几个关键边界：
+
+- Candidate 和 Judge 都是**零工具模型调用**，不能直接修改项目。
+- 候选方案只写入 `.cx/moa/<run>/<step>/candidate-N/` 隔离区。
+- Judge 只负责“哪个候选相对更好”，**不能决定 Step PASS**。
+- Winner 写回后仍然必须经过 Executor 的真实测试和 Commander 的最终验收。
+- 一个 MoA Step 只消耗一个 Orbit loop，但候选模型调用会额外产生 Token / 成本。
+- MoA Route、候选数、Judge、Reasoning 等会在 Run 创建时冻结，中途修改 UI 只影响下一个 Run。
+- Orbit ACTIVE 时会阻止独立 `/moa` 抢占同一个 workspace。
+
+## 启用 MoA：需要自行安装 dsh-moa
+
+**MoA 不是 Orbit 的内置依赖。**
+
+只安装 Orbit 时，SINGLE 模式完全可用；如果希望在 Orbit 中启用“MoA 多候选模式”，必须另外安装：
+
+```bash
+dsh plugin --profile web add @goodandready/dsh-moa
+```
+
+Orbit 当前接受：
+
+```text
+@goodandready/dsh-moa >= 0.2.19
+```
+
+已在真实 DSH 环境验证：
+
+```text
+0.2.19  ✓
+0.2.20  ✓
+```
+
+更高版本不会被 Orbit 主动设置版本上限；如果未来 MoA 的公开 API 出现实际破坏性变化，再按真实故障修复。
+
+安装完成后，在 Orbit 的模型菜单中：
+
+```text
+MoA 多候选模式      [开关]  >
+```
+
+进入二级菜单配置：
+
+- 候选数量：2–4；
+- Candidate 1–4 的模型与 Reasoning；
+- Judge 评审模型与 Reasoning；
+- 是否启用一轮候选互评；
+- 每个 Run 最多允许多少个 MoA Step。
+
+开启 MoA 只是**允许 Commander 为合适的步骤选择 MOA**，并不意味着每一步都会强制运行多个模型。
+
+## Browser：需要网页操作时再安装
+
+`@kasenri/dsh-browser` 给 DSH 增加真实浏览器操作能力。Orbit 不依赖 Browser；只有当某个 Step 声明 `browser` capability 时才需要它。
+
+Browser 可以打开网页、点击、输入、读取页面、下载文件，并带有域名限制、状态保护和 stale-ref 检查等安全边界。
+
+组合起来，一个工程任务可以同时拥有：
+
+```text
+Orbit
+├─ 多步骤规划 / 审核 / 恢复
+├─ SINGLE 执行
+├─ 可选 MoA 多候选选优
+└─ 可选 Browser 网页操作
+```
 
 ## Technical overview
 
@@ -74,7 +180,10 @@ DeepSeek Harness
 │    ├─ OrbitService (durable state in <project>/.cx/state.json)
 │    ├─ Deterministic Supervisor
 │    ├─ Commander / Executor / Smart Watchdog
+│    ├─ Optional MoA Adapter → Candidate fan-out / Judge / controlled promotion
 │    └─ Recoverable guards
+│
+├─ @goodandready/dsh-moa   (optional, required only for Orbit MoA mode)
 │
 └─ @kasenri/dsh-browser
      └─ agent_browser → agent-browser CLI → Chromium / Chrome / CDP
@@ -86,6 +195,7 @@ DeepSeek Harness
 |---|---|
 | `@deepseek-ai/dsh` | `0.1.5-rc.2` |
 | `@deepseek-ai/cordis` | `4.0.2` |
+| `@goodandready/dsh-moa`（仅 Orbit MoA 模式需要） | `>=0.2.19`；已验证 0.2.19、0.2.20 |
 | `agent-browser` (browser plugin) | `0.33.2` |
 | Node.js | `>= 22.19.0` |
 
@@ -107,8 +217,8 @@ dsh plugin --profile web add @kasenri/dsh-browser
 dsh plugin --profile web add @kasenri/dsh-orbit
 dsh plugin --profile web add @kasenri/dsh-browser
 
-# Optional MoA integration for Orbit v0.6.0
-dsh plugin --profile web add @goodandready/dsh-moa@0.2.20
+# Optional: enable Orbit MoA candidate mode (installed separately)
+dsh plugin --profile web add @goodandready/dsh-moa
 ```
 
 The dedicated Git distribution mirrors (`github:KasenRi/dsh-orbit` and
@@ -131,7 +241,7 @@ The most deterministic way to start Orbit is the slash command:
 /agent-orbit 修复当前项目的 TypeScript 错误并运行测试
 ```
 
-Orbit v0.6.0 的可选 MoA 模式保持同一顶层 Supervisor：Candidate/Judge 使用冻结的 DSH routes、零工具运行，候选只写入 `.cx/moa/` 隔离区；胜出结果由 Orbit Supervisor 受控提升，Executor 真实验证，Commander 最终验收。运行态仍通过 DSH Session projection 保留 Candidate/Judge、Token 与成本等有界数据；v0.6.1 将配置首页恢复为紧凑一级菜单，MoA 详细配置进入二级菜单，不再把运行详情直接铺在首页。当 Orbit Run 为 ACTIVE 时，Orbit 会先于下游 hook 阻止独立 `/moa`，避免原版 MoA 的自动 Promotion 与 Orbit 同时争夺 workspace。
+如果另外安装了 `@goodandready/dsh-moa`，可以在 Orbit 菜单中开启 **MoA 多候选模式**。开启后只是允许 Commander 为少量高不确定步骤选择 MOA；普通步骤仍然可以继续使用 SINGLE Executor。没有安装 MoA 时，Orbit 的基础功能完全不受影响。
 
 Orbit supports three activation styles:
 
@@ -140,9 +250,10 @@ Orbit supports three activation styles:
 3. `cx模式` — legacy compatibility; still resolves to Orbit.
 
 In the Web GUI an Orbit model control sits immediately left of the native model
-seat: Commander/Watchdog persist into DSH settings, and the Executor follows the
-current session model through the same shared model directory. Each new run
-snapshots the three effective routes; resumes keep their frozen routes.
+seat. Commander/Watchdog persist into DSH settings, Executor follows the current
+session model, and optional MoA Candidate/Judge routes live in a dedicated
+second-level menu. Each new run snapshots every effective route it needs;
+resumes keep those frozen routes.
 
 ```text
 # Orbit (typed tool, the same entry the slash command activates)

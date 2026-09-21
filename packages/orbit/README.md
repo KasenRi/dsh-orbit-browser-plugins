@@ -3,40 +3,120 @@
 Community plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
 Not affiliated with or endorsed by DeepSeek.
 
-**让 AI 项目可以在无人监管下持续推进。**
-Orbit 会自动规划任务、分工执行、逐步检查并继续完成后续工作；不同环节可以使用不同模型，让低成本模型承担执行任务、强模型负责规划和审核，从而降低整体 AI 使用成本。Watchdog 还会监控运行异常，在任务卡死或中断时协助恢复。
+> **让 AI 不只是“连续回答”，而是按照一个可恢复、可审核、有边界的工程流程把任务真正做完。**
 
-**Orbit — Deterministic Engineering Orchestration for DeepSeek Harness**
+Orbit 是一个面向 DeepSeek Harness 的**确定性长任务编排器**。它把“规划、执行、审核、纠错、恢复、最终验收”拆成明确角色，并把真正的流程控制权留在 Supervisor，而不是交给模型自由循环。
 
-Technical integration:
+从 v0.6.x 开始，Orbit 还可以选择性接入 **MoA 多候选执行**：当某个关键步骤存在多种合理实现路线时，Orbit 可以让多个 Candidate 独立给出方案，再由 Judge 做相对选优，最后仍由 Orbit 写回、真实验证并由 Commander 最终验收。
 
-- an `OrbitService` on `ctx.orbit`
-- a model-facing `orbit_controller` tool (`cx_controller` remains a legacy alias)
-- recoverable tool guards
+## 核心能力
 
-```text
-Goal
- │
- ▼
-OrbitService
- └─ Deterministic Supervisor
-     ├─ Commander   (plan / step & final evaluation / strategy reconsider)
-     ├─ Executor    (one engineering step at a time)
-     └─ Smart Watchdog (runtime diagnosis and recovery)
-```
+- **Commander**：负责计划、步骤审核、最终审核和策略调整。
+- **Executor**：一次只执行当前 Step，并负责真实工具调用与验证。
+- **Smart Watchdog**：只在运行异常时介入诊断和恢复。
+- **Durable State**：运行状态持久化到 `<project>/.cx/state.json`，支持冷恢复。
+- **Bounded Loop**：Plan、Correction、Watchdog 和 Append 都有明确上限。
+- **Route Freeze**：Run 创建后冻结角色模型与 Reasoning，中途改 UI 只影响下一次 Run。
+- **Mutation Fence**：一个 workspace 同一时间只允许合法的 Orbit 修改驱动者。
+- **可选 MoA**：高不确定 Step 可以走 2–4 候选 + Judge 的多方案竞争。
+- **可选 Browser**：需要真实网页操作时再配合 `@kasenri/dsh-browser`。
 
-Every child role runs on DSH's native `ctx.subagents` service; durable state
-lives in `<project>/.cx/state.json`.
-
-Orbit is a *bounded, self-converging engineering execution track*:
+核心状态机：
 
 ```text
 PLAN → EXECUTE → EVALUATE → CORRECT / RECOVER → SUCCESS
 ```
 
-It is not a timer loop, an infinite auto-continue, a pure reviewer, a pure
-planner, or an agent swarm. It is a deterministic supervisor plus Commander,
-Executor, Smart Watchdog, durable state and bounded recovery.
+普通 SINGLE Step：
+
+```text
+Commander
+   ↓
+Executor
+   ↓
+真实测试 / Evidence
+   ↓
+Commander
+   ↓
+PASS / CORRECT / NEEDS_USER
+```
+
+MoA Step：
+
+```text
+Commander
+   ↓
+Candidate 1 ─┐
+Candidate 2 ─┼→ Judge → Winner
+Candidate 3 ─┘              ↓
+                    Orbit 受控写回
+                           ↓
+                        Executor
+                           ↓
+                        真验证
+                           ↓
+                       Commander
+```
+
+## MoA 是可选能力，不随 Orbit 自动安装
+
+**只安装 Orbit，就可以正常使用完整的 SINGLE 模式。**
+
+如果你希望在 Orbit 中开启：
+
+```text
+MoA 多候选模式
+```
+
+需要自行另外安装 `@goodandready/dsh-moa`：
+
+```bash
+dsh plugin --profile web add @kasenri/dsh-orbit
+dsh plugin --profile web add @goodandready/dsh-moa
+```
+
+Orbit 当前接受：
+
+```text
+@goodandready/dsh-moa >= 0.2.19
+```
+
+已在真实 DSH 环境验证：
+
+```text
+0.2.19  ✓
+0.2.20  ✓
+```
+
+更高版本不会被 Orbit 主动设置上限。如果上游未来发生真实 API 不兼容，再按实际故障修复。
+
+安装 MoA 后，在 Orbit 菜单中打开：
+
+```text
+MoA 多候选模式      [开关]  >
+```
+
+进入二级菜单配置候选数量、Candidate 模型、Judge、Reasoning、候选互评和每个 Run 最大 MoA Step 数。
+
+**开启 MoA 不代表每个 Step 都会运行多个模型。** Commander 仍然可以让普通步骤走 SINGLE，只在适合的高不确定步骤选择 MOA。
+
+## Orbit 与 MoA 的职责边界
+
+Orbit 集成 MoA 后，顶层控制权不会改变：
+
+- Orbit Supervisor 仍然是唯一流程控制者。
+- Candidate / Judge 都是零工具模型调用，不能直接修改项目。
+- 候选方案只写入 `.cx/moa/<run>/<step>/candidate-N/`。
+- Judge 只能从已有成功候选中选择 Winner，不能自己生成新的“第四方案”。
+- Judge 只做相对选优，不能决定 `PASS_CURRENT_STEP`。
+- Winner 由 Orbit Supervisor 受控 Promotion 到项目目录。
+- Promotion 后仍然必须让 Executor 做真实测试。
+- 最终仍由 Commander 决定 PASS / CORRECT / NEEDS_USER。
+- Orbit ACTIVE 时会阻止独立 `/moa` 抢占同一 workspace。
+
+因此可以把两者理解成：
+
+> **Orbit 决定任务怎么走；MoA 只负责在困难步骤里多想几个答案再选一个。**
 
 ## Requirements
 
@@ -44,7 +124,7 @@ Executor, Smart Watchdog, durable state and bounded recovery.
 |---|---|
 | `@deepseek-ai/dsh` | `0.1.5-rc.2` |
 | `@deepseek-ai/cordis` | `4.0.2` |
-| `@goodandready/dsh-moa`（可选 MoA 集成） | `>=0.2.19`（已验证 0.2.19、0.2.20） |
+| `@goodandready/dsh-moa`（可选） | `>=0.2.19`；已验证 0.2.19、0.2.20 |
 | Node.js | `>= 22.19.0` |
 
 Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
@@ -52,17 +132,23 @@ Requires the DSH base services: `agents`, `subagents`, `tools`, `sessions`
 
 ## Install
 
-The package is published to the npm Registry; the dedicated Git distribution
-mirror remains available when a Git source is preferred:
+只使用 Orbit：
 
 ```bash
 dsh plugin --profile web add @kasenri/dsh-orbit
+```
 
-# 可选：为 Orbit 的关键步骤启用多候选 MoA 选优
-dsh plugin --profile web add @goodandready/dsh-moa@0.2.20
+启用 Orbit + MoA：
 
-# Git source alternative, tracks the mirror repository HEAD:
-# dsh plugin --profile web add github:KasenRi/dsh-orbit
+```bash
+dsh plugin --profile web add @kasenri/dsh-orbit
+dsh plugin --profile web add @goodandready/dsh-moa
+```
+
+Git 发行镜像：
+
+```bash
+dsh plugin --profile web add github:KasenRi/dsh-orbit
 ```
 
 The package declares a `dsh.bundle` patch, so `dsh plugin add` registers it as a
@@ -120,7 +206,9 @@ provider/model provenance. The parent model and parent tools remain bypassed.
 The Orbit model control is the final entry in `conversation.input.right`, so
 other composer-side controls (for example DSH's rollback control) stay to its
 left while the native `conversation.input.model` seat stays immediately to its
-right. Its button names the Commander's model; the menu edits three roles:
+right. Its button names the Commander's model. The first-level menu stays compact:
+Orbit toggle, Commander, Executor, Watchdog, and one `MoA 多候选模式` entry. All
+Candidate/Judge details live in the MoA second-level menu.
 
 - **Commander** and **Watchdog** pick from the same native model catalog and
   persist into the DSH `orbit` settings namespace (`settings.yaml`). Picking a
@@ -129,6 +217,9 @@ right. Its button names the Commander's model; the menu edits three roles:
 - **Executor** follows the current session model ("Follows current session
   model"). Both the Orbit row and the native seat read and write the SAME
   per-session `ModelDirectory`, so a change in either place updates the other.
+- **MoA Candidate / Judge** routes appear only inside the MoA second-level menu.
+  Candidate count and max-MoA-step values use explicit selectors instead of
+  click-to-cycle controls.
 
 A new run resolves its routes exactly once — Commander/Watchdog from `orbit`
 settings, Executor from the initiating session's current selection — and freezes
@@ -139,7 +230,9 @@ Commander/Watchdog use settings then explicit config; Executor uses the Session
 selection, with explicit config only when there is no Session. Missing or
 unavailable roles block creation of a Run before any child starts.
 
-### Optional MoA execution mode (v0.6.0)
+### Optional MoA execution mode
+
+> 需要额外安装 `@goodandready/dsh-moa`。只安装 Orbit 时，SINGLE 模式仍然完整可用。
 
 Orbit 可以把少量高不确定性步骤标记为 `execution_mode: "MOA"`。这不是新的顶层 Supervisor，也不会把状态机交给 MoA：
 
