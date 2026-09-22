@@ -9,14 +9,17 @@ Orbit 是一个面向 DeepSeek Harness 的**确定性长任务编排器**。它�
 
 从 v0.6.x 开始，Orbit 还可以选择性接入 **MoA 多候选执行**：当某个关键步骤存在多种合理实现路线时，Orbit 可以让多个 Candidate 独立给出方案，再由 Judge 做相对选优，最后仍由 Orbit 写回、真实验证并由 Commander 最终验收。
 
+从 v0.6.2 开始，Commander 与 Executor 在同一个 Run 内默认使用 **Persistent Role Sessions**：PLAN、Step Review、Final Review 会继续同一个 Commander Session；权限集合不变的连续 Step 会继续同一个 Executor Session。这样角色无需在每次交接时重新理解项目。只有权限变化、Watchdog 要求重启、Commander 显式请求 `RESET`、恢复失败或异常时，Supervisor 才会确定性轮换角色 Session。Watchdog、MoA Candidate 和 Judge 仍保持一次性隔离调用。
+
 ## 核心能力
 
-- **Commander**：负责计划、步骤审核、最终审核和策略调整。
-- **Executor**：一次只执行当前 Step，并负责真实工具调用与验证。
+- **Commander**：负责计划、步骤审核、最终审核和策略调整；一个 Run 内默认持续使用同一个 Commander Session。
+- **Executor**：一次只执行当前 Step，并负责真实工具调用与验证；权限集合不变时跨 Step 复用同一个 Executor Session。
 - **Smart Watchdog**：只在运行异常时介入诊断和恢复。
 - **Durable State**：运行状态持久化到 `<project>/.cx/state.json`，支持冷恢复。
 - **Bounded Loop**：Plan、Correction、Watchdog 和 Append 都有明确上限。
 - **Route Freeze**：Run 创建后冻结角色模型与 Reasoning，中途改 UI 只影响下一次 Run。
+- **Persistent Role Sessions**：Commander / Executor 会话身份、轮次、轮换次数和 Token 使用写入 durable state；正常交接不重新创建角色。
 - **Mutation Fence**：一个 workspace 同一时间只允许合法的 Orbit 修改驱动者。
 - **可选 MoA**：高不确定 Step 可以走 2–4 候选 + Judge 的多方案竞争。
 - **可选 Browser**：需要真实网页操作时再配合 `@kasenri/dsh-browser`。
@@ -363,7 +366,7 @@ dsh plugin --profile web add github:KasenRi/dsh-orbit
 | CX mode | Orbit mode (`orbit模式`; `cx模式` still works) |
 | `ctx.cx` | `ctx.orbit` (same `OrbitService` instance; `ctx.cx` remains an alias) |
 
-- `.cx/state.json` 路径保持不变；v0.6.0 写入 schema 3，旧 schema 2 状态可继续读取，并在下一次正常持久化时升级。
+- `.cx/state.json` 路径保持不变；v0.6.2 写入 schema 4（新增 `role_sessions`），旧 schema 2/3 状态可继续读取，并在下一次正常持久化时升级。
 - Legacy `cx模式` remains supported.
 - Existing durable runs do not need migration: Orbit reads the same
   `.cx/state.json`, including historical `CX_*` error strings.

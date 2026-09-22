@@ -53,7 +53,7 @@ const step = (id: string, goal = 'g'): OrbitPlanStep => ({ id, goal, status: 'pe
 
 function state(overrides: Partial<OrbitState> = {}): OrbitState {
   return {
-    schema_version: 3,
+    schema_version: 4,
     active_run_id: 'r1',
     run_id: 'r1',
     phase: 'EXECUTE',
@@ -269,7 +269,7 @@ test('initial state follows the kernel rules', () => {
     userHardConstraints: ['no push'],
     githubAllowed: true,
   })
-  assert.equal(initial.schema_version, 3)
+  assert.equal(initial.schema_version, 4)
   assert.equal(initial.run_id, 'run-1')
   assert.equal(initial.active_run_id, 'run-1')
   assert.equal(initial.phase, 'PLAN')

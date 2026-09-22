@@ -1,6 +1,6 @@
 /** Durable Orbit state and decision vocabulary. */
 
-export const ORBIT_SCHEMA_VERSION = 3 as const
+export const ORBIT_SCHEMA_VERSION = 4 as const
 
 export type OrbitPhase =
   | 'PLAN'
@@ -122,6 +122,31 @@ export interface OrbitStepResult {
   evidence: string
 }
 
+export interface OrbitRoleSessionUsage {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+}
+
+export interface OrbitRoleSessionState {
+  child_id: string
+  generation: number
+  turns: number
+  resets: number
+  grant_fingerprint?: string
+  last_step_id?: string
+  last_reset_reason?: string
+  needs_rotation?: boolean
+  usage?: OrbitRoleSessionUsage
+}
+
+export interface OrbitRoleSessions {
+  commander?: OrbitRoleSessionState
+  executor?: OrbitRoleSessionState
+}
+
 export interface OrbitState extends Record<string, unknown> {
   schema_version: typeof ORBIT_SCHEMA_VERSION
   active_run_id: string
@@ -135,6 +160,8 @@ export interface OrbitState extends Record<string, unknown> {
   goal_hash: string
   preset: string
   routes: OrbitRoutes
+  /** Durable Commander/Executor conversation identities for this Run. */
+  role_sessions?: OrbitRoleSessions
   /** Frozen MoA policy for this Run. Absent on legacy states and when MoA is disabled. */
   moa_policy?: OrbitMoaPolicy
   /** Durable state for the currently or most recently executed MoA step. */
@@ -196,6 +223,8 @@ export interface CommanderDecision {
   next_step_capabilities?: unknown
   next_step_execution_mode?: unknown
   next_steps?: Array<string | { goal: string; capabilities?: unknown; execution_mode?: unknown }>
+  /** Default KEEP; RESET asks the Supervisor to rotate the persistent Executor before its next turn. */
+  executor_session?: 'KEEP' | 'RESET'
 }
 
 export interface StrategyDecision {

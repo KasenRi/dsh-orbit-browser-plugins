@@ -90,7 +90,7 @@ test('active run with a different goal is rejected', async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('schema 2 durable state remains readable and upgrades to schema 3 on the next write', () => {
+test('schema 2 durable state remains readable and upgrades to schema 4 on the next write', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-schema2-state-'))
   const store = new OrbitStateStore(dir)
   const state = new OrbitSupervisor(store, new FakeHost(), config).createState({ goal: 'legacy', approved_loop_count: 3 })
@@ -100,7 +100,7 @@ test('schema 2 durable state remains readable and upgrades to schema 3 on the ne
   assert.equal((legacy as unknown as { schema_version: number }).schema_version, 2)
   assert.equal(legacy?.goal, 'legacy')
   store.writeState(legacy!)
-  assert.equal(store.readState()?.schema_version, 3)
+  assert.equal(store.readState()?.schema_version, 4)
   rmSync(dir, { recursive: true, force: true })
 })
 

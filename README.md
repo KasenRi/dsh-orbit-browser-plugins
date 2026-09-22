@@ -50,6 +50,19 @@ Final Evaluation
 SUCCESS
 ```
 
+## v0.6.2：Persistent Role Sessions
+
+从 v0.6.2 开始，一个 Orbit Run 不再为每次 Commander / Executor 交接都创建全新的角色会话：
+
+- PLAN、STEP_EVALUATE、STRATEGY_RECONSIDER、FINAL_EVALUATE 默认继续同一个 **Commander Session**；
+- 连续 Step 的工具权限集合一致时，默认继续同一个 **Executor Session**；
+- Executor 权限集合发生变化时会自动轮换，避免为了复用上下文而扩大权限；
+- Commander 可以在结构化决策里请求 `executor_session: RESET`，但真正的关闭/创建仍由 Supervisor 执行；
+- Watchdog、MoA Candidate、MoA Judge 继续保持一次性隔离调用；
+- 角色 Session ID、generation、turns、resets 与 Token usage 会写入 `.cx/state.json` 的 `role_sessions`，用于恢复和诊断。
+
+因此默认路径会从“每个阶段一个新 Agent”变成“一个 Run 主要只有一个 Commander + 一个 Executor”，减少重复项目探索和重复上下文建立，同时保留权限隔离和确定性轮换。
+
 ## v0.6.x：Orbit 接入 MoA 多候选执行
 
 从 v0.6.0 开始，Orbit 可以把少量高不确定性步骤交给 **MoA 多候选模式**。

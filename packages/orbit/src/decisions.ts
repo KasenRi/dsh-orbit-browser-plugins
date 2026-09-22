@@ -54,6 +54,7 @@ export const COMMANDER_STEP_EVALUATE_SCHEMA: ObjectJsonSchema = {
     next_step_goal: { type: 'string' },
     next_step_capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
     next_step_execution_mode: { type: 'string', enum: ['SINGLE', 'MOA'] },
+    executor_session: { type: 'string', enum: ['KEEP', 'RESET'] },
   },
 }
 
@@ -67,6 +68,7 @@ export const COMMANDER_FINAL_EVALUATE_SCHEMA: ObjectJsonSchema = {
     next_step_goal: { type: 'string' },
     next_step_capabilities: { type: 'array', items: { type: 'string', enum: CAPABILITY_ENUM } },
     next_step_execution_mode: { type: 'string', enum: ['SINGLE', 'MOA'] },
+    executor_session: { type: 'string', enum: ['KEEP', 'RESET'] },
     next_steps: {
       type: 'array',
       items: {

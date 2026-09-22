@@ -68,7 +68,7 @@ export class FakeHost implements OrbitHost {
     const queue = this.queues.get(request.role)
     const script = queue?.shift()
     if (!script) throw new Error(`FakeHost: no script left for role ${request.role} (${request.label})`)
-    const childId = script.childId ?? `${request.role}-${this.started.length + 1}`
+    const childId = request.resumeOf ?? script.childId ?? `${request.role}-${this.started.length + 1}`
     this.started.push({
       role: request.role,
       label: request.label,

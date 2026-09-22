@@ -18,7 +18,7 @@ import {
   WATCHDOG_TIMEOUT_SCHEMA,
   type EvaluationMode,
 } from './decisions.ts'
-import type { OrbitHost, RoleHandle, RoleRunResult, RoleToolFilter } from './host.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL, type ModelRunUsage, type OrbitHost, type RoleHandle, type RoleRunResult, type RoleToolFilter } from './host.ts'
 import { OrbitMoaAdapter, type OrbitMoaAdapterLike } from './moa-adapter.ts'
 import {
   applyCommanderNeedsUser,
@@ -491,6 +491,76 @@ export class OrbitSupervisor {
     return { allow: allowed }
   }
 
+  private grantFingerprint(filter: RoleToolFilter): string {
+    return [...(filter.allow ?? [])].sort().join('|')
+  }
+
+  private resumeRoleId(state: OrbitState, role: 'commander' | 'executor', fingerprint?: string): string | undefined {
+    const session = state.role_sessions?.[role]
+    if (!session || session.needs_rotation === true) return undefined
+    if (role === 'executor' && fingerprint !== undefined && session.grant_fingerprint !== fingerprint) return undefined
+    return session.child_id || undefined
+  }
+
+  private bindRoleSession(
+    state: OrbitState,
+    role: 'commander' | 'executor',
+    childId: string,
+    options: { fingerprint?: string; stepId?: string } = {},
+  ): void {
+    state.role_sessions ??= {}
+    const previous = state.role_sessions[role]
+    const same = previous?.child_id === childId && previous.needs_rotation !== true
+    const next = same
+      ? previous
+      : {
+          child_id: childId,
+          generation: (previous?.generation ?? 0) + 1,
+          turns: 0,
+          resets: previous?.resets ?? 0,
+          ...(previous?.last_reset_reason ? { last_reset_reason: previous.last_reset_reason } : {}),
+          ...(previous?.usage ? { usage: previous.usage } : {}),
+        }
+    next.child_id = childId
+    next.needs_rotation = false
+    if (options.fingerprint !== undefined) next.grant_fingerprint = options.fingerprint
+    if (options.stepId !== undefined) next.last_step_id = options.stepId
+    state.role_sessions[role] = next
+  }
+
+  private rotateRoleSession(state: OrbitState, role: 'commander' | 'executor', reason: string): void {
+    const current = state.role_sessions?.[role]
+    if (!current) return
+    current.needs_rotation = true
+    current.resets += 1
+    current.last_reset_reason = truncateSafe(reason, 160)
+  }
+
+  private recordRoleTurn(
+    state: OrbitState,
+    role: 'commander' | 'executor',
+    usage?: ModelRunUsage,
+    stepId?: string,
+  ): void {
+    const current = state.role_sessions?.[role]
+    if (!current) return
+    current.turns += 1
+    if (stepId !== undefined) current.last_step_id = stepId
+    if (!usage) return
+    const prior = current.usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+    current.usage = {
+      input_tokens: prior.input_tokens + usage.inputTokens,
+      output_tokens: prior.output_tokens + usage.outputTokens,
+      total_tokens: prior.total_tokens + (usage.totalTokens ?? usage.inputTokens + usage.outputTokens),
+      ...(prior.cache_read_tokens !== undefined || usage.cacheReadTokens !== undefined
+        ? { cache_read_tokens: (prior.cache_read_tokens ?? 0) + (usage.cacheReadTokens ?? 0) }
+        : {}),
+      ...(prior.cache_write_tokens !== undefined || usage.cacheWriteTokens !== undefined
+        ? { cache_write_tokens: (prior.cache_write_tokens ?? 0) + (usage.cacheWriteTokens ?? 0) }
+        : {}),
+    }
+  }
+
   // ── commander supervised path ──────────────────────────────────────────────
 
   private async makePlan(state: OrbitState, signal?: AbortSignal): Promise<OrbitActionResult | undefined> {
@@ -578,20 +648,48 @@ export class OrbitSupervisor {
     signal?: AbortSignal,
   ): Promise<SupervisedResult> {
     const startedAt = this.now()
+    const commanderTools = [
+      ...this.config.commanderReadOnlyTools.filter((name) => (READ_ONLY_ROLE_TOOLS as readonly string[]).includes(name)),
+      ORBIT_COMMANDER_DECISION_TOOL,
+    ]
+    const toolFilter = this.toolAllow(commanderTools, `commander ${mode}`)
+    const resumeOf = this.resumeRoleId(state, 'commander')
+    const persistentPrompt = [
+      prompt,
+      '',
+      `持续会话协议：你正在同一个 Orbit Commander Session 中继续工作。不要重新探索已经掌握的项目背景；只补充读取当前判断真正需要的新事实。`,
+      `完成判断后必须调用 ${ORBIT_COMMANDER_DECISION_TOOL}，mode 必须是 ${mode}。不要用普通文本代替结构化提交。`,
+      '除该内部提交工具外，不要调用任何会修改项目的工具。',
+    ].join('\n')
+    const start = (childId?: string) => this.host.startRole({
+      role: 'commander',
+      label: 'orbit-commander',
+      prompt: persistentPrompt,
+      route: state.routes.commander,
+      workspace: join(this.store.stateDir, '..'),
+      toolFilter,
+      outputSchema,
+      persistent: true,
+      commanderMode: mode,
+      ...(childId ? { resumeOf: childId } : {}),
+      ...(signal ? { signal } : {}),
+    })
     let handle: RoleHandle
     try {
-      handle = await this.host.startRole({
-        role: 'commander',
-        label: `commander-${mode.toLowerCase()}`,
-        prompt,
-        route: state.routes.commander,
-        workspace: join(this.store.stateDir, '..'),
-        toolFilter: this.toolAllow(this.config.commanderReadOnlyTools.filter((name) => (READ_ONLY_ROLE_TOOLS as readonly string[]).includes(name)), `commander ${mode}`),
-        outputSchema,
-        ...(signal ? { signal } : {}),
-      })
+      handle = await start(resumeOf)
     } catch (error) {
-      return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+      if (!resumeOf) return { kind: 'interrupted', reason: truncateSafe(error instanceof Error ? error.message : String(error), 500) }
+      this.rotateRoleSession(state, 'commander', `COMMANDER_RESUME_FAILED:${truncateSafe(error instanceof Error ? error.message : String(error), 120)}`)
+      this.store.writeState(state)
+      try {
+        handle = await start()
+      } catch (retryError) {
+        return { kind: 'interrupted', reason: truncateSafe(retryError instanceof Error ? retryError.message : String(retryError), 500) }
+      }
+    }
+    if (handle.childId) {
+      this.bindRoleSession(state, 'commander', handle.childId)
+      this.store.writeState(state)
     }
 
     try {
@@ -605,18 +703,30 @@ export class OrbitSupervisor {
         const remaining = Math.max(0, deadline - (this.now() - startedAt))
         const raced = await this.raceWithSleep(handle.result, remaining, signal)
         if (raced.kind === 'work') {
-          if (raced.value.interrupted) return { kind: 'interrupted', reason: raced.value.reason ?? `${mode}_INTERRUPTED` }
+          this.recordRoleTurn(state, 'commander', raced.value.tokenUsage)
+          if (raced.value.interrupted) {
+            this.rotateRoleSession(state, 'commander', raced.value.reason ?? `${mode}_INTERRUPTED`)
+            this.store.writeState(state)
+            return { kind: 'interrupted', reason: raced.value.reason ?? `${mode}_INTERRUPTED` }
+          }
           if (raced.value.structured === undefined) {
+            this.rotateRoleSession(state, 'commander', `${mode}_STRUCTURED_OUTPUT_MISSING`)
+            this.store.writeState(state)
             return { kind: 'interrupted', reason: `${mode}_STRUCTURED_OUTPUT_MISSING` }
           }
+          this.store.writeState(state)
           return { kind: 'output', output: raced.value.visibleOutput ?? raced.value.output, structured: raced.value.structured }
         }
         if (raced.kind === 'aborted' || signal?.aborted) {
           await this.cancelHandle(handle, 'ORBIT_ABORTED')
+          this.rotateRoleSession(state, 'commander', 'ORBIT_ABORTED')
+          this.store.writeState(state)
           return { kind: 'interrupted', reason: 'ORBIT_ABORTED' }
         }
         if (extensions >= 2) {
           await this.cancelHandle(handle, 'COMMANDER_HARD_TIMEOUT')
+          this.rotateRoleSession(state, 'commander', 'COMMANDER_HARD_TIMEOUT')
+          this.store.writeState(state)
           return { kind: 'interrupted', reason: 'COMMANDER_HARD_TIMEOUT' }
         }
         const review = await this.commanderTimeoutReview(state, mode, this.now() - startedAt, extensions, handle, signal)
@@ -625,6 +735,8 @@ export class OrbitSupervisor {
           continue
         }
         await this.cancelHandle(handle, review.decision === 'NEEDS_USER' ? 'COMMANDER_NEEDS_USER' : 'COMMANDER_TIMEOUT_INTERRUPTED')
+        this.rotateRoleSession(state, 'commander', review.decision === 'NEEDS_USER' ? 'COMMANDER_NEEDS_USER' : 'COMMANDER_TIMEOUT_INTERRUPTED')
+        this.store.writeState(state)
         if (review.decision === 'NEEDS_USER') return { kind: 'needs_user', reason: review.reason ?? 'COMMANDER_TIMEOUT_NEEDS_USER' }
         return { kind: 'interrupted', reason: 'COMMANDER_TIMEOUT_INTERRUPTED' }
       }
@@ -799,27 +911,55 @@ export class OrbitSupervisor {
       return { done: true, ok: false, message: reason }
     }
 
+    const fingerprint = this.grantFingerprint(toolFilter)
+    const previousExecutor = state.role_sessions?.executor
+    if (previousExecutor && previousExecutor.needs_rotation !== true && previousExecutor.grant_fingerprint !== fingerprint) {
+      this.rotateRoleSession(state, 'executor', 'EXECUTOR_TOOL_GRANT_CHANGED')
+      this.store.writeState(state)
+    }
+    const resumeOf = this.resumeRoleId(state, 'executor', fingerprint)
+      ?? (state.role_sessions?.executor === undefined && state.child?.id && state.child.status === 'interrupted' ? state.child.id : undefined)
+    const start = (childId?: string) => this.host.startRole({
+      role: 'executor',
+      label: 'orbit-executor',
+      prompt: this.executorPrompt(state, step, moaVerification),
+      route: state.routes.executor,
+      workspace: join(this.store.stateDir, '..'),
+      toolFilter,
+      capabilities,
+      persistent: true,
+      ...(signal ? { signal } : {}),
+      ...(childId ? { resumeOf: childId } : {}),
+    })
     let handle: RoleHandle
     try {
-      handle = await this.host.startRole({
-        role: 'executor',
-        label: `executor-${step.id}`,
-        prompt: this.executorPrompt(state, step, moaVerification),
-        route: state.routes.executor,
-        workspace: join(this.store.stateDir, '..'),
-        toolFilter,
-        capabilities,
-        ...(signal ? { signal } : {}),
-        ...(state.child?.id && state.child.status === 'interrupted' ? { resumeOf: state.child.id } : {}),
-      })
+      handle = await start(resumeOf)
     } catch (error) {
-      const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
-      enterNeedsUser(state, reason)
+      if (resumeOf) {
+        this.rotateRoleSession(state, 'executor', `EXECUTOR_RESUME_FAILED:${truncateSafe(error instanceof Error ? error.message : String(error), 120)}`)
+        this.store.writeState(state)
+        try {
+          handle = await start()
+        } catch (retryError) {
+          const reason = truncateSafe(retryError instanceof Error ? retryError.message : String(retryError), 500)
+          enterNeedsUser(state, reason)
+          this.store.writeState(state)
+          return { done: true, ok: false, message: reason }
+        }
+      } else {
+        const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+        enterNeedsUser(state, reason)
+        this.store.writeState(state)
+        return { done: true, ok: false, message: reason }
+      }
+    }
+    if (handle.childId) {
+      this.bindRoleSession(state, 'executor', handle.childId, { fingerprint, stepId: step.id })
       this.store.writeState(state)
-      return { done: true, ok: false, message: reason }
     }
 
     const result = await this.awaitExecutor(handle, signal)
+    this.recordRoleTurn(state, 'executor', result.tokenUsage, step.id)
 
     if (result.interrupted) {
       const retries = applyExecutorInterrupted(state, {
@@ -848,6 +988,7 @@ export class OrbitSupervisor {
       if (recovery === 'restart') {
         await this.cancelHandle(handle, 'ORBIT_RESTART_STEP')
         await this.disposeHandle(handle)
+        this.rotateRoleSession(state, 'executor', 'WATCHDOG_RESTART_STEP')
         clearExecutorChild(state)
         this.store.writeState(state)
         return { done: false, ok: false }
@@ -942,6 +1083,7 @@ export class OrbitSupervisor {
     }
     if (outcome.kind === 'needs_user') return this.setNeedsUser(state, outcome.reason)
     const decision = outcome.decision
+    if (decision.executor_session === 'RESET') this.rotateRoleSession(state, 'executor', 'COMMANDER_REQUEST')
 
     if (decision.decision === 'NEEDS_USER') {
       applyCommanderNeedsUser(state, decision.reason ?? 'COMMANDER_NEEDS_USER')
@@ -1296,6 +1438,7 @@ export class OrbitSupervisor {
       step_results: state.step_results,
       moa_policy: state.moa_policy,
       moa_step: state.moa_step,
+      role_sessions: state.role_sessions,
       changed_files: state.changed_files,
       test_summary: state.test_summary,
       driver_ownership: state.driver_ownership,

@@ -5,6 +5,8 @@ import { Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { DshOrbitHost } from './dsh-host.ts'
+import { createCommanderDecisionTool } from './commander-tool.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL } from './host.ts'
 import { OrbitMoaAdapter } from './moa-adapter.ts'
 import { OrbitStateStore } from './state-store.ts'
 import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome } from './supervisor.ts'
@@ -60,6 +62,9 @@ export class OrbitService extends Service {
     this.root = ctx
     this.host = new DshOrbitHost(ctx)
     this.config = config
+    if (ctx.tools.get(ORBIT_COMMANDER_DECISION_TOOL) === undefined) {
+      ctx.tools.register(createCommanderDecisionTool((agent, submission) => this.host.captureCommanderDecision(agent, submission)))
+    }
   }
 
   private publishRuntime(state: import('./types.ts').OrbitState): void {

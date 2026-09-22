@@ -7,7 +7,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { collectTurnToolFacts } from './evidence.ts'
-import type { ModelRunRequest, ModelRunResult, ModelRunUsage, OrbitHost, RoleHandle, RoleRunRequest, RoleRunResult } from './host.ts'
+import type { CommanderDecisionSubmission } from './commander-tool.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL, type ModelRunRequest, type ModelRunResult, type ModelRunUsage, type OrbitHost, type RoleHandle, type RoleRunRequest, type RoleRunResult } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import { classifyTurnSettlement } from './settlement.ts'
 import type { OrbitTelemetry } from './types.ts'
@@ -56,11 +57,10 @@ function visibleContentToText(blocks: readonly ContentBlock[] | undefined): stri
 /**
  * Wire the Orbit supervisor to DeepSeek Harness native Agent/Subagent services.
  *
- * Roles keep the Pi-validated split:
- * - Commander/Watchdog: one-shot children, cancelled through the launch signal
- *   plus `run.dispose()` (the real one-shot cancellation seam).
- * - Executor: continuable child so a runtime restart can interrupt it and a
- *   resume can reuse the same child.
+ * Commander and Executor can run as durable continuable children for the life
+ * of one Orbit Run. Watchdog and MoA model calls remain isolated one-shot
+ * children. A continuable child may drain between turns; its Session identity
+ * and history remain cold-resumable through DSH.
  */
 export class DshOrbitHost implements OrbitHost {
   private readonly ctx: Context
@@ -68,6 +68,7 @@ export class DshOrbitHost implements OrbitHost {
   private readonly interruptedChildren = new Set<string>()
   private readonly childParents = new Map<string, Agent>()
   private readonly childGrants = new Map<string, { role: OrbitRole; workspace: string; tools: ReadonlySet<string> }>()
+  private readonly commanderDecisions = new Map<string, CommanderDecisionSubmission>()
   private readonly nowFn: () => number
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>
 
@@ -97,8 +98,8 @@ export class DshOrbitHost implements OrbitHost {
       reasoningEffort: request.route.reasoningEffort as never,
     }
 
-    if (request.role === 'executor') {
-      return this.startExecutor(parent, request, prompt, agentOptions)
+    if (request.persistent === true && (request.role === 'executor' || request.role === 'commander')) {
+      return this.startPersistentRole(parent, request, prompt, agentOptions)
     }
     return this.startOneShot(parent, request, prompt, agentOptions)
   }
@@ -186,7 +187,18 @@ export class DshOrbitHost implements OrbitHost {
     }
   }
 
-  private async startExecutor(
+  /** Accept one decision from the exact persistent Commander child. */
+  captureCommanderDecision(agent: Agent | undefined, submission: CommanderDecisionSubmission): void {
+    const childId = String(agent?.id ?? '')
+    const grant = this.childGrants.get(childId)
+    const parent = this.childParents.get(childId)
+    if (!agent || grant?.role !== 'commander' || parent === undefined || this.ctx.agents.get(SessionId(childId)) !== agent || !this.ctx.agents.isOwnedBy(SessionId(childId), parent)) {
+      throw new Error('ORBIT_COMMANDER_DECISION_UNAUTHORIZED')
+    }
+    this.commanderDecisions.set(childId, structuredClone(submission))
+  }
+
+  private async startPersistentRole(
     parent: Agent,
     request: RoleRunRequest,
     prompt: ContentBlock[],
@@ -194,26 +206,31 @@ export class DshOrbitHost implements OrbitHost {
   ): Promise<RoleHandle> {
     if (request.resumeOf) {
       const existingId = request.resumeOf
-      const existing = this.ctx.agents.get(existingId as SessionId)
-      const grant = this.childGrants.get(existingId)
-      const requestedTools = new Set(request.toolFilter?.allow ?? [])
-      const sameGrant = grant?.role === 'executor' && grant.workspace === (request.workspace ?? parent.session.header.cwd ?? process.cwd())
-        && grant.tools.size === requestedTools.size && [...grant.tools].every((tool) => requestedTools.has(tool))
-      if (existing && sameGrant && this.childParents.get(existingId) === parent && this.ctx.agents.isOwnedBy(SessionId(existingId), parent)) {
-        const agent = existing as unknown as AgentLike
-        this.interruptedChildren.delete(existingId)
-        const previousTurns = (agent.session?.snapshotEvents?.() ?? []).filter((event) => event.type === 'turn/start').length
+      const previous = this.ctx.agents.get(existingId as SessionId) as unknown as AgentLike | undefined
+      const previousTurns = (previous?.session?.snapshotEvents?.() ?? []).filter((event) => event.type === 'turn/start').length
+      // DSH sendMessage can cold-resume a durable direct continuable child. Rebuild
+      // Orbit's in-memory grant before delivery so the resumed turn is authorized.
+      this.registerChild(existingId, parent, request)
+      this.interruptedChildren.delete(existingId)
+      try {
         await this.ctx.subagents.sendMessage(parent, existingId as SessionId, prompt, {
           signal: request.signal ?? new AbortController().signal,
         })
-        const done = this.waitForExecutorSettlement(agent, existingId, previousTurns)
+        const resumed = this.ctx.agents.get(existingId as SessionId) as unknown as AgentLike | undefined
+        if (!resumed) throw new Error('ORBIT_PERSISTENT_CHILD_MISSING_AFTER_RESUME')
+        const done = this.waitForPersistentSettlement(request, resumed, existingId, previousTurns)
         return {
           childId: existingId,
           result: done,
-          cancel: async (reason: string) => this.interruptExecutor(existingId, reason),
-          dispose: async () => this.drainExecutor(parent, existingId),
-          runtimeSnapshot: () => this.snapshotAgent(agent),
+          cancel: async (reason: string) => this.interruptPersistentChild(existingId, reason),
+          // A settled persistent turn stays resident for the next Orbit turn.
+          // Run-level cleanup drains it explicitly through revokeWorkspace().
+          dispose: async () => undefined,
+          runtimeSnapshot: () => this.snapshotAgent(resumed),
         }
+      } catch (error) {
+        this.forgetChild(existingId)
+        throw error
       }
     }
 
@@ -242,13 +259,15 @@ export class DshOrbitHost implements OrbitHost {
     }
     const agent = this.ctx.agents.get(started.childId)
     const result = agent
-      ? this.waitForExecutorSettlement(agent as unknown as AgentLike, childId)
-      : Promise.resolve<RoleRunResult>({ childId, output: '', interrupted: true, reason: 'EXECUTOR_CHILD_MISSING' })
+      ? this.waitForPersistentSettlement(request, agent as unknown as AgentLike, childId)
+      : Promise.resolve<RoleRunResult>({ childId, output: '', interrupted: true, reason: 'ORBIT_PERSISTENT_CHILD_MISSING' })
     return {
       childId,
       result,
-      cancel: async (reason: string) => this.interruptExecutor(childId, reason),
-      dispose: async () => this.drainExecutor(parent, childId),
+      cancel: async (reason: string) => this.interruptPersistentChild(childId, reason),
+      // Do not drain after a normal turn: that would force an unnecessary
+      // cold-resume and discard the live role context we intentionally reuse.
+      dispose: async () => undefined,
       runtimeSnapshot: agent ? () => this.snapshotAgent(agent as unknown as AgentLike) : undefined,
     }
   }
@@ -268,9 +287,10 @@ export class DshOrbitHost implements OrbitHost {
     this.interruptedChildren.delete(childId)
     this.childParents.delete(childId)
     this.childGrants.delete(childId)
+    this.commanderDecisions.delete(childId)
   }
 
-  private async interruptExecutor(childId: string, reason: string): Promise<void> {
+  private async interruptPersistentChild(childId: string, reason: string): Promise<void> {
     this.interruptedChildren.add(childId)
     const parent = this.childParents.get(childId)
     this.ctx.subagents.interrupt(childId as SessionId, parent ? { kind: 'ancestor', agent: parent } : { kind: 'user', parentSessionId: childId as SessionId })
@@ -278,7 +298,7 @@ export class DshOrbitHost implements OrbitHost {
     void reason
   }
 
-  private async drainExecutor(parent: Agent, childId: string): Promise<void> {
+  private async drainPersistentChild(parent: Agent, childId: string): Promise<void> {
     try {
       await this.ctx.subagents.drainContinuableChildren(parent, [childId as SessionId])
     } catch {
@@ -287,22 +307,37 @@ export class DshOrbitHost implements OrbitHost {
     this.forgetChild(childId)
   }
 
-  private async waitForExecutorSettlement(agent: AgentLike, childId: string, previousTurns = 0): Promise<RoleRunResult> {
+  private async waitForPersistentSettlement(request: RoleRunRequest, agent: AgentLike, childId: string, previousTurns = 0): Promise<RoleRunResult> {
     await this.waitForTurnOrIdle(agent, previousTurns)
     const events = agent.session?.snapshotEvents?.() ?? agent.session?.ownEvents?.() ?? []
     const classified = classifyTurnSettlement(events)
     const output = this.readFinalOutput(agent)
+    const visibleOutput = this.readFinalVisibleOutput(agent)
     const telemetry = await this.snapshotAgent(agent)
-    // Evidence is read from the settled turn's own events; a resumed executor
-    // therefore reports only the turn that just finished, never an earlier one.
+    const tokenUsage = this.readTokenUsage(agent)
     const toolEvidence = collectTurnToolFacts(events)
     const evidence = {
       settlement: classified.settlement,
       ...(toolEvidence.length > 0 ? { toolEvidence } : {}),
+      ...(tokenUsage ? { tokenUsage } : {}),
     }
+    const roleCode = request.role === 'commander' ? 'COMMANDER' : 'EXECUTOR'
 
     if (this.interruptedChildren.has(childId)) {
-      return { childId, output, interrupted: true, reason: 'EXECUTOR_INTERRUPTED', telemetry, ...evidence }
+      return { childId, output, interrupted: true, reason: `${roleCode}_INTERRUPTED`, telemetry, ...evidence }
+    }
+
+    if (classified.settlement === 'completed' && request.role === 'commander') {
+      const submission = this.commanderDecisions.get(childId)
+      this.commanderDecisions.delete(childId)
+      if (!submission) {
+        return { childId, output, interrupted: true, reason: `${request.commanderMode ?? 'COMMANDER'}_STRUCTURED_OUTPUT_MISSING`, telemetry, ...evidence }
+      }
+      if (request.commanderMode !== undefined && submission.mode !== request.commanderMode) {
+        return { childId, output, interrupted: true, reason: `COMMANDER_DECISION_MODE_MISMATCH: expected ${request.commanderMode}, got ${submission.mode}`, telemetry, ...evidence }
+      }
+      const { mode: _mode, ...structured } = submission
+      return { childId, output, visibleOutput, structured, interrupted: false, telemetry, ...evidence }
     }
 
     switch (classified.settlement) {
@@ -313,7 +348,7 @@ export class DshOrbitHost implements OrbitHost {
           childId,
           output,
           interrupted: true,
-          reason: `EXECUTOR_ABORTED${classified.cancelCause ? `:${classified.cancelCause}` : ''}`,
+          reason: `${roleCode}_ABORTED${classified.cancelCause ? `:${classified.cancelCause}` : ''}`,
           telemetry,
           ...evidence,
         }
@@ -322,18 +357,18 @@ export class DshOrbitHost implements OrbitHost {
           childId,
           output,
           interrupted: true,
-          reason: `EXECUTOR_ERROR: ${redactText(classified.errorMessage ?? 'unknown failure')}`,
+          reason: `${roleCode}_ERROR: ${redactText(classified.errorMessage ?? 'unknown failure')}`,
           telemetry,
           ...evidence,
         }
       case 'blocked':
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_BLOCKED', telemetry, ...evidence }
+        return { childId, output, interrupted: true, reason: `${roleCode}_BLOCKED`, telemetry, ...evidence }
       case 'max-tokens':
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_MAX_TOKENS', telemetry, ...evidence }
+        return { childId, output, interrupted: true, reason: `${roleCode}_MAX_TOKENS`, telemetry, ...evidence }
       case 'interrupted':
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_INTERRUPTED', telemetry, ...evidence }
+        return { childId, output, interrupted: true, reason: `${roleCode}_INTERRUPTED`, telemetry, ...evidence }
       default:
-        return { childId, output, interrupted: true, reason: 'EXECUTOR_NO_TURN', telemetry, ...evidence }
+        return { childId, output, interrupted: true, reason: `${roleCode}_NO_TURN`, telemetry, ...evidence }
     }
   }
 
@@ -366,6 +401,18 @@ export class DshOrbitHost implements OrbitHost {
       }
     }
     return undefined
+  }
+
+  private readFinalVisibleOutput(agent: AgentLike): string {
+    const events = agent.session?.snapshotEvents?.() ?? agent.session?.ownEvents?.() ?? []
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (!event || event.type !== 'assistant/message') continue
+      const data = event.data as { message?: { content?: ContentBlock[] }; content?: ContentBlock[] } | undefined
+      const text = visibleContentToText(data?.message?.content ?? data?.content)
+      if (text.trim()) return text
+    }
+    return ''
   }
 
   private readFinalOutput(agent: AgentLike): string {
@@ -421,7 +468,7 @@ export class DshOrbitHost implements OrbitHost {
       await handle.cancel(reason)
       return
     }
-    if (handle.childId) await this.interruptExecutor(handle.childId, reason)
+    if (handle.childId) await this.interruptPersistentChild(handle.childId, reason)
   }
 
   async releaseRole(handle: RoleHandle): Promise<void> {
@@ -431,11 +478,12 @@ export class DshOrbitHost implements OrbitHost {
     }
     if (handle.childId) {
       const parent = this.childParents.get(handle.childId)
-      if (parent) await this.drainExecutor(parent, handle.childId)
+      if (parent) await this.drainPersistentChild(parent, handle.childId)
     }
   }
 
   hasTool(name: string): boolean {
+    if (name === ORBIT_COMMANDER_DECISION_TOOL) return true
     // Standard profiles mount their tool composition on the agent plane
     // (agent presets), so the visible set must resolve against the initiating
     // agent's scope. Without an initiator this falls back to the global view.
@@ -482,11 +530,11 @@ export class DshOrbitHost implements OrbitHost {
   }
 
   async revokeWorkspace(cwd: string): Promise<void> {
-    const ids = [...this.childGrants].filter(([, grant]) => grant.workspace === resolve(cwd) && grant.role === 'executor').map(([id]) => id)
+    const ids = [...this.childGrants].filter(([, grant]) => grant.workspace === resolve(cwd)).map(([id]) => id)
     for (const id of ids) {
       const parent = this.childParents.get(id)
-      await this.interruptExecutor(id, 'ORBIT_WORKSPACE_RELEASED')
-      if (parent) await this.drainExecutor(parent, id)
+      await this.interruptPersistentChild(id, 'ORBIT_WORKSPACE_RELEASED')
+      if (parent) await this.drainPersistentChild(parent, id)
     }
   }
 

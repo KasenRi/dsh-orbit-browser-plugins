@@ -347,10 +347,11 @@ test('commander adaptive timeout reviews then hard ceiling cancels the same chil
   assert.equal(first.ok, false)
   assert.equal(first.phase, 'EVALUATE')
   assert.deepEqual(host.sleepCalls.slice(0, 3), [360000, 240000, 240000])
-  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-1'))
-  assert.ok(host.disposed.includes('cmd-1'))
-  // timeout telemetry is bound to the current Commander child, not the Executor
-  assert.equal(host.snapshots[0]?.childId, 'cmd-1')
+  const commanderId = host.scriptsFor('commander')[0]?.childId
+  assert.ok(commanderId)
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === commanderId))
+  // timeout telemetry is bound to the persistent Commander child, not the Executor
+  assert.equal(host.snapshots[0]?.childId, commanderId)
 
   const resumed = await supervisor.run(store.readState()!)
   assert.equal(resumed.phase, 'SUCCESS')
@@ -374,7 +375,8 @@ test('commander timeout watchdog unavailable: EXTEND then INTERRUPT', async () =
   assert.equal(first.ok, false)
   assert.deepEqual(host.sleepCalls.slice(0, 2), [360000, 240000])
   assert.equal(host.scriptsFor('watchdog').length, 0)
-  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_TIMEOUT_INTERRUPTED' && call.childId === 'cmd-1'))
+  const commanderId = host.scriptsFor('commander')[0]?.childId
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_TIMEOUT_INTERRUPTED' && call.childId === commanderId))
 
   const resumed = await supervisor.run(store.readState()!)
   assert.equal(resumed.phase, 'SUCCESS')
@@ -526,10 +528,12 @@ test('FINAL_EVALUATE also runs under the adaptive Commander timeout', async () =
   const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 5 })
   assert.equal(first.ok, false)
-  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-final'))
-  const finalStart = host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')
+  const commanderId = host.scriptsFor('commander')[0]?.childId
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === commanderId))
+  const finalStart = host.scriptsFor('commander').find((entry) => entry.request.commanderMode === 'FINAL_EVALUATE')
   assert.ok(finalStart)
-  assert.equal(host.snapshots.at(-1)?.childId, 'cmd-final')
+  assert.equal(finalStart.childId, commanderId)
+  assert.equal(host.snapshots.at(-1)?.childId, commanderId)
   cleanup()
 })
 
@@ -553,7 +557,8 @@ test('STRATEGY_RECONSIDER runs under the adaptive Commander timeout and stays re
   const supervisor = new OrbitSupervisor(store, host, config)
   const first = await supervisor.bootstrap({ goal: 'x', approved_loop_count: 10 })
   assert.equal(first.ok, false)
-  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === 'cmd-strategy'))
+  const commanderId = host.scriptsFor('commander')[0]?.childId
+  assert.ok(host.cancelled.some((call) => call.reason === 'COMMANDER_HARD_TIMEOUT' && call.childId === commanderId))
   // Temporary failure must NOT consume the strategy challenge.
   assert.equal(store.readState()?.strategy_challenge, undefined)
   assert.equal(store.readState()?.phase, 'EVALUATE')
@@ -582,7 +587,7 @@ test('Commander receives the settled step evidence bundle', async () => {
     ])
   await make(host, dir).bootstrap({ goal: 'x', approved_loop_count: 5 })
   const stepPrompt =
-    host.scriptsFor('commander').find((entry) => entry.label === 'commander-step_evaluate')?.request.prompt ?? ''
+    host.scriptsFor('commander').find((entry) => entry.request.commanderMode === 'STEP_EVALUATE')?.request.prompt ?? ''
   assert.match(stepPrompt, /"settlement":"completed"/)
   assert.match(stepPrompt, /"command":"npm test"/)
   assert.match(stepPrompt, /执行员证据/)
@@ -643,7 +648,7 @@ test('insufficient stop evidence cannot settle as FINAL SUCCESS', async () => {
   // The Commander's final review receives the weak evidence verbatim, so the
   // verdict can refuse SUCCESS instead of trusting the Executor's claim.
   const finalPrompt =
-    host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')?.request.prompt ?? ''
+    host.scriptsFor('commander').find((entry) => entry.request.commanderMode === 'FINAL_EVALUATE')?.request.prompt ?? ''
   assert.match(finalPrompt, /HTTP 502/)
   assert.match(finalPrompt, /执行员证据/)
   assert.match(finalPrompt, /你是 Orbit 指挥官/)
@@ -720,7 +725,7 @@ test('an arbitrary user reply resumes the NEEDS_USER run and stays durable', asy
   assert.match(executorPrompt, /8080/)
   const stepPrompt = host
     .scriptsFor('commander')
-    .find((entry) => entry.label === 'commander-step_evaluate' && entry.request.prompt.includes('8080'))?.request.prompt
+    .find((entry) => entry.request.commanderMode === 'STEP_EVALUATE' && entry.request.prompt.includes('8080'))?.request.prompt
   assert.ok(stepPrompt, 'the Commander step evaluation must read the reply')
   cleanup()
 })
@@ -812,12 +817,97 @@ test('FINAL_EVALUATE sees every durable step result after rebuilding the Supervi
     { structured: commander({ decision: 'SUCCESS' }) },
   ]).script('executor', [{ output: 'P2 result', changedFiles: ['third.ts'], testSummary: ['third tests pass'] }])
   assert.equal((await new OrbitSupervisor(store, host, config).run(persisted)).phase, 'SUCCESS')
-  const final = host.scriptsFor('commander').find((entry) => entry.label === 'commander-final_evaluate')!.request.prompt
+  const final = host.scriptsFor('commander').find((entry) => entry.request.commanderMode === 'FINAL_EVALUATE')!.request.prompt
   for (const value of ['P0 result', 'P1 result', 'P2 result', 'first.ts', 'second.ts', 'third.ts', 'first tests pass', 'second tests pass', 'third tests pass']) {
     assert.ok(final.includes(value), `FINAL must retain ${value}`)
   }
-  const coldReview = host.scriptsFor('commander').filter((entry) => entry.label === 'commander-step_evaluate')[2]!.request.prompt
+  const coldReview = host.scriptsFor('commander').filter((entry) => entry.request.commanderMode === 'STEP_EVALUATE')[2]!.request.prompt
   assert.ok(coldReview.includes('P1 result'))
   assert.equal(host.scriptsFor('watchdog').length, 0)
+  cleanup()
+})
+
+test('v0.6.2 persistent roles reuse one Commander and one Executor when grants stay stable', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'a' }, { id: 'P1', goal: 'b' }, { id: 'P2', goal: 'c' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS', summary: 'done' }) },
+    ])
+    .script('executor', [
+      { output: 'a' },
+      { output: 'b' },
+      { output: 'c' },
+    ])
+
+  const result = await make(host, dir).bootstrap({ goal: 'persistent proof', approved_loop_count: 5 })
+  assert.equal(result.phase, 'SUCCESS')
+
+  const commanders = host.scriptsFor('commander')
+  const executors = host.scriptsFor('executor')
+  assert.equal(new Set(commanders.map((entry) => entry.childId)).size, 1, 'one Commander Session must survive PLAN/reviews/FINAL')
+  assert.equal(new Set(executors.map((entry) => entry.childId)).size, 1, 'one Executor Session must survive same-grant steps')
+  assert.ok(commanders.slice(1).every((entry) => entry.request.resumeOf === commanders[0]?.childId))
+  assert.ok(executors.slice(1).every((entry) => entry.request.resumeOf === executors[0]?.childId))
+
+  const state = new OrbitStateStore(dir).readState()
+  assert.equal(state?.role_sessions?.commander?.turns, 5)
+  assert.equal(state?.role_sessions?.commander?.generation, 1)
+  assert.equal(state?.role_sessions?.executor?.turns, 3)
+  assert.equal(state?.role_sessions?.executor?.generation, 1)
+  cleanup()
+})
+
+test('v0.6.2 rotates Executor only when the tool grant changes', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([
+        { id: 'P0', goal: 'read' },
+        { id: 'P1', goal: 'edit', capabilities: ['filesystem', 'shell'] },
+      ]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [{ output: 'read' }, { output: 'edited' }])
+
+  assert.equal((await make(host, dir).bootstrap({ goal: 'grant rotation', approved_loop_count: 4 })).phase, 'SUCCESS')
+  const executors = host.scriptsFor('executor')
+  assert.equal(executors.length, 2)
+  assert.notEqual(executors[0]?.childId, executors[1]?.childId)
+  assert.equal(executors[1]?.request.resumeOf, undefined)
+
+  const state = new OrbitStateStore(dir).readState()
+  assert.equal(state?.role_sessions?.executor?.generation, 2)
+  assert.equal(state?.role_sessions?.executor?.resets, 1)
+  assert.equal(state?.role_sessions?.executor?.last_reset_reason, 'EXECUTOR_TOOL_GRANT_CHANGED')
+  cleanup()
+})
+
+test('Commander RESET request deterministically rotates the persistent Executor', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'a' }, { id: 'P1', goal: 'b' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP', executor_session: 'RESET' }) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [{ output: 'a' }, { output: 'b' }])
+
+  assert.equal((await make(host, dir).bootstrap({ goal: 'commander reset', approved_loop_count: 4 })).phase, 'SUCCESS')
+  const executors = host.scriptsFor('executor')
+  assert.equal(executors.length, 2)
+  assert.notEqual(executors[0]?.childId, executors[1]?.childId)
+  const state = new OrbitStateStore(dir).readState()
+  assert.equal(state?.role_sessions?.executor?.resets, 1)
+  assert.equal(state?.role_sessions?.executor?.last_reset_reason, 'COMMANDER_REQUEST')
   cleanup()
 })

@@ -95,7 +95,7 @@ test('the projections register strict toggle and runtime wire shapes', () => {
 
 test('runtime snapshot is bounded and excludes candidate/Judge text', () => {
   const snapshot = orbitRuntimeFromState({
-    schema_version: 3,
+    schema_version: 4,
     active_run_id: 'run-1',
     run_id: 'run-1',
     phase: 'EXECUTE',

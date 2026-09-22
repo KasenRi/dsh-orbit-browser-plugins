@@ -1,7 +1,10 @@
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { EvidenceToolFact } from './evidence.ts'
 import type { TurnSettlement } from './settlement.ts'
-import type { OrbitRole, OrbitRoute, OrbitTelemetry } from './types.ts'
+import type { CommanderMode, OrbitRole, OrbitRoute, OrbitTelemetry } from './types.ts'
+
+/** Internal turn-concluding tool available only inside the persistent Commander child. */
+export const ORBIT_COMMANDER_DECISION_TOOL = 'orbit_commander_decision'
 
 export interface RoleToolFilter {
   allow?: readonly string[]
@@ -20,6 +23,10 @@ export interface RoleRunRequest {
   capabilities?: readonly string[]
   signal?: AbortSignal
   resumeOf?: string
+  /** Keep this role as one durable continuable child across Orbit turns. */
+  persistent?: boolean
+  /** Expected Commander decision mode for the internal decision tool. */
+  commanderMode?: CommanderMode
   /**
    * DSH-native structured output request for one-shot decision roles
    * (Commander/Watchdog). The provider validates the child's capture against

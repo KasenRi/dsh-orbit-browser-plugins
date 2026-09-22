@@ -9,6 +9,7 @@ import LlmPlugin from '@deepseek-ai/dsh-llm'
 import SessionPlugin, { SessionId } from '@deepseek-ai/dsh-session'
 import PersistencePlugin from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionProjectionPlugin from '@deepseek-ai/dsh-session-projection'
+import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
 import type {} from '@deepseek-ai/dsh-api-session-controller/types'
 import SystemPromptPlugin from '@deepseek-ai/dsh-system-prompt'
 import ToolsPlugin, { defineTool } from '@deepseek-ai/dsh-tools'
@@ -19,11 +20,18 @@ import SubagentPlugin from '@deepseek-ai/dsh-subagent'
 import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as OrbitPlugin from '../../src/index.ts'
 import { DshOrbitHost } from '../../src/dsh-host.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL } from '../../src/host.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
 import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
 const MODEL = { provider: 'fake', model: 'fm' }
 const ROUTE = { provider: 'fake', model: 'fm', reasoningEffort: 'off' }
+
+/** Minimal exact-read backend for continuable cold-resume tests; search is irrelevant here. */
+class TestSessionQuery extends SessionQueryEngine {
+  async searchSessions(): Promise<never> { return { items: [], next: null } as never }
+  async searchEvents(): Promise<never> { return { items: [], next: null } as never }
+}
 
 interface AdapterScript {
   plan?: string
@@ -89,6 +97,13 @@ class ScriptedAdapter extends LlmAdapter {
       .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
       .map((block) => block.text)
       .join('\n')
+    const currentUser = [...options.messages].reverse().find((message) =>
+      message.role === 'user' && message.content.some((block) => block.type === 'text'),
+    )
+    const turnPrompt = currentUser?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? prompt
     this.seen.push(prompt.slice(0, 80))
     this.prompts.push(prompt)
     this.requests.push({
@@ -99,7 +114,7 @@ class ScriptedAdapter extends LlmAdapter {
       prompt: prompt.slice(0, 40),
     })
 
-    if (this.script.hangMarker && prompt.includes(this.script.hangMarker)) {
+    if (this.script.hangMarker && turnPrompt.includes(this.script.hangMarker)) {
       await hangUntilAborted(options.signal)
     }
 
@@ -107,57 +122,66 @@ class ScriptedAdapter extends LlmAdapter {
     // the Executor settles with plain text.
     let reply = 'ok'
     let structured = false
-    if (prompt.includes('当前阶段：PLAN')) {
+    let commanderMode: 'PLAN' | 'STEP_EVALUATE' | 'FINAL_EVALUATE' | 'STRATEGY_RECONSIDER' | undefined
+    if (turnPrompt.includes('当前阶段：PLAN')) {
       reply = this.script.plan ?? '{"summary":"e2e","steps":[{"id":"P1","goal":"do the thing"}]}'
       structured = true
-    } else if (prompt.includes('你是 Orbit 的 MoA Judge')) {
+      commanderMode = 'PLAN'
+    } else if (turnPrompt.includes('你是 Orbit 的 MoA Judge')) {
       reply = '候选 2 更完整。\nWINNER_CANDIDATE_INDEX: 2'
-    } else if (prompt.includes('你是 Orbit 的 MoA 独立候选模型') || prompt.includes('你是 Orbit 的 MoA 候选模型')) {
+    } else if (turnPrompt.includes('你是 Orbit 的 MoA 独立候选模型') || turnPrompt.includes('你是 Orbit 的 MoA 候选模型')) {
       reply = '候选方案 ' + options.model + '\n```text file="result.txt"\n' + options.model + '\n```'
-    } else if (prompt.includes('你是 Orbit 执行员')) {
+    } else if (turnPrompt.includes('你是 Orbit 执行员')) {
       this.executorCalls += 1
       if (this.script.hangFirstExecutor && this.executorCalls === 1) {
         await hangUntilAborted(options.signal)
       }
       reply = 'executor done'
-    } else if (prompt.includes('STEP_EVALUATE')) {
+    } else if (turnPrompt.includes('STEP_EVALUATE')) {
       const replies = this.script.stepEvaluates
       reply = replies !== undefined && replies.length > 0
         ? replies[Math.min(this.stepEvaluateCalls, replies.length - 1)] ?? '{"decision":"PASS_CURRENT_STEP"}'
         : this.script.stepEvaluate ?? '{"decision":"PASS_CURRENT_STEP"}'
       this.stepEvaluateCalls += 1
       structured = true
-    } else if (prompt.includes('FINAL_EVALUATE')) {
+      commanderMode = 'STEP_EVALUATE'
+    } else if (turnPrompt.includes('FINAL_EVALUATE')) {
       reply = this.script.finalEvaluate ?? '{"decision":"SUCCESS","summary":"scripted final summary"}'
       structured = true
-    } else if (prompt.includes('STRATEGY_CHALLENGE')) {
+      commanderMode = 'FINAL_EVALUATE'
+    } else if (turnPrompt.includes('STRATEGY_CHALLENGE')) {
       reply = this.script.strategyChallenge ?? '{"question":"is this tunnel vision?"}'
       structured = true
-    } else if (prompt.includes('STRATEGY_RECONSIDER')) {
+    } else if (turnPrompt.includes('STRATEGY_RECONSIDER')) {
       reply = this.script.strategyReconsider ?? '{"decision":"KEEP_APPROACH"}'
       structured = true
-    } else if (prompt.includes('RUNTIME_DIAGNOSE')) {
+      commanderMode = 'STRATEGY_RECONSIDER'
+    } else if (turnPrompt.includes('RUNTIME_DIAGNOSE')) {
       reply = this.script.runtimeDiagnose ?? '{"decision":"RESTART_STEP"}'
       structured = true
-    } else if (prompt.includes('COMMANDER_TIMEOUT_REVIEW')) {
+    } else if (turnPrompt.includes('COMMANDER_TIMEOUT_REVIEW')) {
       reply = this.script.timeoutReview ?? '{"decision":"EXTEND"}'
       structured = true
-    } else if (prompt.includes('GUARD_ESCALATION')) {
+    } else if (turnPrompt.includes('GUARD_ESCALATION')) {
       reply = this.script.guardEscalation ?? '{"decision":"RETRY_DIFFERENTLY"}'
       structured = true
     }
 
     if (structured) {
-      if (prompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText) {
+      if (turnPrompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText) {
         yield { type: 'block-start', index: 0, blockType: 'text' }
         yield { type: 'text-delta', index: 0, text: this.script.finalVisibleText }
         yield { type: 'block-end', index: 0, block: { type: 'text', text: this.script.finalVisibleText } }
       }
       const callId = ToolCallId(`structured-${this.seen.length}`)
-      const index = prompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText ? 1 : 0
+      const index = turnPrompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText ? 1 : 0
+      const toolName = commanderMode === undefined ? 'structured_output' : ORBIT_COMMANDER_DECISION_TOOL
+      const args = commanderMode === undefined
+        ? reply
+        : JSON.stringify({ mode: commanderMode, ...(JSON.parse(reply) as Record<string, unknown>) })
       yield { type: 'block-start', index, blockType: 'tool-call' }
-      yield { type: 'tool-call-delta', index, id: callId, name: 'structured_output', argumentsDelta: reply }
-      yield { type: 'block-end', index, block: { type: 'tool-call', id: callId, name: 'structured_output', arguments: reply } }
+      yield { type: 'tool-call-delta', index, id: callId, name: toolName, argumentsDelta: args }
+      yield { type: 'block-end', index, block: { type: 'tool-call', id: callId, name: toolName, arguments: args } }
       yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
       return
@@ -211,6 +235,7 @@ async function boot(adapter: ScriptedAdapter, options: { executorTimeoutMs?: num
     [AgentLoopPlugin, { agents: [] }],
   ]
   for (const [plugin, config] of plugins) await root.plugin(plugin as never, config as never)
+  new TestSessionQuery(root)
   root.llm.registerAdapter(options.providers ?? ['fake'], adapter)
   root.provide('agentDefaultModel', { currentSelection: () => ({ ...ROUTE }) } as never)
   for (const name of ['read', 'glob', 'grep', 'bash', 'write', 'edit', 'agent_browser']) root.tools.register(stubTool(name))
@@ -257,7 +282,9 @@ function hangUntilAborted(signal: AbortSignal | undefined): Promise<never> {
 }
 
 test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a competitor', { timeout: 120_000 }, async () => {
-  const adapter = new ScriptedAdapter()
+  const adapter = new ScriptedAdapter({
+    plan: '{"summary":"persistent","steps":[{"id":"P0","goal":"first"},{"id":"P1","goal":"second"}]}',
+  })
   const root = await boot(adapter)
   const project = tempProject()
   const parent = await makeParent(root, project.dir, 'e2e-parent-1')
@@ -273,10 +300,20 @@ test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a comp
       0,
       'direct service/tool-style calls never project the hard-activation final result',
     )
-    const state = JSON.parse(readFileSync(join(project.dir, '.cx', 'state.json'), 'utf8')) as { phase: string; driver_ownership: string }
+    const state = JSON.parse(readFileSync(join(project.dir, '.cx', 'state.json'), 'utf8')) as {
+      phase: string
+      driver_ownership: string
+      role_sessions?: { commander?: { child_id?: string; turns?: number }; executor?: { child_id?: string; turns?: number } }
+    }
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.driver_ownership, 'CLOSED')
-    assert.ok(adapter.executorCalls >= 1, 'the real Executor child must have run')
+    assert.equal(adapter.executorCalls, 2, 'both real Executor turns must have run')
+    assert.equal(state.role_sessions?.commander?.turns, 4, `PLAN + two reviews + FINAL reuse one Commander Session: ${JSON.stringify(state.role_sessions)}`)
+    assert.equal(state.role_sessions?.executor?.turns, 2, 'two same-grant steps reuse one Executor Session')
+    const commanderSessionIds = new Set(adapter.requests.filter((entry) => entry.prompt.includes('Orbit 指挥官')).map((entry) => entry.sessionId))
+    const executorSessionIds = new Set(adapter.requests.filter((entry) => entry.prompt.includes('Orbit 执行员')).map((entry) => entry.sessionId))
+    assert.equal(commanderSessionIds.size, 1, 'real DSH must keep one Commander child session id')
+    assert.equal(executorSessionIds.size, 1, 'real DSH must keep one Executor child session id across steps')
     const runtimeEvents = parent.agent.session.snapshotEvents().filter((event) => event.type === 'orbit/runtime')
     assert.ok(runtimeEvents.length > 0, 'Orbit must publish durable runtime snapshots into the owning Session')
     const lastRuntime = runtimeEvents.at(-1)?.data as { phase?: string; status?: string }
