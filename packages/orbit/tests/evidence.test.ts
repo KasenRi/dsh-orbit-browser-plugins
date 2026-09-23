@@ -15,12 +15,25 @@ const call = (turn: number, callId: string, name: string, args: Record<string, u
   data: { turn, step: 1, callId, name, arguments: JSON.stringify(args) },
 })
 
-const result = (turn: number, callId: string, isError = false, error?: { name: string; code: string }) => ({
+const result = (
+  turn: number,
+  callId: string,
+  isError = false,
+  error?: { name: string; code: string },
+  text?: string,
+) => ({
   type: 'tool/result',
   data: {
     turn,
     step: 1,
-    message: { content: [{ type: 'tool-result', toolCallId: callId, content: [], isError }] },
+    message: {
+      content: [{
+        type: 'tool-result',
+        toolCallId: callId,
+        content: text === undefined ? [] : [{ type: 'text', text }],
+        isError,
+      }],
+    },
     ...(error ? { error } : {}),
   },
 })
@@ -76,6 +89,48 @@ test('detects test commands and keeps them as real evidence', () => {
   assert.equal(bundle.tools.length, 2)
 })
 
+test('run_code nested tools.bash preserves trusted stdout, exit code, and test evidence', () => {
+  const code = `const r = await tools.bash({ command: 'node --test orbit-smoke-test/task-summary.test.js; echo "EXIT_CODE=$?"', workdir: '/root/code' });\nconsole.log(r.stdout.text);\nconsole.log('timedOut:', r.timedOut, 'exitCode:', r.exitCode);`
+  const output = [
+    '✔ 正常统计',
+    'ℹ tests 7',
+    'ℹ pass 7',
+    'ℹ fail 0',
+    'EXIT_CODE=0',
+    'timedOut: false exitCode: 0',
+  ].join('\n')
+  const facts = collectTurnToolFacts([
+    { type: 'turn/start', data: { turn: 1 } },
+    call(1, 'rc1', 'run_code', { code, description: 'run tests' }),
+    result(1, 'rc1', false, undefined, output),
+  ])
+
+  assert.equal(facts.length, 1)
+  assert.equal(facts[0]?.name, 'run_code')
+  assert.equal(facts[0]?.operation, 'tools.bash')
+  assert.match(facts[0]?.command ?? '', /node --test orbit-smoke-test\/task-summary\.test\.js/)
+  assert.equal(facts[0]?.exit_code, 0)
+  assert.match(facts[0]?.result_summary ?? '', /pass 7/)
+
+  const bundle = buildEvidenceBundle({ tools: facts, executorOutput: 'tests passed' })
+  assert.equal(bundle.tests.length, 1)
+  assert.equal(bundle.tests[0]?.status, 'ok')
+  assert.equal(bundle.tests[0]?.exit_code, 0)
+  assert.match(bundle.tests[0]?.result_summary ?? '', /tests 7/)
+  assert.match(bundle.tests[0]?.result_summary ?? '', /fail 0/)
+  const formatted = formatEvidenceBundle(bundle)
+  assert.match(formatted, /\[TRUSTED_TOOL_EVENTS\]/)
+  assert.match(formatted, /\[EXECUTOR_SUMMARY_UNVERIFIED\]/)
+  assert.match(formatted, /"operation":"tools\.bash"/)
+  assert.match(formatted, /"exit_code":0/)
+  const durable = buildStepResult('P2', 1, bundle)
+  assert.equal(durable.test_summary.length, 1)
+  assert.match(durable.test_summary[0] ?? '', /node --test/)
+  assert.match(durable.test_summary[0] ?? '', /pass 7/)
+  assert.match(durable.test_summary[0] ?? '', /fail 0/)
+  assert.match(durable.test_summary[0] ?? '', /exit=0/)
+})
+
 test('bounds every evidence section', () => {
   const tools = Array.from({ length: 30 }, (_, index) => ({
     name: `tool-${index}`,
@@ -93,9 +148,10 @@ test('bounds every evidence section', () => {
   assert.ok((bundle.executor_summary ?? '').length <= EVIDENCE_LIMITS.executorSummary)
 
   const longEntry = buildEvidenceBundle({
-    tools: [{ name: 'bash', status: 'ok', command: 'y'.repeat(1000) }],
+    tools: [{ name: 'bash', status: 'ok', command: 'y'.repeat(1000), result_summary: 'r'.repeat(5000) }],
   })
   assert.ok((longEntry.tools[0]?.detail ?? '').length <= EVIDENCE_LIMITS.entry)
+  assert.ok((longEntry.tools[0]?.result_summary ?? '').length <= EVIDENCE_LIMITS.toolResult)
   assert.ok((longEntry.tests[0]?.command ?? '').length <= EVIDENCE_LIMITS.entry)
 })
 
@@ -105,7 +161,12 @@ test('redacts secrets and enforces the total budget', () => {
     call(1, 's1', 'bash', { command: 'API_KEY=supersecret123 npm run deploy', env: { TOKEN: 'abc' } }),
     result(1, 's1'),
   ])
-  const bundle = buildEvidenceBundle({ tools: facts, executorOutput: 'access_token=abcdef123456' })
+  const secretOutputFacts = collectTurnToolFacts([
+    { type: 'turn/start', data: { turn: 2 } },
+    call(2, 's2', 'run_code', { code: `console.log('token')` }),
+    result(2, 's2', false, undefined, 'TOKEN=supersecret123'),
+  ])
+  const bundle = buildEvidenceBundle({ tools: [...facts, ...secretOutputFacts], executorOutput: 'access_token=abcdef123456' })
   const formatted = formatEvidenceBundle(bundle)
   assert.ok(!formatted.includes('supersecret123'))
   assert.ok(!formatted.includes('abcdef123456'))

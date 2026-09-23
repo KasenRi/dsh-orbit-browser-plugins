@@ -172,6 +172,7 @@ const COMMANDER_STEP_PROMPT = (
   state: OrbitState,
 ) => `你是 Orbit 指挥官（Commander），当前阶段：STEP_EVALUATE。
 请核实真实项目状态，不要只相信执行员的说法；以可验证的执行证据为准。
+证据语义：[TRUSTED_TOOL_EVENTS] 来自 Orbit Supervisor 对当前已结算 DSH tool/call + tool/result 的确定性提取，可视为真实发生过的工具事件；其中 tests 是从真实 shell 命令（包括 run_code 内可确定识别的字面 tools.bash 命令）与对应 tool/result 提取的测试证据。[EXECUTOR_SUMMARY_UNVERIFIED] 仍只是执行员自述，不能单独作为 PASS 依据。若可信工具事件已经包含所需 stdout/exit code/测试汇总，不要仅为了重复验证而要求 Commander 自己获得 shell 或创建临时证据文件。
 允许的 decision 仅限：PASS_CURRENT_STEP | CORRECT_CURRENT_STEP | NEEDS_USER。
 - CORRECT_CURRENT_STEP 必须给出具体的下一步目标（可选 capabilities）。
 请通过结构化结果协议提交最终判断。
@@ -180,12 +181,13 @@ const COMMANDER_STEP_PROMPT = (
 当前步骤 ${step.id}：${step.goal}
 执行模式：${normalizeExecutionMode(step.execution_mode)}
 迭代计数：loop ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
-执行员证据：
+Supervisor 执行证据：
 ${evidence}`
 
 const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence: string, state: OrbitState) =>
   `你是 Orbit 指挥官（Commander），当前阶段：FINAL_EVALUATE。
 所有计划步骤均已执行完毕。请依据真实项目状态判断原始目标是否真正达成。
+证据语义：步骤 evidence 中的 [TRUSTED_TOOL_EVENTS] 来自 Orbit Supervisor 对已结算 DSH tool/call + tool/result 的确定性提取，可作为真实工具执行事实；[EXECUTOR_SUMMARY_UNVERIFIED] 只是模型总结。已有可信 stdout/exit code/测试汇总时，不要仅为了重复验证而要求 Commander 自己获得 shell 或额外落盘证据。
 允许的 decision 仅限：SUCCESS | APPEND | NEEDS_USER。
 - APPEND 必须给出新增步骤或下一步目标；追加受剩余 loop 预算限制。
 请通过结构化结果协议提交最终判断。
@@ -194,7 +196,7 @@ const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence
 计划摘要：${plan.summary}
 步骤：${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}/${normalizeExecutionMode(step.execution_mode)}]`).join('; ')}
 Loop：${state.loop.used}/${state.loop.max}${userReplyLine(state)}
-执行员证据：
+Supervisor 执行证据：
 ${evidence}`
 
 /**

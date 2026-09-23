@@ -11,6 +11,8 @@ Orbit 是一个面向 DeepSeek Harness 的**确定性长任务编排器**。它�
 
 从 v0.6.2 开始，Commander 与 Executor 在同一个 Run 内默认使用 **Persistent Role Sessions**：PLAN、Step Review、Final Review 会继续同一个 Commander Session；权限集合不变的连续 Step 会继续同一个 Executor Session。这样角色无需在每次交接时重新理解项目。只有权限变化、Watchdog 要求重启、Commander 显式请求 `RESET`、恢复失败或异常时，Supervisor 才会确定性轮换角色 Session。Watchdog、MoA Candidate 和 Judge 仍保持一次性隔离调用。
 
+从 v0.6.3 开始，Orbit 增加 **Trusted Execution Evidence**：Supervisor 会从已结算的 DSH `tool/call` + `tool/result` 中确定性提取真实工具结果摘要、exit code 和测试证据，并能识别 `run_code` 内字面 `tools.bash({ command: ... })` 的嵌套 shell 命令。Commander 会明确区分 `[TRUSTED_TOOL_EVENTS]` 和 `[EXECUTOR_SUMMARY_UNVERIFIED]`，避免已经有真实 stdout / exit code / test summary 时仍重复申请 shell 或要求 Executor 把证据写入临时文件。
+
 ## 核心能力
 
 - **Commander**：负责计划、步骤审核、最终审核和策略调整；一个 Run 内默认持续使用同一个 Commander Session。

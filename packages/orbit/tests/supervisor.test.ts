@@ -581,7 +581,7 @@ test('Commander receives the settled step evidence bundle', async () => {
         settlement: 'completed',
         toolEvidence: [
           { name: 'edit', status: 'ok', detail: 'src/a.ts' },
-          { name: 'bash', status: 'ok', command: 'npm test', detail: 'npm test' },
+          { name: 'bash', status: 'ok', command: 'npm test', detail: 'npm test', result_summary: 'tests 7\npass 7\nfail 0\nEXIT=0', exit_code: 0 },
         ],
       },
     ])
@@ -590,7 +590,12 @@ test('Commander receives the settled step evidence bundle', async () => {
     host.scriptsFor('commander').find((entry) => entry.request.commanderMode === 'STEP_EVALUATE')?.request.prompt ?? ''
   assert.match(stepPrompt, /"settlement":"completed"/)
   assert.match(stepPrompt, /"command":"npm test"/)
-  assert.match(stepPrompt, /执行员证据/)
+  assert.match(stepPrompt, /"result_summary":"tests 7\\npass 7\\nfail 0\\nEXIT=0"/)
+  assert.match(stepPrompt, /"exit_code":0/)
+  assert.match(stepPrompt, /\[TRUSTED_TOOL_EVENTS\]/)
+  assert.match(stepPrompt, /\[EXECUTOR_SUMMARY_UNVERIFIED\]/)
+  assert.match(stepPrompt, /Supervisor 执行证据/)
+  assert.match(stepPrompt, /不要仅为了重复验证而要求 Commander 自己获得 shell/)
   assert.match(stepPrompt, /你是 Orbit 指挥官/)
   cleanup()
 })
@@ -650,7 +655,7 @@ test('insufficient stop evidence cannot settle as FINAL SUCCESS', async () => {
   const finalPrompt =
     host.scriptsFor('commander').find((entry) => entry.request.commanderMode === 'FINAL_EVALUATE')?.request.prompt ?? ''
   assert.match(finalPrompt, /HTTP 502/)
-  assert.match(finalPrompt, /执行员证据/)
+  assert.match(finalPrompt, /Supervisor 执行证据/)
   assert.match(finalPrompt, /你是 Orbit 指挥官/)
   cleanup()
 })

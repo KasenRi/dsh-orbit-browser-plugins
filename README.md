@@ -63,6 +63,10 @@ SUCCESS
 
 因此默认路径会从“每个阶段一个新 Agent”变成“一个 Run 主要只有一个 Commander + 一个 Executor”，减少重复项目探索和重复上下文建立，同时保留权限隔离和确定性轮换。
 
+## v0.6.3：Trusted Execution Evidence
+
+v0.6.3 补齐 Executor → Supervisor → Commander 的可信执行证据链：Orbit 会从已结算的 DSH `tool/call` + `tool/result` 中提取经过脱敏和限长的真实结果摘要、显式 exit code，以及可识别的测试命令。对于 `run_code` 中可确定识别的字面 `tools.bash({ command: ... })`，Orbit 会把嵌套 shell 命令与对应真实输出关联起来。Commander 会明确区分 `[TRUSTED_TOOL_EVENTS]` 与 `[EXECUTOR_SUMMARY_UNVERIFIED]`，因此已有真实 stdout / exit code / 测试汇总时，不再需要为了重复证明而申请 shell 或让 Executor 额外落盘临时 evidence 文件。
+
 ## v0.6.x：Orbit 接入 MoA 多候选执行
 
 从 v0.6.0 开始，Orbit 可以把少量高不确定性步骤交给 **MoA 多候选模式**。
