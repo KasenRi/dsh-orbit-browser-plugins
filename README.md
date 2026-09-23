@@ -77,6 +77,10 @@ v0.6.4 把 Watchdog 从“出错后才介入”扩展为 **事件触发 + 周期
 
 最终关闭流程也改为 fail-closed：Commander 的 `FINAL_EVALUATE → SUCCESS` 只是完成候选，随后必须通过 one-shot `FINAL_AUDIT`，再由 Persistent Commander 在 `TERMINAL_CONFIRM` 阶段调用专用 `orbit_run_complete({ signal: "COMPLETE" })`。Supervisor 最后还会机械检查所有 Step 已通过、没有活动执行步骤、Final Audit 指纹仍有效且没有等待用户输入，全部满足后才写入真正的 `SUCCESS / CLOSED`。普通文本“完成”不会关闭 Run。
 
+## v0.6.5：Session Persistence Hotfix
+
+真实 Web Profile Live Apply 暴露了一个 DSH 兼容性边界：当前 DSH 的 `Session.append()` 还没有给外部插件开放 envelope-level `ignorable: true` 写入接口，而持久化 reader 会拒绝未知且非 ignorable 的自定义 Session event。v0.6.5 因此停止在当前 Harness 上持久化未被核心词汇识别的 `orbit/runtime` event，避免 Session 在冷读取/重启后变成不可恢复日志。Orbit 的权威运行状态仍然是 `<project>/.cx/state.json`；只有未来 Harness 原生识别 `orbit/runtime` 时才会恢复该 Session runtime projection。
+
 ## v0.6.x：Orbit 接入 MoA 多候选执行
 
 从 v0.6.0 开始，Orbit 可以把少量高不确定性步骤交给 **MoA 多候选模式**。

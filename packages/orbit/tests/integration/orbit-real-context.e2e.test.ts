@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { LlmAdapter, ToolCallId, createUserMessage, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import LlmPlugin from '@deepseek-ai/dsh-llm'
-import SessionPlugin, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionPlugin, { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
 import PersistencePlugin from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionProjectionPlugin from '@deepseek-ai/dsh-session-projection'
 import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
@@ -339,10 +339,14 @@ test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a comp
     assert.equal(commanderSessionIds.size, 1, 'real DSH must keep one Commander child session id')
     assert.equal(executorSessionIds.size, 1, 'real DSH must keep one Executor child session id across steps')
     const runtimeEvents = parent.agent.session.snapshotEvents().filter((event) => event.type === 'orbit/runtime')
-    assert.ok(runtimeEvents.length > 0, 'Orbit must publish durable runtime snapshots into the owning Session')
-    const lastRuntime = runtimeEvents.at(-1)?.data as { phase?: string; status?: string }
-    assert.equal(lastRuntime.phase, 'SUCCESS')
-    assert.equal(lastRuntime.status, 'success')
+    if (KNOWN_SESSION_EVENT_TYPES.has('orbit/runtime')) {
+      assert.ok(runtimeEvents.length > 0, 'a harness that recognizes orbit/runtime should receive the bounded runtime projection')
+      const lastRuntime = runtimeEvents.at(-1)?.data as { phase?: string; status?: string }
+      assert.equal(lastRuntime.phase, 'SUCCESS')
+      assert.equal(lastRuntime.status, 'success')
+    } else {
+      assert.equal(runtimeEvents.length, 0, 'unknown out-of-tree Session events must not be persisted without an ignorable writer surface')
+    }
   } finally {
     await parent.dispose()
     await root.fiber.dispose()

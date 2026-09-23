@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { KNOWN_SESSION_EVENT_TYPES, SessionId } from '@deepseek-ai/dsh-session'
 import { DshOrbitHost } from './dsh-host.ts'
 import { createCommanderDecisionTool } from './commander-tool.ts'
 import { createRunCompleteTool } from './completion-tool.ts'
@@ -81,6 +81,13 @@ export class OrbitService extends Service {
     if (!owner) return
     const session = this.root.sessions.get(SessionId(owner))
     if (!session) return
+    // Current DSH Session.append has no public writer surface for the
+    // envelope-level `ignorable: true` marker required by out-of-tree event
+    // types. Persisting an unknown `orbit/runtime` event would make the
+    // Session unreadable after a cold observer/restart. Publish only when the
+    // running harness itself recognizes the event vocabulary; `.cx/state.json`
+    // remains Orbit's durable source of truth on older harnesses.
+    if (!KNOWN_SESSION_EVENT_TYPES.has('orbit/runtime')) return
     session.append('orbit/runtime', orbitRuntimeFromState(state))
   }
 
