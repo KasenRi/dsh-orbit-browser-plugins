@@ -1,11 +1,13 @@
 /** Durable Orbit state and decision vocabulary. */
 
-export const ORBIT_SCHEMA_VERSION = 4 as const
+export const ORBIT_SCHEMA_VERSION = 5 as const
 
 export type OrbitPhase =
   | 'PLAN'
   | 'EXECUTE'
   | 'EVALUATE'
+  | 'FINAL_VERIFY'
+  | 'TERMINAL_CONFIRM'
   | 'SUCCESS'
   | 'NEEDS_USER'
   | 'BUDGET_EXHAUSTED'
@@ -147,6 +149,62 @@ export interface OrbitRoleSessions {
   executor?: OrbitRoleSessionState
 }
 
+export interface OrbitProgressState {
+  seq: number
+  at: string
+}
+
+export type HeartbeatDecisionKind =
+  | 'HEALTHY'
+  | 'WAIT'
+  | 'RESTART_STEP'
+  | 'ROTATE_COMMANDER'
+  | 'STRATEGY_REVIEW'
+  | 'NEEDS_USER'
+  | 'RUNTIME_BUG'
+
+export interface HeartbeatDecision {
+  decision: HeartbeatDecisionKind
+  reason?: string
+}
+
+export type FinalAuditDecisionKind = 'APPROVE_CLOSE' | 'BLOCK_CLOSE' | 'NEEDS_USER' | 'RUNTIME_BUG'
+
+export interface FinalAuditDecision {
+  decision: FinalAuditDecisionKind
+  reason?: string
+}
+
+export interface OrbitHeartbeatState {
+  enabled: boolean
+  sequence: number
+  interval_ms: number
+  healthy_interval_ms: number
+  suspect_interval_ms: number
+  healthy_streak: number
+  anomaly_streak: number
+  last_at?: string
+  next_at?: string
+  last_decision?: HeartbeatDecisionKind | 'STALE_HEARTBEAT' | 'UNAVAILABLE'
+  last_reason?: string
+  observed_progress_seq?: number
+  last_runtime_signature?: string
+  strategy_review_requested?: boolean
+  final_audit?: {
+    verdict?: FinalAuditDecisionKind
+    at?: string
+    fingerprint?: string
+    reason?: string
+    block_count?: number
+  }
+}
+
+export interface OrbitTerminalConfirmation {
+  signal: 'COMPLETE' | 'NOT_COMPLETE'
+  at: string
+  reason?: string
+}
+
 export interface OrbitState extends Record<string, unknown> {
   schema_version: typeof ORBIT_SCHEMA_VERSION
   active_run_id: string
@@ -162,6 +220,14 @@ export interface OrbitState extends Record<string, unknown> {
   routes: OrbitRoutes
   /** Durable Commander/Executor conversation identities for this Run. */
   role_sessions?: OrbitRoleSessions
+  /** Monotonic meaningful-work progress; ordinary persistence writes do not bump it. */
+  progress?: OrbitProgressState
+  /** Durable proactive supervision schedule/state. */
+  heartbeat_watchdog?: OrbitHeartbeatState
+  /** Final explicit Commander stop signal. */
+  terminal_confirmation?: OrbitTerminalConfirmation
+  /** Most recent recovered error retained for diagnostics after a successful close. */
+  recovered_error?: string
   /** Frozen MoA policy for this Run. Absent on legacy states and when MoA is disabled. */
   moa_policy?: OrbitMoaPolicy
   /** Durable state for the currently or most recently executed MoA step. */
@@ -176,7 +242,7 @@ export interface OrbitState extends Record<string, unknown> {
   step_results?: OrbitStepResult[]
   current_step?: { id: string; attempt: number }
   child?: { id?: string; status: 'running' | 'completed' | 'interrupted' | 'unknown' }
-  commander?: { last_decision?: string; summary?: string; remaining_gap?: string }
+  commander?: { last_decision?: string; summary?: string; remaining_gap?: string; final_output?: string }
   changed_files: string[]
   test_summary: string[]
   last_error: string | null
@@ -214,6 +280,11 @@ export type TimeoutDecisionKind = 'EXTEND' | 'INTERRUPT' | 'NEEDS_USER'
 export type WatchdogDecisionKind = 'RESUME_CHILD' | 'RESTART_STEP' | 'NEEDS_USER' | 'RUNTIME_BUG'
 
 export type GuardWatchdogDecisionKind = 'RETRY_DIFFERENTLY' | 'NEEDS_USER'
+
+export interface TerminalCompletionSubmission {
+  signal: 'COMPLETE' | 'NOT_COMPLETE'
+  reason?: string
+}
 
 export interface CommanderDecision {
   decision: CommanderDecisionKind
@@ -255,6 +326,10 @@ export interface OrbitTelemetry {
   turn_count?: number
   activity_state?: string
   duration_ms?: number
+  last_event_age_ms?: number
+  current_tool_age_ms?: number
+  last_assistant_age_ms?: number
+  turn_age_ms?: number
   recent_output?: string
 }
 
@@ -280,6 +355,10 @@ export const COMMANDER_HARD_CEILING_MS = 14 * 60_000
 
 export const EXECUTOR_TIMEOUT_MS = 8 * 60_000
 export const WATCHDOG_TIMEOUT_MS = 2 * 60_000
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 2 * 60_000
+export const DEFAULT_HEARTBEAT_HEALTHY_INTERVAL_MS = 3 * 60_000
+export const DEFAULT_HEARTBEAT_SUSPECT_INTERVAL_MS = 60_000
+export const MAX_FINAL_AUDIT_BLOCKS = 2
 
 export type CommanderMode = 'PLAN' | 'STEP_EVALUATE' | 'FINAL_EVALUATE' | 'STRATEGY_RECONSIDER'
 

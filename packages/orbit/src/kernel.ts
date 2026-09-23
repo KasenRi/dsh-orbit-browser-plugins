@@ -278,6 +278,7 @@ export function createInitialState(input: InitialStateInput): OrbitState {
     driver_ownership: 'ACTIVE',
     state_revision: 0,
     updated_at: new Date(input.now).toISOString(),
+    progress: { seq: 0, at: new Date(input.now).toISOString() },
     goal: input.goal,
     goal_hash: hashGoal(input.goal),
     preset: input.preset ?? 'orbit-lite',
@@ -417,9 +418,78 @@ export function applyStepPass(state: OrbitState, step: OrbitPlanStep | undefined
   state.status = 'running'
 }
 
-/** FINAL_EVALUATE says SUCCESS: the run is done. */
+/** Record one piece of meaningful work. Heartbeat persistence alone must never call this. */
+export function markMeaningfulProgress(state: OrbitState, now: number): void {
+  state.progress = { seq: (state.progress?.seq ?? 0) + 1, at: new Date(now).toISOString() }
+}
+
+/** FINAL_EVALUATE says SUCCESS: enter the final audit gate, but do not close yet. */
+export function applyFinalCandidate(state: OrbitState, summary?: string, finalOutput?: string): void {
+  state.commander = {
+    last_decision: 'SUCCESS',
+    summary: summary ?? state.commander?.summary,
+    ...(state.commander?.remaining_gap ? { remaining_gap: state.commander.remaining_gap } : {}),
+    ...(finalOutput?.trim() ? { final_output: finalOutput.trim().slice(0, 8000) } : state.commander?.final_output ? { final_output: state.commander.final_output } : {}),
+  }
+  state.phase = 'FINAL_VERIFY'
+  state.status = 'running'
+  state.terminal_confirmation = undefined
+}
+
+/** Final Watchdog approved closure; ask the Commander for one explicit terminal signal. */
+export function applyFinalAuditApproved(state: OrbitState): void {
+  state.phase = 'TERMINAL_CONFIRM'
+  state.status = 'running'
+}
+
+/** Final Watchdog blocked closure; return to final evaluation with the gap explicit. */
+export function applyFinalAuditBlocked(state: OrbitState, reason: string): void {
+  state.commander = {
+    ...state.commander,
+    last_decision: 'FINAL_AUDIT_BLOCKED',
+    remaining_gap: reason,
+  }
+  state.phase = 'EVALUATE'
+  state.status = 'running'
+  state.current_step = undefined
+  state.child = undefined
+  state.last_error = reason
+  state.terminal_confirmation = undefined
+}
+
+/** Record the Commander's narrow terminal signal without closing the Run. */
+export function applyTerminalConfirmation(state: OrbitState, signal: 'COMPLETE' | 'NOT_COMPLETE', now: number, reason?: string): void {
+  state.terminal_confirmation = {
+    signal,
+    at: new Date(now).toISOString(),
+    ...(reason?.trim() ? { reason: reason.trim().slice(0, 500) } : {}),
+  }
+  if (signal === 'NOT_COMPLETE') {
+    state.commander = { ...state.commander, last_decision: 'NOT_COMPLETE', ...(reason ? { remaining_gap: reason.slice(0, 500) } : {}) }
+    state.phase = 'EVALUATE'
+    state.status = 'running'
+    state.current_step = undefined
+    state.child = undefined
+  }
+}
+
+/** Mechanical completion gate. Models cannot override these invariants. */
+export function completionGateIssue(state: OrbitState, auditFingerprint: string, currentFingerprint: string): string | undefined {
+  if (state.plan.steps.some((step) => step.status !== 'passed')) return 'ORBIT_COMPLETION_GATE_STEPS_NOT_PASSED'
+  if (state.plan.steps.some((step) => step.status === 'pending' || step.status === 'running')) return 'ORBIT_COMPLETION_GATE_ACTIVE_STEP'
+  if (state.child?.status === 'running' || state.role_sessions?.executor?.needs_rotation === true) return 'ORBIT_COMPLETION_GATE_EXECUTOR_ACTIVE'
+  if (state.phase === 'NEEDS_USER' || state.status === 'needs_user') return 'ORBIT_COMPLETION_GATE_PENDING_USER_REPLY'
+  if (state.heartbeat_watchdog?.final_audit?.verdict !== 'APPROVE_CLOSE') return 'ORBIT_COMPLETION_GATE_AUDIT_NOT_APPROVED'
+  if (!auditFingerprint || auditFingerprint !== currentFingerprint) return 'ORBIT_COMPLETION_GATE_AUDIT_STALE'
+  if (state.terminal_confirmation?.signal !== 'COMPLETE') return 'ORBIT_COMPLETION_GATE_TERMINAL_SIGNAL_MISSING'
+  return undefined
+}
+
+/** All final gates passed: close success and clear the current error surface. */
 export function applyFinalSuccess(state: OrbitState, summary?: string): void {
-  state.commander = { last_decision: 'SUCCESS', summary: summary ?? state.commander?.summary }
+  state.commander = { ...state.commander, last_decision: 'SUCCESS', summary: summary ?? state.commander?.summary }
+  if (state.last_error) state.recovered_error = state.last_error
+  state.last_error = null
   state.phase = 'SUCCESS'
   state.status = 'success'
 }

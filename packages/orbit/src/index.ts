@@ -61,6 +61,11 @@ export const Config = z.object({
     .array(z.string())
     .default(['read', 'read_image', 'glob', 'grep']),
   executorTimeoutMs: z.natural().default(480_000),
+  heartbeatEnabled: z.boolean().default(true),
+  heartbeatIntervalMs: z.natural().default(120_000),
+  heartbeatHealthyIntervalMs: z.natural().default(180_000),
+  heartbeatSuspectIntervalMs: z.natural().default(60_000),
+  finalAuditEnabled: z.boolean().default(true),
   registerTool: z.boolean().default(true),
   registerGuards: z.boolean().default(true),
   slashCommand: z.boolean().default(true),
@@ -75,6 +80,11 @@ export interface OrbitConfigShape {
   watchdogTools: string[]
   executorTools: string[]
   executorTimeoutMs: number
+  heartbeatEnabled: boolean
+  heartbeatIntervalMs: number
+  heartbeatHealthyIntervalMs: number
+  heartbeatSuspectIntervalMs: number
+  finalAuditEnabled: boolean
   registerTool: boolean
   registerGuards: boolean
   slashCommand: boolean
@@ -163,6 +173,11 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
     watchdogTools: config.watchdogTools,
     executorTools: config.executorTools,
     executorTimeoutMs: config.executorTimeoutMs,
+    heartbeatEnabled: config.heartbeatEnabled ?? true,
+    heartbeatIntervalMs: config.heartbeatIntervalMs ?? 120_000,
+    heartbeatHealthyIntervalMs: config.heartbeatHealthyIntervalMs ?? 180_000,
+    heartbeatSuspectIntervalMs: config.heartbeatSuspectIntervalMs ?? 60_000,
+    finalAuditEnabled: config.finalAuditEnabled ?? true,
     ...(config.projectDir ? { projectDir: config.projectDir } : {}),
   }
   const service = new OrbitService(ctx, serviceConfig)

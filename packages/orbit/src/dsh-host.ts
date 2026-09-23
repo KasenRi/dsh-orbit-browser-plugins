@@ -8,10 +8,10 @@ import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { collectTurnToolFacts } from './evidence.ts'
 import type { CommanderDecisionSubmission } from './commander-tool.ts'
-import { ORBIT_COMMANDER_DECISION_TOOL, type ModelRunRequest, type ModelRunResult, type ModelRunUsage, type OrbitHost, type RoleHandle, type RoleRunRequest, type RoleRunResult } from './host.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL, ORBIT_RUN_COMPLETE_TOOL, type ModelRunRequest, type ModelRunResult, type ModelRunUsage, type OrbitHost, type RoleHandle, type RoleRunRequest, type RoleRunResult } from './host.ts'
 import { redactText, truncateSafe } from './sanitize.ts'
 import { classifyTurnSettlement } from './settlement.ts'
-import type { OrbitTelemetry } from './types.ts'
+import type { OrbitTelemetry, TerminalCompletionSubmission } from './types.ts'
 import type { OrbitRole, OrbitRoute } from './types.ts'
 
 interface SubagentRunLike {
@@ -26,8 +26,8 @@ interface AgentLike {
   status?: 'idle' | 'running'
   session?: {
     header?: { cwd?: string }
-    ownEvents?: () => readonly { type?: string; data?: unknown }[]
-    snapshotEvents?: () => readonly { type?: string; data?: unknown }[]
+    ownEvents?: () => readonly { type?: string; time?: number; data?: unknown }[]
+    snapshotEvents?: () => readonly { type?: string; time?: number; data?: unknown }[]
   }
   whenIdle?: () => Promise<void>
 }
@@ -69,6 +69,8 @@ export class DshOrbitHost implements OrbitHost {
   private readonly childParents = new Map<string, Agent>()
   private readonly childGrants = new Map<string, { role: OrbitRole; workspace: string; tools: ReadonlySet<string> }>()
   private readonly commanderDecisions = new Map<string, CommanderDecisionSubmission>()
+  private readonly terminalConfirmations = new Map<string, TerminalCompletionSubmission>()
+  private readonly terminalExpected = new Set<string>()
   private readonly nowFn: () => number
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>
 
@@ -192,10 +194,21 @@ export class DshOrbitHost implements OrbitHost {
     const childId = String(agent?.id ?? '')
     const grant = this.childGrants.get(childId)
     const parent = this.childParents.get(childId)
-    if (!agent || grant?.role !== 'commander' || parent === undefined || this.ctx.agents.get(SessionId(childId)) !== agent || !this.ctx.agents.isOwnedBy(SessionId(childId), parent)) {
+    if (!agent || grant?.role !== 'commander' || this.terminalExpected.has(childId) || parent === undefined || this.ctx.agents.get(SessionId(childId)) !== agent || !this.ctx.agents.isOwnedBy(SessionId(childId), parent)) {
       throw new Error('ORBIT_COMMANDER_DECISION_UNAUTHORIZED')
     }
     this.commanderDecisions.set(childId, structuredClone(submission))
+  }
+
+  /** Accept the narrow final stop signal from the exact persistent Commander child. */
+  captureTerminalConfirmation(agent: Agent | undefined, submission: TerminalCompletionSubmission): void {
+    const childId = String(agent?.id ?? '')
+    const grant = this.childGrants.get(childId)
+    const parent = this.childParents.get(childId)
+    if (!agent || grant?.role !== 'commander' || !this.terminalExpected.has(childId) || parent === undefined || this.ctx.agents.get(SessionId(childId)) !== agent || !this.ctx.agents.isOwnedBy(SessionId(childId), parent)) {
+      throw new Error('ORBIT_TERMINAL_CONFIRM_UNAUTHORIZED')
+    }
+    this.terminalConfirmations.set(childId, structuredClone(submission))
   }
 
   private async startPersistentRole(
@@ -280,6 +293,10 @@ export class DshOrbitHost implements OrbitHost {
       workspace: resolve(request.workspace ?? parent.session.header.cwd ?? process.cwd()),
       tools: new Set(request.toolFilter?.allow ?? []),
     })
+    if (request.role === 'commander') {
+      if (request.terminalConfirm === true) this.terminalExpected.add(childId)
+      else this.terminalExpected.delete(childId)
+    }
   }
 
   private forgetChild(childId: string): void {
@@ -288,6 +305,8 @@ export class DshOrbitHost implements OrbitHost {
     this.childParents.delete(childId)
     this.childGrants.delete(childId)
     this.commanderDecisions.delete(childId)
+    this.terminalConfirmations.delete(childId)
+    this.terminalExpected.delete(childId)
   }
 
   private async interruptPersistentChild(childId: string, reason: string): Promise<void> {
@@ -328,6 +347,15 @@ export class DshOrbitHost implements OrbitHost {
     }
 
     if (classified.settlement === 'completed' && request.role === 'commander') {
+      if (request.terminalConfirm === true) {
+        const submission = this.terminalConfirmations.get(childId)
+        this.terminalConfirmations.delete(childId)
+        this.terminalExpected.delete(childId)
+        if (!submission) {
+          return { childId, output, interrupted: true, reason: 'TERMINAL_CONFIRM_STRUCTURED_OUTPUT_MISSING', telemetry, ...evidence }
+        }
+        return { childId, output, visibleOutput, structured: submission, interrupted: false, telemetry, ...evidence }
+      }
       const submission = this.commanderDecisions.get(childId)
       this.commanderDecisions.delete(childId)
       if (!submission) {
@@ -431,34 +459,52 @@ export class DshOrbitHost implements OrbitHost {
   private async snapshotAgent(agent: AgentLike | undefined): Promise<OrbitTelemetry> {
     if (!agent) return { status: 'unknown' }
     const events = agent.session?.snapshotEvents?.() ?? []
-    const openCalls = new Map<string, string>()
+    const openCalls = new Map<string, { name: string; at?: number }>()
     let turnCount = 0
     let toolCount = 0
     let lastAssistant = ''
+    let lastEventAt: number | undefined
+    let lastAssistantAt: number | undefined
+    let lastTurnStartAt: number | undefined
     for (const event of events) {
+      if (typeof event.time === 'number') lastEventAt = event.time
+      if (event.type === 'turn/start' && typeof event.time === 'number') lastTurnStartAt = event.time
       if (event.type === 'turn/end') turnCount += 1
       if (event.type === 'tool/call') {
         toolCount += 1
         const data = event.data as { callId?: string; name?: string } | undefined
-        if (data?.callId) openCalls.set(data.callId, data.name ?? 'unknown')
+        if (data?.callId) openCalls.set(data.callId, { name: data.name ?? 'unknown', ...(typeof event.time === 'number' ? { at: event.time } : {}) })
       }
       if (event.type === 'tool/result') {
-        const data = event.data as { callId?: string } | undefined
-        if (data?.callId) openCalls.delete(data.callId)
+        const data = event.data as {
+          callId?: string
+          message?: { content?: Array<{ toolCallId?: string }> }
+        } | undefined
+        const callId = data?.callId ?? data?.message?.content?.find((block) => block.toolCallId)?.toolCallId
+        if (callId) openCalls.delete(callId)
       }
       if (event.type === 'assistant/message') {
         const data = event.data as { message?: { content?: ContentBlock[] }; content?: ContentBlock[] } | undefined
         const text = contentToText(data?.message?.content ?? data?.content)
-        if (text.trim()) lastAssistant = text
+        if (text.trim()) {
+          lastAssistant = text
+          if (typeof event.time === 'number') lastAssistantAt = event.time
+        }
       }
     }
     const currentTool = [...openCalls.values()].pop()
+    const now = this.nowFn()
+    const age = (value: number | undefined): number | undefined => value === undefined ? undefined : Math.max(0, now - value)
     return {
       status: agent.status ?? 'unknown',
       activity_state: agent.status ?? 'unknown',
       turn_count: turnCount,
       tool_count: toolCount,
-      ...(currentTool ? { current_tool: currentTool } : {}),
+      ...(currentTool ? { current_tool: currentTool.name } : {}),
+      ...(age(lastEventAt) === undefined ? {} : { last_event_age_ms: age(lastEventAt) }),
+      ...(age(currentTool?.at) === undefined ? {} : { current_tool_age_ms: age(currentTool?.at) }),
+      ...(age(lastAssistantAt) === undefined ? {} : { last_assistant_age_ms: age(lastAssistantAt) }),
+      ...(agent.status === 'running' && age(lastTurnStartAt) !== undefined ? { turn_age_ms: age(lastTurnStartAt) } : {}),
       ...(lastAssistant ? { recent_output: truncateSafe(lastAssistant, 1500) } : {}),
     }
   }
@@ -483,7 +529,7 @@ export class DshOrbitHost implements OrbitHost {
   }
 
   hasTool(name: string): boolean {
-    if (name === ORBIT_COMMANDER_DECISION_TOOL) return true
+    if (name === ORBIT_COMMANDER_DECISION_TOOL || name === ORBIT_RUN_COMPLETE_TOOL) return true
     // Standard profiles mount their tool composition on the agent plane
     // (agent presets), so the visible set must resolve against the initiating
     // agent's scope. Without an initiator this falls back to the global view.

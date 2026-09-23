@@ -7,6 +7,8 @@ import {
   type TimeoutDecision,
   type WatchdogDecision,
   type GuardWatchdogDecision,
+  type HeartbeatDecision,
+  type FinalAuditDecision,
 } from './types.ts'
 
 // ── DSH-native structured decision schemas ───────────────────────────────────
@@ -130,6 +132,26 @@ export const WATCHDOG_GUARD_SCHEMA: ObjectJsonSchema = {
   },
 }
 
+export const WATCHDOG_HEARTBEAT_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['HEALTHY', 'WAIT', 'RESTART_STEP', 'ROTATE_COMMANDER', 'STRATEGY_REVIEW', 'NEEDS_USER', 'RUNTIME_BUG'] },
+    reason: { type: 'string' },
+  },
+}
+
+export const WATCHDOG_FINAL_AUDIT_SCHEMA: ObjectJsonSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['decision'],
+  properties: {
+    decision: { type: 'string', enum: ['APPROVE_CLOSE', 'BLOCK_CLOSE', 'NEEDS_USER', 'RUNTIME_BUG'] },
+    reason: { type: 'string' },
+  },
+}
+
 export const WATCHDOG_TIMEOUT_SCHEMA: ObjectJsonSchema = {
   type: 'object',
   additionalProperties: false,
@@ -148,6 +170,8 @@ export const ORBIT_DECISION_SCHEMAS = {
   WATCHDOG_RUNTIME_SCHEMA,
   WATCHDOG_STRATEGY_SCHEMA,
   WATCHDOG_GUARD_SCHEMA,
+  WATCHDOG_HEARTBEAT_SCHEMA,
+  WATCHDOG_FINAL_AUDIT_SCHEMA,
   WATCHDOG_TIMEOUT_SCHEMA,
 } as const
 
@@ -187,6 +211,22 @@ export function assertWatchdogDecision(decision: WatchdogDecision): WatchdogDeci
   const allowed = ['RESUME_CHILD', 'RESTART_STEP', 'NEEDS_USER', 'RUNTIME_BUG']
   if (!allowed.includes(decision.decision)) {
     throw new Error(`SMART_WATCHDOG_RUNTIME_DECISION_INVALID: ${decision.decision}`)
+  }
+  return decision
+}
+
+export function assertHeartbeatDecision(decision: HeartbeatDecision): HeartbeatDecision {
+  const allowed = ['HEALTHY', 'WAIT', 'RESTART_STEP', 'ROTATE_COMMANDER', 'STRATEGY_REVIEW', 'NEEDS_USER', 'RUNTIME_BUG']
+  if (!allowed.includes(decision.decision)) {
+    throw new Error(`SMART_WATCHDOG_HEARTBEAT_DECISION_INVALID: ${decision.decision}`)
+  }
+  return decision
+}
+
+export function assertFinalAuditDecision(decision: FinalAuditDecision): FinalAuditDecision {
+  const allowed = ['APPROVE_CLOSE', 'BLOCK_CLOSE', 'NEEDS_USER', 'RUNTIME_BUG']
+  if (!allowed.includes(decision.decision)) {
+    throw new Error(`SMART_WATCHDOG_FINAL_AUDIT_DECISION_INVALID: ${decision.decision}`)
   }
   return decision
 }

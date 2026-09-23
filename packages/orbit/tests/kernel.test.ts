@@ -8,7 +8,12 @@ import {
   applyExecutorResume,
   applyExecutorSuccess,
   applyFinalAppend,
+  applyFinalAuditApproved,
+  applyFinalAuditBlocked,
+  applyFinalCandidate,
   applyFinalSuccess,
+  applyTerminalConfirmation,
+  completionGateIssue,
   applyPlan,
   applyStepPass,
   baseStepIdOf,
@@ -27,6 +32,7 @@ import {
   hashGoal,
   isBaseStepId,
   markStrategyChallengeUsed,
+  markMeaningfulProgress,
   normalizeAppend,
   normalizeCapabilities,
   normalizeExecutionMode,
@@ -53,7 +59,7 @@ const step = (id: string, goal = 'g'): OrbitPlanStep => ({ id, goal, status: 'pe
 
 function state(overrides: Partial<OrbitState> = {}): OrbitState {
   return {
-    schema_version: 4,
+    schema_version: 5,
     active_run_id: 'r1',
     run_id: 'r1',
     phase: 'EXECUTE',
@@ -269,7 +275,7 @@ test('initial state follows the kernel rules', () => {
     userHardConstraints: ['no push'],
     githubAllowed: true,
   })
-  assert.equal(initial.schema_version, 4)
+  assert.equal(initial.schema_version, 5)
   assert.equal(initial.run_id, 'run-1')
   assert.equal(initial.active_run_id, 'run-1')
   assert.equal(initial.phase, 'PLAN')
@@ -547,4 +553,86 @@ test('guard recovery counts per step and code, and clears on decision', () => {
 
   clearGuardRecovery(current)
   assert.equal(current.guard_recovery, undefined)
+})
+
+test('meaningful progress is monotonic and independent from ordinary state revision', () => {
+  const current = state({ progress: { seq: 4, at: '2026-01-01T00:00:00.000Z' }, state_revision: 99 })
+  markMeaningfulProgress(current, Date.parse('2026-01-01T00:00:10.000Z'))
+  assert.deepEqual(current.progress, { seq: 5, at: '2026-01-01T00:00:10.000Z' })
+  assert.equal(current.state_revision, 99)
+})
+
+test('final candidate requires audit, terminal confirmation, and the mechanical completion gate', () => {
+  const current = state({
+    plan: { summary: 'done', steps: [{ id: 'P0', goal: 'g', status: 'passed' }] },
+    current_step: { id: 'P0', attempt: 1 },
+    child: { id: 'e1', status: 'completed' },
+    heartbeat_watchdog: {
+      enabled: true,
+      sequence: 0,
+      interval_ms: 120_000,
+      healthy_interval_ms: 180_000,
+      suspect_interval_ms: 60_000,
+      healthy_streak: 0,
+      anomaly_streak: 0,
+    },
+  })
+  applyFinalCandidate(current, 'done', 'visible final')
+  assert.equal(current.phase, 'FINAL_VERIFY')
+  assert.equal(current.status, 'running')
+  assert.equal(current.commander?.final_output, 'visible final')
+
+  applyFinalAuditApproved(current)
+  assert.equal(current.phase, 'TERMINAL_CONFIRM')
+  current.heartbeat_watchdog!.final_audit = { verdict: 'APPROVE_CLOSE', fingerprint: 'fp', at: '2026-01-01T00:00:01Z' }
+
+  assert.equal(completionGateIssue(current, 'fp', 'fp'), 'ORBIT_COMPLETION_GATE_TERMINAL_SIGNAL_MISSING')
+  applyTerminalConfirmation(current, 'COMPLETE', Date.parse('2026-01-01T00:00:02Z'))
+  assert.equal(completionGateIssue(current, 'fp', 'fp'), undefined)
+
+  current.last_error = 'recovered problem'
+  applyFinalSuccess(current)
+  assert.equal(current.phase, 'SUCCESS')
+  assert.equal(current.status, 'success')
+  assert.equal(current.last_error, null)
+  assert.equal(current.recovered_error, 'recovered problem')
+})
+
+test('final audit block and NOT_COMPLETE both reopen final evaluation without closing', () => {
+  const current = state({
+    plan: { summary: 'done', steps: [{ id: 'P0', goal: 'g', status: 'passed' }] },
+    current_step: { id: 'P0', attempt: 1 },
+    child: { id: 'e1', status: 'completed' },
+  })
+  applyFinalAuditBlocked(current, 'missing proof')
+  assert.equal(current.phase, 'EVALUATE')
+  assert.equal(current.current_step, undefined)
+  assert.equal(current.child, undefined)
+  assert.equal(current.commander?.remaining_gap, 'missing proof')
+
+  current.phase = 'TERMINAL_CONFIRM'
+  applyTerminalConfirmation(current, 'NOT_COMPLETE', Date.parse('2026-01-01T00:00:03Z'), 'more work')
+  assert.equal(current.phase, 'EVALUATE')
+  assert.equal(current.terminal_confirmation?.signal, 'NOT_COMPLETE')
+})
+
+test('completion gate rejects stale audits and unfinished plans even after COMPLETE', () => {
+  const unfinished = state({
+    plan: { summary: '', steps: [{ id: 'P0', goal: 'g', status: 'pending' }] },
+    heartbeat_watchdog: {
+      enabled: true,
+      sequence: 0,
+      interval_ms: 120_000,
+      healthy_interval_ms: 180_000,
+      suspect_interval_ms: 60_000,
+      healthy_streak: 0,
+      anomaly_streak: 0,
+      final_audit: { verdict: 'APPROVE_CLOSE', fingerprint: 'fp' },
+    },
+    terminal_confirmation: { signal: 'COMPLETE', at: '2026-01-01T00:00:00Z' },
+  })
+  assert.equal(completionGateIssue(unfinished, 'fp', 'fp'), 'ORBIT_COMPLETION_GATE_STEPS_NOT_PASSED')
+
+  unfinished.plan.steps[0]!.status = 'passed'
+  assert.equal(completionGateIssue(unfinished, 'fp', 'different'), 'ORBIT_COMPLETION_GATE_AUDIT_STALE')
 })

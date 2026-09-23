@@ -20,7 +20,7 @@ import SubagentPlugin from '@deepseek-ai/dsh-subagent'
 import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as OrbitPlugin from '../../src/index.ts'
 import { DshOrbitHost } from '../../src/dsh-host.ts'
-import { ORBIT_COMMANDER_DECISION_TOOL } from '../../src/host.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL, ORBIT_RUN_COMPLETE_TOOL } from '../../src/host.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
 import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
@@ -46,6 +46,9 @@ interface AdapterScript {
   runtimeDiagnose?: string
   timeoutReview?: string
   guardEscalation?: string
+  heartbeatReview?: string
+  finalAudit?: string
+  terminalConfirm?: string
   /** Executor first call hangs, later calls complete (runtime timeout test). */
   hangFirstExecutor?: boolean
   /** Commander prompt containing this marker never settles. */
@@ -122,6 +125,7 @@ class ScriptedAdapter extends LlmAdapter {
     // the Executor settles with plain text.
     let reply = 'ok'
     let structured = false
+    let terminalConfirm = false
     let commanderMode: 'PLAN' | 'STEP_EVALUATE' | 'FINAL_EVALUATE' | 'STRATEGY_RECONSIDER' | undefined
     if (turnPrompt.includes('当前阶段：PLAN')) {
       reply = this.script.plan ?? '{"summary":"e2e","steps":[{"id":"P1","goal":"do the thing"}]}'
@@ -137,6 +141,16 @@ class ScriptedAdapter extends LlmAdapter {
         await hangUntilAborted(options.signal)
       }
       reply = 'executor done'
+    } else if (turnPrompt.includes('HEARTBEAT_REVIEW')) {
+      reply = this.script.heartbeatReview ?? '{"decision":"HEALTHY","reason":"scripted heartbeat healthy"}'
+      structured = true
+    } else if (turnPrompt.includes('FINAL_AUDIT')) {
+      reply = this.script.finalAudit ?? '{"decision":"APPROVE_CLOSE","reason":"scripted final audit approved"}'
+      structured = true
+    } else if (turnPrompt.includes('TERMINAL_CONFIRM')) {
+      reply = this.script.terminalConfirm ?? '{"signal":"COMPLETE"}'
+      structured = true
+      terminalConfirm = true
     } else if (turnPrompt.includes('STEP_EVALUATE')) {
       const replies = this.script.stepEvaluates
       reply = replies !== undefined && replies.length > 0
@@ -175,8 +189,12 @@ class ScriptedAdapter extends LlmAdapter {
       }
       const callId = ToolCallId(`structured-${this.seen.length}`)
       const index = turnPrompt.includes('FINAL_EVALUATE') && this.script.finalVisibleText ? 1 : 0
-      const toolName = commanderMode === undefined ? 'structured_output' : ORBIT_COMMANDER_DECISION_TOOL
-      const args = commanderMode === undefined
+      const toolName = terminalConfirm
+        ? ORBIT_RUN_COMPLETE_TOOL
+        : commanderMode === undefined
+          ? 'structured_output'
+          : ORBIT_COMMANDER_DECISION_TOOL
+      const args = terminalConfirm || commanderMode === undefined
         ? reply
         : JSON.stringify({ mode: commanderMode, ...(JSON.parse(reply) as Record<string, unknown>) })
       yield { type: 'block-start', index, blockType: 'tool-call' }
@@ -304,12 +322,18 @@ test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a comp
       phase: string
       driver_ownership: string
       role_sessions?: { commander?: { child_id?: string; turns?: number }; executor?: { child_id?: string; turns?: number } }
+      heartbeat_watchdog?: { final_audit?: { verdict?: string } }
+      terminal_confirmation?: { signal?: string }
     }
     assert.equal(state.phase, 'SUCCESS')
     assert.equal(state.driver_ownership, 'CLOSED')
     assert.equal(adapter.executorCalls, 2, 'both real Executor turns must have run')
-    assert.equal(state.role_sessions?.commander?.turns, 4, `PLAN + two reviews + FINAL reuse one Commander Session: ${JSON.stringify(state.role_sessions)}`)
+    assert.equal(state.role_sessions?.commander?.turns, 5, `PLAN + two reviews + FINAL + TERMINAL_CONFIRM reuse one Commander Session: ${JSON.stringify(state.role_sessions)}`)
     assert.equal(state.role_sessions?.executor?.turns, 2, 'two same-grant steps reuse one Executor Session')
+    assert.equal(state.heartbeat_watchdog?.final_audit?.verdict, 'APPROVE_CLOSE')
+    assert.equal(state.terminal_confirmation?.signal, 'COMPLETE')
+    assert.ok(adapter.prompts.some((prompt) => prompt.includes('FINAL_AUDIT')), 'real DSH must run the final one-shot Watchdog audit')
+    assert.ok(adapter.prompts.some((prompt) => prompt.includes('TERMINAL_CONFIRM')), 'real persistent Commander must receive the terminal-confirm turn')
     const commanderSessionIds = new Set(adapter.requests.filter((entry) => entry.prompt.includes('Orbit 指挥官')).map((entry) => entry.sessionId))
     const executorSessionIds = new Set(adapter.requests.filter((entry) => entry.prompt.includes('Orbit 执行员')).map((entry) => entry.sessionId))
     assert.equal(commanderSessionIds.size, 1, 'real DSH must keep one Commander child session id')

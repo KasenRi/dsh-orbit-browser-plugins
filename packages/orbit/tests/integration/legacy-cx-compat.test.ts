@@ -123,7 +123,7 @@ test('legacy compatibility: old .cx/state.json resumes under Orbit', { timeout: 
     // A state document as written by the previous CX-era runtime, including a
     // historical CX_* last_error string that must be read as plain history.
     const legacyState: OrbitState = {
-      schema_version: 4,
+      schema_version: 5,
       active_run_id: 'legacy-run',
       run_id: 'legacy-run',
       phase: 'SUCCESS',

@@ -4,6 +4,8 @@ import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   assertCommanderDecision,
   assertGuardWatchdogDecision,
+  assertHeartbeatDecision,
+  assertFinalAuditDecision,
   assertStrategyDecision,
   assertTimeoutDecision,
   assertWatchdogDecision,
@@ -28,4 +30,8 @@ test('enforces strategy / timeout / watchdog boundaries', () => {
   assert.throws(() => assertTimeoutDecision({ decision: 'SUCCESS' as never }), /COMMANDER_TIMEOUT_WATCHDOG_DECISION_INVALID/)
   assert.throws(() => assertWatchdogDecision({ decision: 'BAD' as never }), /SMART_WATCHDOG_RUNTIME_DECISION_INVALID/)
   assert.throws(() => assertGuardWatchdogDecision({ decision: 'BAD' as never }), /SMART_WATCHDOG_GUARD_DECISION_INVALID/)
+  assert.throws(() => assertHeartbeatDecision({ decision: 'BAD' as never }), /SMART_WATCHDOG_HEARTBEAT_DECISION_INVALID/)
+  assert.equal(assertHeartbeatDecision({ decision: 'HEALTHY' }).decision, 'HEALTHY')
+  assert.throws(() => assertFinalAuditDecision({ decision: 'BAD' as never }), /SMART_WATCHDOG_FINAL_AUDIT_DECISION_INVALID/)
+  assert.equal(assertFinalAuditDecision({ decision: 'APPROVE_CLOSE' }).decision, 'APPROVE_CLOSE')
 })

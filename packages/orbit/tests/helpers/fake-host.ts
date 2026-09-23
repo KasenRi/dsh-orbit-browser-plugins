@@ -12,6 +12,7 @@ export interface RoleScript {
   reason?: string
   childId?: string
   pending?: boolean
+  settleAfterMs?: number
   changedFiles?: string[]
   testSummary?: string[]
   toolEvidence?: EvidenceToolFact[]
@@ -76,22 +77,33 @@ export class FakeHost implements OrbitHost {
       childId,
       ...(request.toolFilter ? { toolFilter: request.toolFilter } : {}),
     })
+    const settledValue = (): RoleRunResult => ({
+      childId,
+      output: script.output ?? '',
+      ...(script.visibleOutput !== undefined ? { visibleOutput: script.visibleOutput } : {}),
+      interrupted: script.interrupted === true,
+      ...(script.structured !== undefined ? { structured: script.structured } : {}),
+      ...(script.reason ? { reason: script.reason } : {}),
+      ...(script.changedFiles ? { changedFiles: script.changedFiles } : {}),
+      ...(script.testSummary ? { testSummary: script.testSummary } : {}),
+      ...(script.toolEvidence ? { toolEvidence: script.toolEvidence } : {}),
+      ...(script.settlement ? { settlement: script.settlement } : {}),
+    })
+    const startedAt = this.clock
+    const result = script.pending
+      ? new Promise<RoleRunResult>(() => undefined)
+      : script.settleAfterMs === undefined
+        ? Promise.resolve(settledValue())
+        : new Promise<RoleRunResult>((resolve) => {
+            const poll = (): void => {
+              if (this.clock - startedAt >= (script.settleAfterMs ?? 0)) resolve(settledValue())
+              else setImmediate(poll)
+            }
+            setImmediate(poll)
+          })
     const handle: RoleHandle = {
       childId,
-      result: script.pending
-        ? new Promise<RoleRunResult>(() => undefined)
-        : Promise.resolve({
-            childId,
-            output: script.output ?? '',
-            ...(script.visibleOutput !== undefined ? { visibleOutput: script.visibleOutput } : {}),
-            interrupted: script.interrupted === true,
-            ...(script.structured !== undefined ? { structured: script.structured } : {}),
-            ...(script.reason ? { reason: script.reason } : {}),
-            ...(script.changedFiles ? { changedFiles: script.changedFiles } : {}),
-            ...(script.testSummary ? { testSummary: script.testSummary } : {}),
-            ...(script.toolEvidence ? { toolEvidence: script.toolEvidence } : {}),
-            ...(script.settlement ? { settlement: script.settlement } : {}),
-          }),
+      result,
       cancel: async (reason: string) => {
         this.cancelled.push({ childId, reason })
         this.interruptCalls.push({ childId, reason })

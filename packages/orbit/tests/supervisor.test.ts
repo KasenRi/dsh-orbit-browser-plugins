@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { OrbitStateStore } from '../src/state-store.ts'
 import { OrbitSupervisor, type OrbitSupervisorConfig } from '../src/supervisor.ts'
 import { FakeHost } from './helpers/fake-host.ts'
+import type { OrbitState } from '../src/types.ts'
 
 const config: OrbitSupervisorConfig = {
   defaultRoutes: {
@@ -914,5 +915,276 @@ test('Commander RESET request deterministically rotates the persistent Executor'
   const state = new OrbitStateStore(dir).readState()
   assert.equal(state?.role_sessions?.executor?.resets, 1)
   assert.equal(state?.role_sessions?.executor?.last_reset_reason, 'COMMANDER_REQUEST')
+  cleanup()
+})
+
+test('v0.6.4 healthy heartbeat supervises a long Executor without consuming loop slots', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'long shell', capabilities: ['shell'] }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS', summary: 'done' }) },
+    ])
+    .script('executor', [{ output: 'long work done', settleAfterMs: 2500 }])
+    .script('watchdog', [
+      { structured: { decision: 'HEALTHY', reason: 'executor is still making progress' } },
+      { structured: { decision: 'HEALTHY', reason: 'executor remains healthy' } },
+      { structured: { decision: 'HEALTHY', reason: 'executor remains healthy' } },
+    ])
+
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: true,
+    heartbeatIntervalMs: 1000,
+    heartbeatHealthyIntervalMs: 3000,
+    heartbeatSuspectIntervalMs: 1000,
+    finalAuditEnabled: false,
+  })
+  const result = await supervisor.bootstrap({ goal: 'heartbeat proof', approved_loop_count: 3 })
+  assert.equal(result.phase, 'SUCCESS')
+  const state = new OrbitStateStore(dir).readState()
+  assert.equal(state?.loop.used, 1, 'heartbeat must never consume an Orbit execution slot')
+  assert.equal(state?.progress?.seq, 5, 'heartbeat persistence must not count as meaningful work')
+  assert.ok((state?.heartbeat_watchdog?.sequence ?? 0) >= 1)
+  assert.ok(host.scriptsFor('watchdog').some((entry) => entry.label === 'watchdog-heartbeat'))
+  assert.equal(host.scriptsFor('watchdog').some((entry) => entry.label === 'watchdog-runtime'), false)
+  assert.equal(host.cancelled.some((entry) => entry.childId?.startsWith('executor')), false)
+  cleanup()
+})
+
+test('v0.6.4 heartbeat RESTART_STEP rotates Executor without spending the runtime-watchdog cap', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'recover shell', capabilities: ['shell'] }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [
+      { pending: true, childId: 'hung-executor' },
+      { output: 'recovered', childId: 'fresh-executor' },
+    ])
+    .script('watchdog', [
+      { structured: { decision: 'RESTART_STEP', reason: 'no meaningful runtime progress' } },
+    ])
+
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: true,
+    heartbeatIntervalMs: 1000,
+    heartbeatHealthyIntervalMs: 3000,
+    heartbeatSuspectIntervalMs: 1000,
+    finalAuditEnabled: false,
+  })
+  const result = await supervisor.bootstrap({ goal: 'heartbeat restart proof', approved_loop_count: 3 })
+  assert.equal(result.phase, 'SUCCESS')
+  const state = new OrbitStateStore(dir).readState()
+  assert.equal(state?.loop.used, 1)
+  assert.equal(state?.smart_watchdog, undefined, 'periodic heartbeat must not consume runtime watchdog per-step calls')
+  assert.equal(host.scriptsFor('watchdog').filter((entry) => entry.label === 'watchdog-heartbeat').length, 1)
+  assert.equal(host.scriptsFor('watchdog').filter((entry) => entry.label === 'watchdog-runtime').length, 0)
+  assert.ok(host.cancelled.some((entry) => entry.childId === 'hung-executor' && entry.reason.includes('HEARTBEAT_RESTART_STEP')))
+  assert.equal(state?.role_sessions?.executor?.generation, 2)
+  cleanup()
+})
+
+test('v0.6.4 final SUCCESS is only a candidate until Watchdog audit and COMPLETE terminal signal both pass', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'verify' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { visibleOutput: 'candidate final', structured: commander({ decision: 'SUCCESS', summary: 'candidate done' }) },
+      { structured: { signal: 'COMPLETE' } },
+    ])
+    .script('executor', [{ output: 'verified' }])
+    .script('watchdog', [
+      { structured: { decision: 'APPROVE_CLOSE', reason: 'all durable evidence is sufficient' } },
+    ])
+
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: false,
+    finalAuditEnabled: true,
+  })
+  const result = await supervisor.bootstrap({ goal: 'completion gate proof', approved_loop_count: 3 })
+  assert.equal(result.ok, true, result.message)
+  assert.equal(result.phase, 'SUCCESS')
+  assert.equal(result.final_output?.text, 'candidate final')
+  const state = new OrbitStateStore(dir).readState()
+  assert.equal(state?.heartbeat_watchdog?.final_audit?.verdict, 'APPROVE_CLOSE')
+  assert.equal(state?.terminal_confirmation?.signal, 'COMPLETE')
+  assert.equal(state?.driver_ownership, 'CLOSED')
+  assert.equal(state?.last_error, null)
+  assert.equal(host.scriptsFor('watchdog').filter((entry) => entry.label === 'watchdog-final-audit').length, 1)
+  const terminal = host.scriptsFor('commander').find((entry) => entry.request.terminalConfirm === true)
+  assert.ok(terminal, 'the same persistent Commander must receive a dedicated TERMINAL_CONFIRM turn')
+  assert.equal(terminal?.childId, host.scriptsFor('commander')[0]?.childId)
+  cleanup()
+})
+
+test('v0.6.4 plain text 完成 cannot close the Run without orbit_run_complete structured capture', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'verify' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+      { output: '完成', visibleOutput: '完成' },
+    ])
+    .script('executor', [{ output: 'verified' }])
+    .script('watchdog', [{ structured: { decision: 'APPROVE_CLOSE' } }])
+
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: false,
+    finalAuditEnabled: true,
+  })
+  const result = await supervisor.bootstrap({ goal: 'text must not close', approved_loop_count: 3 })
+  assert.equal(result.ok, false)
+  assert.equal(result.phase, 'TERMINAL_CONFIRM')
+  assert.match(String(result.message ?? result.data?.['last_error']), /TERMINAL_CONFIRM_STRUCTURED_OUTPUT_MISSING/)
+  const state = new OrbitStateStore(dir).readState()
+  assert.notEqual(state?.status, 'success')
+  assert.equal(state?.terminal_confirmation, undefined)
+  cleanup()
+})
+
+test('v0.6.4 Final Watchdog BLOCK_CLOSE returns to Commander instead of falsely succeeding', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'verify' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+      { structured: commander({ decision: 'NEEDS_USER', reason: 'missing deployment proof' }) },
+    ])
+    .script('executor', [{ output: 'verified' }])
+    .script('watchdog', [{ structured: { decision: 'BLOCK_CLOSE', reason: 'deployment proof missing' } }])
+
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: false,
+    finalAuditEnabled: true,
+  })
+  const result = await supervisor.bootstrap({ goal: 'audit block proof', approved_loop_count: 3 })
+  assert.equal(result.phase, 'NEEDS_USER')
+  assert.notEqual(result.status, 'success')
+  const finalPrompts = host.scriptsFor('commander').filter((entry) => entry.request.commanderMode === 'FINAL_EVALUATE')
+  assert.equal(finalPrompts.length, 2, 'BLOCK_CLOSE must return to the persistent Commander final evaluation')
+  assert.match(finalPrompts[1]?.request.prompt ?? '', /deployment proof missing/)
+  cleanup()
+})
+
+test('v0.6.4 unavailable Final Watchdog retries twice and never manufactures SUCCESS', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  host
+    .script('commander', [
+      { structured: plan([{ id: 'P0', goal: 'verify' }]) },
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+    .script('executor', [{ output: 'verified' }])
+    .script('watchdog', [
+      { interrupted: true, reason: 'watchdog unavailable' },
+      { interrupted: true, reason: 'watchdog unavailable again' },
+    ])
+
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: false,
+    finalAuditEnabled: true,
+  })
+  const result = await supervisor.bootstrap({ goal: 'fail closed audit', approved_loop_count: 3 })
+  assert.equal(result.ok, false)
+  assert.equal(result.phase, 'FINAL_VERIFY')
+  assert.equal(host.scriptsFor('watchdog').filter((entry) => entry.label === 'watchdog-final-audit').length, 2)
+  assert.match(String(result.message), /watchdog unavailable/)
+  cleanup()
+})
+
+test('v0.6.4 discards a stale heartbeat decision when the monitored run changes during review', async () => {
+  const { dir, cleanup } = project()
+  const host = new FakeHost()
+  const supervisor = new OrbitSupervisor(new OrbitStateStore(dir), host, {
+    ...config,
+    heartbeatEnabled: true,
+    heartbeatIntervalMs: 1000,
+    heartbeatHealthyIntervalMs: 3000,
+    heartbeatSuspectIntervalMs: 1000,
+    finalAuditEnabled: false,
+  })
+  const state = supervisor.createState({ goal: 'stale heartbeat', approved_loop_count: 3 })
+  state.phase = 'EXECUTE'
+  state.plan = { summary: 'p', steps: [{ id: 'P0', goal: 'work', status: 'running' }] }
+  state.current_step = { id: 'P0', attempt: 1 }
+  state.child = { id: 'executor-a', status: 'running' }
+  host.script('watchdog', [{ structured: { decision: 'RESTART_STEP', reason: 'looks stuck' } }])
+
+  const original = host.startRole.bind(host)
+  host.startRole = async (request) => {
+    if (request.label === 'watchdog-heartbeat') {
+      state.current_step = { id: 'P0', attempt: 2 }
+    }
+    return original(request)
+  }
+
+  const internal = supervisor as unknown as {
+    heartbeatReview(
+      state: OrbitState,
+      target: 'executor',
+      telemetry: { status: 'running'; current_tool: string },
+      childId: string,
+    ): Promise<unknown>
+  }
+  const decision = await internal.heartbeatReview(state, 'executor', { status: 'running', current_tool: 'bash' }, 'executor-a')
+  assert.equal(decision, undefined)
+  assert.equal(state.heartbeat_watchdog?.last_decision, 'STALE_HEARTBEAT')
+  assert.equal(state.current_step.attempt, 2, 'the newer run state must survive the stale Watchdog answer')
+  cleanup()
+})
+
+test('v0.6.4 cold resume replays only one overdue heartbeat before returning to the normal interval', async () => {
+  const { dir, cleanup } = project()
+  const store = new OrbitStateStore(dir)
+  const host = new FakeHost()
+  const cfg: OrbitSupervisorConfig = {
+    ...config,
+    heartbeatEnabled: true,
+    heartbeatIntervalMs: 1000,
+    heartbeatHealthyIntervalMs: 3000,
+    heartbeatSuspectIntervalMs: 1000,
+    finalAuditEnabled: false,
+  }
+  const creator = new OrbitSupervisor(store, host, cfg)
+  const state = creator.createState({ goal: 'overdue heartbeat', approved_loop_count: 3 })
+  state.plan = { summary: 'already planned', steps: [{ id: 'P0', goal: 'resume work', capabilities: ['shell'], status: 'pending' }] }
+  state.phase = 'EXECUTE'
+  state.heartbeat_watchdog!.next_at = new Date(-60_000).toISOString()
+  store.writeState(state)
+  host.clock = 60_000
+  host
+    .script('executor', [{ output: 'resumed work', settleAfterMs: 500 }])
+    .script('watchdog', [
+      { structured: { decision: 'HEALTHY' } },
+      { structured: { decision: 'HEALTHY' } },
+    ])
+    .script('commander', [
+      { structured: commander({ decision: 'PASS_CURRENT_STEP' }) },
+      { structured: commander({ decision: 'SUCCESS' }) },
+    ])
+
+  const result = await new OrbitSupervisor(store, host, cfg).run(store.readState()!)
+  assert.equal(result.phase, 'SUCCESS')
+  assert.equal(host.sleepCalls.filter((ms) => ms === 0).length, 1, 'missed historical intervals must collapse into one immediate overdue check')
+  assert.ok(host.sleepCalls.some((ms) => ms >= 1000), 'after the overdue check the normal heartbeat interval must resume')
+  assert.ok((store.readState()?.heartbeat_watchdog?.sequence ?? 0) <= 2, 'a long-missed schedule must not produce a catch-up storm')
   cleanup()
 })

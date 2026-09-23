@@ -47,6 +47,10 @@ PASS / CORRECT / NEEDS_USER
    ↓
 Final Evaluation
    ↓
+Final Watchdog Audit
+   ↓
+Commander Terminal Confirm
+   ↓
 SUCCESS
 ```
 
@@ -66,6 +70,12 @@ SUCCESS
 ## v0.6.3：Trusted Execution Evidence
 
 v0.6.3 补齐 Executor → Supervisor → Commander 的可信执行证据链：Orbit 会从已结算的 DSH `tool/call` + `tool/result` 中提取经过脱敏和限长的真实结果摘要、显式 exit code，以及可识别的测试命令。对于 `run_code` 中可确定识别的字面 `tools.bash({ command: ... })`，Orbit 会把嵌套 shell 命令与对应真实输出关联起来。Commander 会明确区分 `[TRUSTED_TOOL_EVENTS]` 与 `[EXECUTOR_SUMMARY_UNVERIFIED]`，因此已有真实 stdout / exit code / 测试汇总时，不再需要为了重复证明而申请 shell 或让 Executor 额外落盘临时 evidence 文件。
+
+## v0.6.4：Heartbeat Watchdog & Deterministic Completion Gate
+
+v0.6.4 把 Watchdog 从“出错后才介入”扩展为 **事件触发 + 周期主动巡检** 两条路径。默认每 120 秒进行一次 one-shot Heartbeat Review；连续健康后可退避到 180 秒，可疑状态会缩短到 60 秒复查。Heartbeat 读取 Supervisor 生成的有界运行快照，包括 meaningful progress、Session generation、当前工具和真实事件年龄，但它本身不会消耗 Orbit loop，也不会占用 runtime Watchdog 的每 Step 恢复次数。Watchdog 返回时 Supervisor 会重新核对 run/phase/step/child/generation 指纹；运行已经推进时，旧决策被标记为 `STALE_HEARTBEAT` 并丢弃。
+
+最终关闭流程也改为 fail-closed：Commander 的 `FINAL_EVALUATE → SUCCESS` 只是完成候选，随后必须通过 one-shot `FINAL_AUDIT`，再由 Persistent Commander 在 `TERMINAL_CONFIRM` 阶段调用专用 `orbit_run_complete({ signal: "COMPLETE" })`。Supervisor 最后还会机械检查所有 Step 已通过、没有活动执行步骤、Final Audit 指纹仍有效且没有等待用户输入，全部满足后才写入真正的 `SUCCESS / CLOSED`。普通文本“完成”不会关闭 Run。
 
 ## v0.6.x：Orbit 接入 MoA 多候选执行
 

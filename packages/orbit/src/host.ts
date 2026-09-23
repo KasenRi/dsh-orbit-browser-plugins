@@ -5,6 +5,8 @@ import type { CommanderMode, OrbitRole, OrbitRoute, OrbitTelemetry } from './typ
 
 /** Internal turn-concluding tool available only inside the persistent Commander child. */
 export const ORBIT_COMMANDER_DECISION_TOOL = 'orbit_commander_decision'
+/** Narrow final-stop signal tool exposed only during TERMINAL_CONFIRM. */
+export const ORBIT_RUN_COMPLETE_TOOL = 'orbit_run_complete'
 
 export interface RoleToolFilter {
   allow?: readonly string[]
@@ -27,6 +29,8 @@ export interface RoleRunRequest {
   persistent?: boolean
   /** Expected Commander decision mode for the internal decision tool. */
   commanderMode?: CommanderMode
+  /** This persistent Commander turn must conclude through orbit_run_complete. */
+  terminalConfirm?: boolean
   /**
    * DSH-native structured output request for one-shot decision roles
    * (Commander/Watchdog). The provider validates the child's capture against

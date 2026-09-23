@@ -6,7 +6,8 @@ import type {} from '@deepseek-ai/dsh-subagent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { DshOrbitHost } from './dsh-host.ts'
 import { createCommanderDecisionTool } from './commander-tool.ts'
-import { ORBIT_COMMANDER_DECISION_TOOL } from './host.ts'
+import { createRunCompleteTool } from './completion-tool.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL, ORBIT_RUN_COMPLETE_TOOL } from './host.ts'
 import { OrbitMoaAdapter } from './moa-adapter.ts'
 import { OrbitStateStore } from './state-store.ts'
 import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome } from './supervisor.ts'
@@ -43,6 +44,11 @@ export interface OrbitPluginConfig {
   watchdogTools: string[]
   executorTools: string[]
   executorTimeoutMs?: number
+  heartbeatEnabled?: boolean
+  heartbeatIntervalMs?: number
+  heartbeatHealthyIntervalMs?: number
+  heartbeatSuspectIntervalMs?: number
+  finalAuditEnabled?: boolean
 }
 
 export interface OrbitDoctorReport {
@@ -65,6 +71,9 @@ export class OrbitService extends Service {
     if (ctx.tools.get(ORBIT_COMMANDER_DECISION_TOOL) === undefined) {
       ctx.tools.register(createCommanderDecisionTool((agent, submission) => this.host.captureCommanderDecision(agent, submission)))
     }
+    if (ctx.tools.get(ORBIT_RUN_COMPLETE_TOOL) === undefined) {
+      ctx.tools.register(createRunCompleteTool((agent, submission) => this.host.captureTerminalConfirmation(agent, submission)))
+    }
   }
 
   private publishRuntime(state: import('./types.ts').OrbitState): void {
@@ -86,6 +95,11 @@ export class OrbitService extends Service {
       watchdogTools: this.config.watchdogTools,
       executorTools: this.config.executorTools,
       ...(this.config.executorTimeoutMs ? { executorTimeoutMs: this.config.executorTimeoutMs } : {}),
+      ...(this.config.heartbeatEnabled !== undefined ? { heartbeatEnabled: this.config.heartbeatEnabled } : {}),
+      ...(this.config.heartbeatIntervalMs ? { heartbeatIntervalMs: this.config.heartbeatIntervalMs } : {}),
+      ...(this.config.heartbeatHealthyIntervalMs ? { heartbeatHealthyIntervalMs: this.config.heartbeatHealthyIntervalMs } : {}),
+      ...(this.config.heartbeatSuspectIntervalMs ? { heartbeatSuspectIntervalMs: this.config.heartbeatSuspectIntervalMs } : {}),
+      ...(this.config.finalAuditEnabled !== undefined ? { finalAuditEnabled: this.config.finalAuditEnabled } : {}),
     })
   }
 

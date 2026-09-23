@@ -8,17 +8,21 @@ import {
   assertTimeoutDecision,
   assertWatchdogDecision,
   assertGuardWatchdogDecision,
+  assertHeartbeatDecision,
+  assertFinalAuditDecision,
   COMMANDER_FINAL_EVALUATE_SCHEMA,
   COMMANDER_PLAN_SCHEMA,
   COMMANDER_STEP_EVALUATE_SCHEMA,
   COMMANDER_STRATEGY_SCHEMA,
   WATCHDOG_GUARD_SCHEMA,
+  WATCHDOG_HEARTBEAT_SCHEMA,
+  WATCHDOG_FINAL_AUDIT_SCHEMA,
   WATCHDOG_RUNTIME_SCHEMA,
   WATCHDOG_STRATEGY_SCHEMA,
   WATCHDOG_TIMEOUT_SCHEMA,
   type EvaluationMode,
 } from './decisions.ts'
-import { ORBIT_COMMANDER_DECISION_TOOL, type ModelRunUsage, type OrbitHost, type RoleHandle, type RoleRunResult, type RoleToolFilter } from './host.ts'
+import { ORBIT_COMMANDER_DECISION_TOOL, ORBIT_RUN_COMPLETE_TOOL, type ModelRunUsage, type OrbitHost, type RoleHandle, type RoleRunResult, type RoleToolFilter } from './host.ts'
 import { OrbitMoaAdapter, type OrbitMoaAdapterLike } from './moa-adapter.ts'
 import {
   applyCommanderNeedsUser,
@@ -28,7 +32,12 @@ import {
   applyExecutorResume,
   applyExecutorSuccess,
   applyFinalAppend,
+  applyFinalAuditApproved,
+  applyFinalAuditBlocked,
+  applyFinalCandidate,
   applyFinalSuccess,
+  applyTerminalConfirmation,
+  completionGateIssue,
   applyPlan,
   applyStepPass,
   baseStepIdOf,
@@ -41,7 +50,9 @@ import {
   enterBudgetExhausted,
   enterNeedsUser,
   ensureAutomaticLoopBudgetForPlan,
+  hashGoal,
   markStrategyChallengeUsed,
+  markMeaningfulProgress,
   normalizePlan,
   assertMoaPlanWithinPolicy,
   normalizeExecutionMode,
@@ -63,6 +74,9 @@ import {
   COMMANDER_HARD_CEILING_MS,
   COMMANDER_SOFT_DEADLINE_MS,
   DEFAULT_CAPABILITIES,
+  DEFAULT_HEARTBEAT_HEALTHY_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_SUSPECT_INTERVAL_MS,
   EXECUTOR_TIMEOUT_MS,
   GUARD_ESCALATION_THRESHOLD,
   GUARD_FIRST_INSTRUCTION,
@@ -71,6 +85,7 @@ import {
   GUARD_REPEAT_INSTRUCTION,
   GUARD_RETRY_INSTRUCTION,
   MAX_EXECUTOR_INTERRUPT_RETRIES,
+  MAX_FINAL_AUDIT_BLOCKS,
   MAX_WATCHDOG_CALLS_PER_STEP,
   WATCHDOG_TIMEOUT_MS,
   type CommanderDecision,
@@ -83,9 +98,12 @@ import {
   type OrbitTelemetry,
   type GuardCode,
   type GuardWatchdogDecision,
+  type HeartbeatDecision,
+  type FinalAuditDecision,
   type StrategyDecision,
   type TimeoutDecision,
   type WatchdogDecision,
+  type TerminalCompletionSubmission,
 } from './types.ts'
 import { resolveEffectiveRoutes, type OrbitConfiguredRoutes } from './routes.ts'
 
@@ -114,6 +132,11 @@ export interface OrbitSupervisorConfig {
   executorTools: readonly string[]
   executorTimeoutMs?: number
   watchdogTimeoutMs?: number
+  heartbeatEnabled?: boolean
+  heartbeatIntervalMs?: number
+  heartbeatHealthyIntervalMs?: number
+  heartbeatSuspectIntervalMs?: number
+  finalAuditEnabled?: boolean
 }
 
 export interface OrbitRunInput {
@@ -156,6 +179,17 @@ interface AuxRoleRequest {
   outputSchema?: ObjectJsonSchema
 }
 
+type HeartbeatTarget = 'commander' | 'executor' | 'moa'
+
+type HeartbeatWaitResult<T> =
+  | { kind: 'work'; value: T }
+  | { kind: 'timeout' }
+  | { kind: 'aborted' }
+  | { kind: 'restart_step'; reason: string }
+  | { kind: 'rotate_commander'; reason: string }
+  | { kind: 'needs_user'; reason: string }
+  | { kind: 'runtime_bug'; reason: string }
+
 const COMMANDER_PLAN_PROMPT = (goal: string, constraints: readonly string[], userReply: string, moaPolicy?: OrbitMoaPolicy) => `你是 Orbit 指挥官（Commander），当前阶段：PLAN。
 请为下述目标制定最小化的 1-5 个逻辑工程步骤。
 规则：基础读取不声明 capabilities；修改文件使用 "filesystem"，执行命令使用 "shell"，访问网页/API 使用 "web"，驱动真实浏览器使用 "browser"。只选择当前步骤真正需要的能力，可组合，保持最小化。
@@ -181,7 +215,7 @@ const COMMANDER_STEP_PROMPT = (
 当前步骤 ${step.id}：${step.goal}
 执行模式：${normalizeExecutionMode(step.execution_mode)}
 迭代计数：loop ${state.loop.used}/${state.loop.max}${userReplyLine(state)}
-Supervisor 执行证据：
+${state.heartbeat_watchdog?.strategy_review_requested ? `Heartbeat Watchdog 请求策略复核：${state.heartbeat_watchdog.last_reason ?? '请重新审视当前思路是否陷入重复或隧道视野。'}\n` : ''}Supervisor 执行证据：
 ${evidence}`
 
 const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence: string, state: OrbitState) =>
@@ -196,7 +230,7 @@ const COMMANDER_FINAL_PROMPT = (goal: string, plan: OrbitState['plan'], evidence
 计划摘要：${plan.summary}
 步骤：${plan.steps.map((step) => `${step.id}:${step.goal}[${step.status}/${normalizeExecutionMode(step.execution_mode)}]`).join('; ')}
 Loop：${state.loop.used}/${state.loop.max}${userReplyLine(state)}
-Supervisor 执行证据：
+${state.commander?.remaining_gap ? `Final Watchdog 上次阻止关闭的缺口：${state.commander.remaining_gap}\n` : ''}Supervisor 执行证据：
 ${evidence}`
 
 /**
@@ -270,6 +304,55 @@ const WATCHDOG_TIMEOUT_PROMPT = (mode: CommanderMode, elapsed: number, extension
 模式：${mode}
 遥测：${JSON.stringify(telemetry ?? {})}`
 
+const WATCHDOG_HEARTBEAT_PROMPT = (snapshot: Record<string, unknown>) =>
+  `你是 Orbit 心跳监控模型（Heartbeat Watchdog），当前阶段：HEARTBEAT_REVIEW。
+你的职责是主动检查 Orbit 是否仍在健康推进，而不是评审代码风格，也不是重新规划任务。
+允许的 decision 仅限：HEALTHY | WAIT | RESTART_STEP | ROTATE_COMMANDER | STRATEGY_REVIEW | NEEDS_USER | RUNTIME_BUG。
+规则：
+- HEALTHY：存在明确、持续的有效进展，无需干预。
+- WAIT：当前较慢或暂时缺少新事件，但仍有合理理由继续等待；下一次心跳应更快复查。
+- RESTART_STEP：当前 Executor 明显卡死/失活，且重启当前 Step 比继续等待更安全。
+- ROTATE_COMMANDER：当前 Commander 明显卡死/协议失效，应更换 Commander Session 后重试同一阶段。
+- STRATEGY_REVIEW：系统仍活着，但出现反复/隧道视野；在下一次 Commander 评估时强制重新审视策略。
+- NEEDS_USER：继续执行必须依赖用户信息或授权。
+- RUNTIME_BUG：发现状态机/Session/Invariant 异常，继续自动执行风险过高。
+不要监控 Watchdog 自己，不要直接执行项目操作，不要自行改变状态；只提交结构化判断。
+你的自然语言输出默认使用简体中文；decision 枚举、代码、命令、路径、provider/model ID 等机器标识保持原样。
+Supervisor 健康快照：${JSON.stringify(snapshot)}`
+
+const WATCHDOG_FINAL_AUDIT_PROMPT = (goal: string, state: OrbitState, fingerprint: string) =>
+  `你是 Orbit 最终关闭审计 Watchdog，当前阶段：FINAL_AUDIT。
+Commander 已认为目标完成，但 Run 尚未关闭。请独立检查是否允许进入最终停机确认。
+你只能依据原始目标、计划状态、durable step_results / trusted evidence、当前错误和角色状态判断；不要重新执行任务。
+允许的 decision 仅限：APPROVE_CLOSE | BLOCK_CLOSE | NEEDS_USER | RUNTIME_BUG。
+- APPROVE_CLOSE：原始目标已经有充分证据达成，且没有明显未完成工作。
+- BLOCK_CLOSE：证据不足或仍存在明确缺口；reason 必须说明缺口，后续由 Commander 决定 APPEND / NEEDS_USER。
+- NEEDS_USER：最终闭环需要用户信息或确认。
+- RUNTIME_BUG：状态机/Session/invariant 异常，不能安全关闭。
+请通过结构化结果协议提交最终判断。
+目标：${goal}
+审计指纹：${fingerprint}
+状态摘要：${JSON.stringify({
+    phase: state.phase,
+    loop: state.loop,
+    plan: state.plan,
+    step_results: state.step_results,
+    last_error: state.last_error,
+    recovered_error: state.recovered_error,
+    role_sessions: state.role_sessions,
+    moa_step: state.moa_step,
+  })}`
+
+const COMMANDER_TERMINAL_CONFIRM_PROMPT = (goal: string, auditReason: string | undefined) =>
+  `你是 Orbit 指挥官（Commander），当前阶段：TERMINAL_CONFIRM。
+原始目标已经完成计划步骤，且 Final Watchdog 已批准进入最终停机确认。
+现在只进行生命周期终止确认，不要重新执行项目，不要重新规划，不要调用读取/写入/shell/web/browser 工具。
+如果你确认：原始目标已达成、没有未完成步骤、不需要追加工作、不需要用户输入，请调用 orbit_run_complete 并提交 signal=COMPLETE。
+如果你认为仍不应停止，请调用 orbit_run_complete 并提交 signal=NOT_COMPLETE，同时说明 reason。
+普通文本（包括“完成”二字）绝不能替代这个工具调用。
+原始目标：${goal}
+Final Watchdog：APPROVE_CLOSE${auditReason ? `；${auditReason}` : ''}`
+
 type CommanderOutcome =
   | { kind: 'decision'; decision: CommanderDecision; output: string }
   | { kind: 'interrupted'; reason: string }
@@ -297,7 +380,7 @@ export class OrbitSupervisor {
   createState(input: OrbitRunInput): OrbitState {
     const ownerSessionId = this.config.resolveOwnerSessionId?.()
     const moaPolicy = this.config.resolveMoaPolicy?.()
-    return createInitialState({
+    const state = createInitialState({
       runId: typeof input.run_id === 'string' && input.run_id.length > 0 ? input.run_id : randomUUID(),
       now: this.now(),
       goal: (input.goal ?? '').trim(),
@@ -310,6 +393,21 @@ export class OrbitSupervisor {
       githubAllowed: input.github_allowed === true,
       ...(ownerSessionId === undefined ? {} : { ownerSessionId }),
     })
+    const interval = Math.max(1_000, this.config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS)
+    const healthyInterval = Math.max(interval, this.config.heartbeatHealthyIntervalMs ?? DEFAULT_HEARTBEAT_HEALTHY_INTERVAL_MS)
+    const suspectInterval = Math.max(1_000, Math.min(interval, this.config.heartbeatSuspectIntervalMs ?? DEFAULT_HEARTBEAT_SUSPECT_INTERVAL_MS))
+    state.heartbeat_watchdog = {
+      enabled: this.config.heartbeatEnabled === true,
+      sequence: 0,
+      interval_ms: interval,
+      healthy_interval_ms: healthyInterval,
+      suspect_interval_ms: suspectInterval,
+      healthy_streak: 0,
+      anomaly_streak: 0,
+      observed_progress_seq: state.progress?.seq ?? 0,
+      next_at: new Date(this.now() + interval).toISOString(),
+    }
+    return state
   }
 
   private resolveNewRoutes(): OrbitState['routes'] {
@@ -436,6 +534,22 @@ export class OrbitSupervisor {
       if (routeIssue) return this.result(state, false, routeIssue)
     }
 
+    const hadHeartbeat = state.heartbeat_watchdog !== undefined && state.progress !== undefined
+    this.ensureHeartbeatState(state)
+    if (!hadHeartbeat) this.store.writeState(state)
+
+    if (state.phase === 'FINAL_VERIFY') {
+      const audited = await this.runFinalAudit(state, signal)
+      if (audited) return audited
+      return this.run(state, signal, false)
+    }
+
+    if (state.phase === 'TERMINAL_CONFIRM') {
+      const confirmed = await this.runTerminalConfirm(state, signal)
+      if (confirmed) return confirmed
+      return this.run(state, signal, false)
+    }
+
     if (state.plan.steps.length === 0 && state.phase === 'PLAN') {
       const planOutcome = await this.makePlan(state, signal)
       if (planOutcome) return planOutcome
@@ -472,6 +586,7 @@ export class OrbitSupervisor {
     }
 
     beginStep(state, step)
+    this.markProgress(state)
     this.store.writeState(state)
 
     const executed = await this.executeStep(state, step, signal)
@@ -563,6 +678,295 @@ export class OrbitSupervisor {
     }
   }
 
+  private markProgress(state: OrbitState): void {
+    markMeaningfulProgress(state, this.now())
+  }
+
+  private ensureHeartbeatState(state: OrbitState): NonNullable<OrbitState['heartbeat_watchdog']> {
+    if (!state.progress) state.progress = { seq: 0, at: new Date(this.now()).toISOString() }
+    if (!state.heartbeat_watchdog) {
+      const interval = Math.max(1_000, this.config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS)
+      const healthyInterval = Math.max(interval, this.config.heartbeatHealthyIntervalMs ?? DEFAULT_HEARTBEAT_HEALTHY_INTERVAL_MS)
+      const suspectInterval = Math.max(1_000, Math.min(interval, this.config.heartbeatSuspectIntervalMs ?? DEFAULT_HEARTBEAT_SUSPECT_INTERVAL_MS))
+      state.heartbeat_watchdog = {
+        enabled: this.config.heartbeatEnabled === true,
+        sequence: 0,
+        interval_ms: interval,
+        healthy_interval_ms: healthyInterval,
+        suspect_interval_ms: suspectInterval,
+        healthy_streak: 0,
+        anomaly_streak: 0,
+        observed_progress_seq: state.progress.seq,
+        next_at: new Date(this.now() + interval).toISOString(),
+      }
+    }
+    return state.heartbeat_watchdog
+  }
+
+  private runtimeSignature(telemetry: OrbitTelemetry | undefined): string {
+    if (!telemetry) return 'none'
+    return hashGoal(JSON.stringify({
+      status: telemetry.status,
+      current_tool: telemetry.current_tool,
+      tool_count: telemetry.tool_count,
+      turn_count: telemetry.turn_count,
+      activity_state: telemetry.activity_state,
+      recent_output: telemetry.recent_output?.slice(-800),
+    }))
+  }
+
+  private heartbeatTargetFingerprint(
+    state: OrbitState,
+    target: HeartbeatTarget,
+    childId?: string,
+  ): string {
+    return hashGoal(JSON.stringify({
+      run_id: state.run_id,
+      phase: state.phase,
+      step: state.current_step,
+      progress_seq: state.progress?.seq ?? 0,
+      child: state.child,
+      target,
+      child_id: childId,
+      commander: state.role_sessions?.commander
+        ? {
+            child_id: state.role_sessions.commander.child_id,
+            generation: state.role_sessions.commander.generation,
+            needs_rotation: state.role_sessions.commander.needs_rotation,
+          }
+        : undefined,
+      executor: state.role_sessions?.executor
+        ? {
+            child_id: state.role_sessions.executor.child_id,
+            generation: state.role_sessions.executor.generation,
+            needs_rotation: state.role_sessions.executor.needs_rotation,
+            last_step_id: state.role_sessions.executor.last_step_id,
+          }
+        : undefined,
+      moa: state.moa_step ? { step_id: state.moa_step.step_id, phase: state.moa_step.phase } : undefined,
+    }))
+  }
+
+  private completionFingerprint(state: OrbitState): string {
+    return hashGoal(JSON.stringify({
+      run_id: state.run_id,
+      progress_seq: state.progress?.seq ?? 0,
+      plan: state.plan.steps.map((step) => ({ id: step.id, status: step.status })),
+      results: (state.step_results ?? []).map((result) => ({
+        step_id: result.step_id,
+        attempt: result.attempt,
+        test_summary: result.test_summary,
+        changed_files: result.changed_files,
+        evidence: result.evidence,
+      })),
+      child: state.child,
+      pending_user_reply: state.pending_user_reply,
+      executor_generation: state.role_sessions?.executor?.generation,
+      executor_child: state.role_sessions?.executor?.child_id,
+      moa: state.moa_step ? { step_id: state.moa_step.step_id, phase: state.moa_step.phase } : undefined,
+    }))
+  }
+
+  private invariantIssues(state: OrbitState): string[] {
+    const issues: string[] = []
+    const running = state.plan.steps.filter((step) => step.status === 'running')
+    if (running.length > 1) issues.push('ORBIT_INVARIANT_MULTIPLE_RUNNING_STEPS')
+    if (state.phase === 'EVALUATE' && state.current_step && !state.plan.steps.some((step) => step.id === state.current_step?.id)) {
+      issues.push('ORBIT_INVARIANT_CURRENT_STEP_MISSING')
+    }
+    if (state.phase === 'SUCCESS' && (state.status !== 'success' || state.driver_ownership !== 'CLOSED')) {
+      issues.push('ORBIT_INVARIANT_SUCCESS_NOT_CLOSED')
+    }
+    if (state.phase === 'FINAL_VERIFY' || state.phase === 'TERMINAL_CONFIRM') {
+      if (state.plan.steps.some((step) => step.status !== 'passed')) issues.push('ORBIT_INVARIANT_FINAL_WITH_UNPASSED_STEP')
+    }
+    if (state.role_sessions?.executor?.needs_rotation === false && !state.role_sessions.executor.child_id) {
+      issues.push('ORBIT_INVARIANT_EXECUTOR_ID_MISSING')
+    }
+    return issues
+  }
+
+  private heartbeatSnapshot(
+    state: OrbitState,
+    target: HeartbeatTarget,
+    telemetry: OrbitTelemetry | undefined,
+    childId?: string,
+  ): Record<string, unknown> {
+    const heartbeat = this.ensureHeartbeatState(state)
+    const now = this.now()
+    const progressAt = Date.parse(state.progress?.at ?? '')
+    const previousRuntimeSignature = heartbeat.last_runtime_signature
+    const runtimeSignature = this.runtimeSignature(telemetry)
+    return {
+      run: {
+        run_id: state.run_id,
+        phase: state.phase,
+        status: state.status,
+        loop: state.loop,
+      },
+      target,
+      step: state.current_step,
+      progress: {
+        seq: state.progress?.seq ?? 0,
+        last_progress_age_ms: Number.isNaN(progressAt) ? undefined : Math.max(0, now - progressAt),
+        changed_since_last_heartbeat: (state.progress?.seq ?? 0) !== (heartbeat.observed_progress_seq ?? -1),
+      },
+      runtime: {
+        child_id: childId,
+        telemetry: telemetry ?? {},
+        changed_since_last_heartbeat: previousRuntimeSignature !== undefined && previousRuntimeSignature !== runtimeSignature,
+      },
+      commander: state.role_sessions?.commander,
+      executor: state.role_sessions?.executor,
+      moa: state.moa_step,
+      invariants: this.invariantIssues(state),
+      last_error: state.last_error,
+    }
+  }
+
+  private scheduleNextHeartbeat(state: OrbitState, decision: HeartbeatDecision['decision'] | 'STALE_HEARTBEAT' | 'UNAVAILABLE'): void {
+    const heartbeat = this.ensureHeartbeatState(state)
+    let delay = heartbeat.interval_ms
+    if (decision === 'HEALTHY') {
+      heartbeat.healthy_streak += 1
+      heartbeat.anomaly_streak = 0
+      delay = heartbeat.healthy_streak >= 3 ? heartbeat.healthy_interval_ms : heartbeat.interval_ms
+    } else if (decision === 'STALE_HEARTBEAT') {
+      delay = heartbeat.interval_ms
+    } else {
+      heartbeat.healthy_streak = 0
+      heartbeat.anomaly_streak += 1
+      delay = heartbeat.suspect_interval_ms
+    }
+    heartbeat.next_at = new Date(this.now() + delay).toISOString()
+  }
+
+  private async heartbeatReview(
+    state: OrbitState,
+    target: HeartbeatTarget,
+    telemetry: OrbitTelemetry | undefined,
+    childId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<HeartbeatDecision | undefined> {
+    const heartbeat = this.ensureHeartbeatState(state)
+    if (!heartbeat.enabled) return undefined
+
+    const snapshot = this.heartbeatSnapshot(state, target, telemetry, childId)
+    const before = this.heartbeatTargetFingerprint(state, target, childId)
+    heartbeat.sequence += 1
+    heartbeat.last_at = new Date(this.now()).toISOString()
+    heartbeat.observed_progress_seq = state.progress?.seq ?? 0
+    heartbeat.last_runtime_signature = this.runtimeSignature(telemetry)
+    this.store.writeState(state)
+
+    const result = await this.runAuxRole(state, {
+      role: 'watchdog',
+      label: 'watchdog-heartbeat',
+      prompt: WATCHDOG_HEARTBEAT_PROMPT(snapshot),
+      outputSchema: WATCHDOG_HEARTBEAT_SCHEMA,
+      ...(signal ? { signal } : {}),
+    })
+    if (!result || result.interrupted || result.structured === undefined) {
+      heartbeat.last_decision = 'UNAVAILABLE'
+      heartbeat.last_reason = truncateSafe(result?.reason ?? 'HEARTBEAT_WATCHDOG_UNAVAILABLE', 300)
+      this.scheduleNextHeartbeat(state, 'UNAVAILABLE')
+      this.store.writeState(state)
+      return undefined
+    }
+
+    let decision: HeartbeatDecision
+    try {
+      decision = assertHeartbeatDecision(result.structured as HeartbeatDecision)
+    } catch (error) {
+      heartbeat.last_decision = 'UNAVAILABLE'
+      heartbeat.last_reason = truncateSafe(error instanceof Error ? error.message : String(error), 300)
+      this.scheduleNextHeartbeat(state, 'UNAVAILABLE')
+      this.store.writeState(state)
+      return undefined
+    }
+
+    if (before !== this.heartbeatTargetFingerprint(state, target, childId)) {
+      heartbeat.last_decision = 'STALE_HEARTBEAT'
+      heartbeat.last_reason = '运行状态已在 Watchdog 返回前发生变化，丢弃旧决策。'
+      this.scheduleNextHeartbeat(state, 'STALE_HEARTBEAT')
+      this.store.writeState(state)
+      return undefined
+    }
+
+    heartbeat.last_decision = decision.decision
+    heartbeat.last_reason = decision.reason ? truncateSafe(decision.reason, 300) : undefined
+    if (decision.decision === 'STRATEGY_REVIEW') heartbeat.strategy_review_requested = true
+    this.scheduleNextHeartbeat(state, decision.decision)
+    this.store.writeState(state)
+    return decision
+  }
+
+  private async waitWithHeartbeat<T>(
+    state: OrbitState,
+    target: HeartbeatTarget,
+    work: Promise<T>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    handle?: RoleHandle,
+  ): Promise<HeartbeatWaitResult<T>> {
+    const heartbeat = this.ensureHeartbeatState(state)
+    const deadline = this.now() + Math.max(0, timeoutMs)
+    let settled = false
+    const tracked = work.then(
+      (value) => {
+        settled = true
+        return { ok: true as const, value }
+      },
+      (error: unknown) => {
+        settled = true
+        return { ok: false as const, error }
+      },
+    )
+
+    for (;;) {
+      if (signal?.aborted) return { kind: 'aborted' }
+      const remaining = Math.max(0, deadline - this.now())
+      if (remaining <= 0) return { kind: 'timeout' }
+
+      const nextAt = heartbeat.enabled ? Date.parse(heartbeat.next_at ?? '') : Number.NaN
+      const untilHeartbeat = heartbeat.enabled && !Number.isNaN(nextAt) ? Math.max(0, nextAt - this.now()) : remaining
+      const raced = await this.raceWithSleep(tracked, Math.min(remaining, untilHeartbeat), signal)
+      if (raced.kind === 'work') {
+        if (!raced.value.ok) throw raced.value.error
+        return { kind: 'work', value: raced.value.value }
+      }
+      if (raced.kind === 'aborted' || signal?.aborted) return { kind: 'aborted' }
+      if (this.now() >= deadline) return { kind: 'timeout' }
+      if (!heartbeat.enabled) continue
+
+      const telemetry = await handle?.runtimeSnapshot?.()
+      const childId = handle?.childId
+      const decision = await this.heartbeatReview(state, target, telemetry, childId, signal)
+      if (settled) {
+        const hb = this.ensureHeartbeatState(state)
+        hb.last_decision = 'STALE_HEARTBEAT'
+        hb.last_reason = '目标角色已在 Heartbeat 检查期间结算，丢弃 Watchdog 决策。'
+        this.scheduleNextHeartbeat(state, 'STALE_HEARTBEAT')
+        this.store.writeState(state)
+        continue
+      }
+      if (!decision || decision.decision === 'HEALTHY' || decision.decision === 'WAIT' || decision.decision === 'STRATEGY_REVIEW') continue
+      const reason = decision.reason ?? decision.decision
+      if (decision.decision === 'RESTART_STEP') {
+        if (target === 'commander') return { kind: 'rotate_commander', reason: `Watchdog requested RESTART_STEP while Commander was active: ${reason}` }
+        return { kind: 'restart_step', reason }
+      }
+      if (decision.decision === 'ROTATE_COMMANDER') {
+        if (target === 'commander') return { kind: 'rotate_commander', reason }
+        this.rotateRoleSession(state, 'commander', `HEARTBEAT_ROTATE_COMMANDER:${truncateSafe(reason, 120)}`)
+        this.store.writeState(state)
+        continue
+      }
+      if (decision.decision === 'NEEDS_USER') return { kind: 'needs_user', reason }
+      return { kind: 'runtime_bug', reason }
+    }
+  }
+
   // ── commander supervised path ──────────────────────────────────────────────
 
   private async makePlan(state: OrbitState, signal?: AbortSignal): Promise<OrbitActionResult | undefined> {
@@ -584,6 +988,7 @@ export class OrbitSupervisor {
       assertMoaPlanWithinPolicy(plan, state.moa_policy)
       applyPlan(state, plan)
       ensureAutomaticLoopBudgetForPlan(state)
+      this.markProgress(state)
       this.store.writeState(state)
       return undefined
     } catch (error) {
@@ -648,11 +1053,13 @@ export class OrbitSupervisor {
     prompt: string,
     outputSchema: ObjectJsonSchema,
     signal?: AbortSignal,
+    heartbeatRotations = 0,
   ): Promise<SupervisedResult> {
     const startedAt = this.now()
     const commanderTools = [
       ...this.config.commanderReadOnlyTools.filter((name) => (READ_ONLY_ROLE_TOOLS as readonly string[]).includes(name)),
       ORBIT_COMMANDER_DECISION_TOOL,
+      ORBIT_RUN_COMPLETE_TOOL,
     ]
     const toolFilter = this.toolAllow(commanderTools, `commander ${mode}`)
     const resumeOf = this.resumeRoleId(state, 'commander')
@@ -703,7 +1110,7 @@ export class OrbitSupervisor {
               ? COMMANDER_SOFT_DEADLINE_MS + COMMANDER_EXTENSION_MS
               : COMMANDER_HARD_CEILING_MS
         const remaining = Math.max(0, deadline - (this.now() - startedAt))
-        const raced = await this.raceWithSleep(handle.result, remaining, signal)
+        const raced = await this.waitWithHeartbeat(state, 'commander', handle.result, remaining, signal, handle)
         if (raced.kind === 'work') {
           this.recordRoleTurn(state, 'commander', raced.value.tokenUsage)
           if (raced.value.interrupted) {
@@ -724,6 +1131,27 @@ export class OrbitSupervisor {
           this.rotateRoleSession(state, 'commander', 'ORBIT_ABORTED')
           this.store.writeState(state)
           return { kind: 'interrupted', reason: 'ORBIT_ABORTED' }
+        }
+        if (raced.kind === 'rotate_commander') {
+          await this.cancelHandle(handle, 'HEARTBEAT_ROTATE_COMMANDER')
+          this.rotateRoleSession(state, 'commander', `HEARTBEAT_ROTATE_COMMANDER:${truncateSafe(raced.reason, 120)}`)
+          this.store.writeState(state)
+          if (heartbeatRotations < 1) {
+            return this.runCommander(state, mode, prompt, outputSchema, signal, heartbeatRotations + 1)
+          }
+          return { kind: 'interrupted', reason: 'HEARTBEAT_COMMANDER_ROTATION_EXHAUSTED' }
+        }
+        if (raced.kind === 'needs_user' || raced.kind === 'runtime_bug') {
+          await this.cancelHandle(handle, raced.kind === 'needs_user' ? 'HEARTBEAT_NEEDS_USER' : 'HEARTBEAT_RUNTIME_BUG')
+          this.rotateRoleSession(state, 'commander', raced.kind === 'needs_user' ? 'HEARTBEAT_NEEDS_USER' : 'HEARTBEAT_RUNTIME_BUG')
+          this.store.writeState(state)
+          return { kind: 'needs_user', reason: raced.reason }
+        }
+        if (raced.kind === 'restart_step') {
+          await this.cancelHandle(handle, 'HEARTBEAT_RESTART_STEP_DURING_COMMANDER')
+          this.rotateRoleSession(state, 'commander', 'HEARTBEAT_RESTART_STEP_DURING_COMMANDER')
+          this.store.writeState(state)
+          return { kind: 'interrupted', reason: 'HEARTBEAT_RESTART_STEP_DURING_COMMANDER' }
         }
         if (extensions >= 2) {
           await this.cancelHandle(handle, 'COMMANDER_HARD_TIMEOUT')
@@ -820,7 +1248,42 @@ export class OrbitSupervisor {
     }
     try {
       if (state.moa_step.phase === 'FANOUT') {
-        const fanout = await this.moa.fanout({ workspace, runId: state.run_id, step, policy, ...(signal ? { signal } : {}) })
+        const controller = new AbortController()
+        const phaseSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+        const pending = this.moa.fanout({ workspace, runId: state.run_id, step, policy, signal: phaseSignal })
+        const waited = await this.waitWithHeartbeat(
+          state,
+          'moa',
+          pending,
+          this.config.executorTimeoutMs ?? EXECUTOR_TIMEOUT_MS,
+          phaseSignal,
+        )
+        if (waited.kind !== 'work') {
+          controller.abort()
+          if (waited.kind === 'restart_step') {
+            state.moa_step = {
+              ...state.moa_step,
+              phase: 'FANOUT',
+              candidates: [],
+              successful_candidates: 0,
+              failed_candidates: 0,
+              last_error: `HEARTBEAT_RESTART_STEP:${truncateSafe(waited.reason, 200)}`,
+            }
+            this.markProgress(state)
+            this.store.writeState(state)
+            return { ready: false, done: false, message: state.moa_step.last_error }
+          }
+          if (waited.kind === 'aborted' || signal?.aborted) return { ready: false, done: true, message: 'ORBIT_ABORTED' }
+          const reason = waited.kind === 'timeout'
+            ? 'ORBIT_MOA_FANOUT_TIMEOUT'
+            : waited.kind === 'needs_user' || waited.kind === 'runtime_bug'
+              ? waited.reason
+              : 'ORBIT_MOA_FANOUT_INTERRUPTED'
+          enterNeedsUser(state, truncateSafe(reason, 500))
+          this.store.writeState(state)
+          return { ready: false, done: true, message: state.last_error ?? reason }
+        }
+        const fanout = waited.value
         state.moa_step = {
           ...state.moa_step,
           phase: fanout.successful >= 2 ? 'JUDGE' : 'FAILED',
@@ -831,6 +1294,7 @@ export class OrbitSupervisor {
           ...(sumMoaUsage(fanout.candidates.map((candidate) => candidate.usage)) ? { total_usage: sumMoaUsage(fanout.candidates.map((candidate) => candidate.usage)) } : {}),
           ...(fanout.successful >= 2 ? {} : { last_error: 'ORBIT_MOA_QUORUM_FAILED: 至少需要 2 个成功候选。' }),
         }
+        this.markProgress(state)
         this.store.writeState(state)
       }
       if (state.moa_step.phase === 'FAILED') {
@@ -844,7 +1308,42 @@ export class OrbitSupervisor {
         return { ready: false, done: false }
       }
       if (state.moa_step.phase === 'JUDGE') {
-        const judged = await this.moa.judge({ workspace, runId: state.run_id, step, policy, candidates: state.moa_step.candidates, ...(signal ? { signal } : {}) })
+        const controller = new AbortController()
+        const phaseSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+        const pending = this.moa.judge({ workspace, runId: state.run_id, step, policy, candidates: state.moa_step.candidates, signal: phaseSignal })
+        const waited = await this.waitWithHeartbeat(
+          state,
+          'moa',
+          pending,
+          this.config.executorTimeoutMs ?? EXECUTOR_TIMEOUT_MS,
+          phaseSignal,
+        )
+        if (waited.kind !== 'work') {
+          controller.abort()
+          if (waited.kind === 'restart_step') {
+            state.moa_step = {
+              ...state.moa_step,
+              phase: 'FANOUT',
+              candidates: [],
+              successful_candidates: 0,
+              failed_candidates: 0,
+              last_error: `HEARTBEAT_RESTART_STEP:${truncateSafe(waited.reason, 200)}`,
+            }
+            this.markProgress(state)
+            this.store.writeState(state)
+            return { ready: false, done: false, message: state.moa_step.last_error }
+          }
+          if (waited.kind === 'aborted' || signal?.aborted) return { ready: false, done: true, message: 'ORBIT_ABORTED' }
+          const reason = waited.kind === 'timeout'
+            ? 'ORBIT_MOA_JUDGE_TIMEOUT'
+            : waited.kind === 'needs_user' || waited.kind === 'runtime_bug'
+              ? waited.reason
+              : 'ORBIT_MOA_JUDGE_INTERRUPTED'
+          enterNeedsUser(state, truncateSafe(reason, 500))
+          this.store.writeState(state)
+          return { ready: false, done: true, message: state.last_error ?? reason }
+        }
+        const judged = waited.value
         state.moa_step = {
           ...state.moa_step,
           phase: 'SELECTED',
@@ -854,10 +1353,12 @@ export class OrbitSupervisor {
           ...(judged.usage ? { judge_usage: judged.usage } : {}),
           ...(sumMoaUsage([...state.moa_step.candidates.map((candidate) => candidate.usage), judged.usage]) ? { total_usage: sumMoaUsage([...state.moa_step.candidates.map((candidate) => candidate.usage), judged.usage]) } : {}),
         }
+        this.markProgress(state)
         this.store.writeState(state)
       }
       if (state.moa_step.phase === 'SELECTED') {
         state.moa_step.phase = 'PROMOTING'
+        this.markProgress(state)
         this.store.writeState(state)
       }
       if (state.moa_step.phase === 'PROMOTING') {
@@ -865,6 +1366,7 @@ export class OrbitSupervisor {
         if (!winner) throw new Error('ORBIT_MOA_WINNER_MISSING')
         const receipt = await this.moa.promote({ workspace, runId: state.run_id, stepId: step.id, winningCandidate: winner })
         state.moa_step = { ...state.moa_step, phase: 'PROMOTED', promotion_receipt: receipt }
+        this.markProgress(state)
         this.store.writeState(state)
       }
       return { ready: state.moa_step.phase === 'PROMOTED', done: false }
@@ -960,7 +1462,7 @@ export class OrbitSupervisor {
       this.store.writeState(state)
     }
 
-    const result = await this.awaitExecutor(handle, signal)
+    const result = await this.awaitExecutor(state, handle, signal)
     this.recordRoleTurn(state, 'executor', result.tokenUsage, step.id)
 
     if (result.interrupted) {
@@ -971,6 +1473,18 @@ export class OrbitSupervisor {
       this.store.writeState(state)
 
       if (signal?.aborted) return { done: true, ok: false, message: 'ORBIT_ABORTED' }
+      if (result.reason?.startsWith('HEARTBEAT_RESTART_STEP:')) {
+        this.rotateRoleSession(state, 'executor', truncateSafe(result.reason, 160))
+        clearExecutorChild(state)
+        this.markProgress(state)
+        this.store.writeState(state)
+        return { done: false, ok: false }
+      }
+      if (result.reason?.startsWith('HEARTBEAT_NEEDS_USER:') || result.reason?.startsWith('HEARTBEAT_RUNTIME_BUG:')) {
+        enterNeedsUser(state, truncateSafe(result.reason, 500))
+        this.store.writeState(state)
+        return { done: true, ok: false, message: result.reason }
+      }
       if (result.reason === 'USER_HARD_SCOPE_VIOLATION') {
         enterNeedsUser(state)
         this.store.writeState(state)
@@ -1023,23 +1537,35 @@ export class OrbitSupervisor {
       }),
     }
     upsertStepResult(state, buildStepResult(step.id, state.current_step?.attempt ?? 1, this.stepEvidence.bundle, state.test_summary))
+    this.markProgress(state)
     this.store.writeState(state)
     await this.disposeHandle(handle)
     return { done: false, ok: false }
   }
 
   /** Deterministic executor runtime timeout; a timeout does not destroy the child. */
-  private async awaitExecutor(handle: RoleHandle, signal?: AbortSignal): Promise<RoleRunResult> {
+  private async awaitExecutor(state: OrbitState, handle: RoleHandle, signal?: AbortSignal): Promise<RoleRunResult> {
     const timeoutMs = this.config.executorTimeoutMs ?? EXECUTOR_TIMEOUT_MS
-    const raced = await this.raceWithSleep(handle.result, timeoutMs, signal)
+    const raced = await this.waitWithHeartbeat(state, 'executor', handle.result, timeoutMs, signal, handle)
     if (raced.kind === 'work') return raced.value
-    await this.cancelHandle(handle, raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'EXECUTOR_TIMEOUT')
+    const reason = raced.kind === 'aborted'
+      ? 'ORBIT_ABORTED'
+      : raced.kind === 'timeout'
+        ? 'EXECUTOR_TIMEOUT'
+        : raced.kind === 'restart_step'
+          ? `HEARTBEAT_RESTART_STEP:${truncateSafe(raced.reason, 200)}`
+          : raced.kind === 'needs_user'
+            ? `HEARTBEAT_NEEDS_USER:${truncateSafe(raced.reason, 200)}`
+            : raced.kind === 'runtime_bug'
+              ? `HEARTBEAT_RUNTIME_BUG:${truncateSafe(raced.reason, 200)}`
+              : `HEARTBEAT_EXECUTOR_INTERRUPTED:${truncateSafe(raced.reason, 200)}`
+    await this.cancelHandle(handle, reason)
     const telemetry = await handle.runtimeSnapshot?.()
     return {
       ...(handle.childId ? { childId: handle.childId } : {}),
       output: '',
       interrupted: true,
-      reason: raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'EXECUTOR_TIMEOUT',
+      reason,
       ...(telemetry ? { telemetry } : {}),
     }
   }
@@ -1066,6 +1592,256 @@ export class OrbitSupervisor {
     return lines.join('\n')
   }
 
+  private async runFinalAudit(state: OrbitState, signal?: AbortSignal): Promise<OrbitActionResult | undefined> {
+    const heartbeat = this.ensureHeartbeatState(state)
+    const auditInputFingerprint = this.completionFingerprint(state)
+
+    if (this.config.finalAuditEnabled !== true) {
+      applyFinalAuditApproved(state)
+      this.markProgress(state)
+      heartbeat.final_audit = {
+        verdict: 'APPROVE_CLOSE',
+        at: new Date(this.now()).toISOString(),
+        fingerprint: this.completionFingerprint(state),
+        reason: 'Final audit disabled by explicit profile configuration.',
+        block_count: heartbeat.final_audit?.block_count ?? 0,
+      }
+      this.store.writeState(state)
+      return undefined
+    }
+
+    let result: RoleRunResult | undefined
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      result = await this.runAuxRole(state, {
+        role: 'watchdog',
+        label: 'watchdog-final-audit',
+        prompt: WATCHDOG_FINAL_AUDIT_PROMPT(state.goal, state, auditInputFingerprint),
+        outputSchema: WATCHDOG_FINAL_AUDIT_SCHEMA,
+        ...(signal ? { signal } : {}),
+      })
+      if (result && !result.interrupted && result.structured !== undefined) break
+    }
+
+    if (!result || result.interrupted || result.structured === undefined) {
+      state.last_error = truncateSafe(result?.reason ?? 'FINAL_AUDIT_WATCHDOG_UNAVAILABLE', 500)
+      this.store.writeState(state)
+      return this.result(state, false, state.last_error)
+    }
+
+    let decision: FinalAuditDecision
+    try {
+      decision = assertFinalAuditDecision(result.structured as FinalAuditDecision)
+    } catch (error) {
+      state.last_error = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      this.store.writeState(state)
+      return this.result(state, false, state.last_error)
+    }
+
+    if (auditInputFingerprint !== this.completionFingerprint(state)) {
+      state.last_error = 'FINAL_AUDIT_STALE: Run changed while the final Watchdog was reviewing it.'
+      heartbeat.final_audit = {
+        verdict: decision.decision,
+        at: new Date(this.now()).toISOString(),
+        fingerprint: auditInputFingerprint,
+        reason: state.last_error,
+        block_count: heartbeat.final_audit?.block_count ?? 0,
+      }
+      this.store.writeState(state)
+      return undefined
+    }
+
+    if (decision.decision === 'APPROVE_CLOSE') {
+      applyFinalAuditApproved(state)
+      this.markProgress(state)
+      heartbeat.final_audit = {
+        verdict: 'APPROVE_CLOSE',
+        at: new Date(this.now()).toISOString(),
+        fingerprint: this.completionFingerprint(state),
+        ...(decision.reason ? { reason: truncateSafe(decision.reason, 500) } : {}),
+        block_count: heartbeat.final_audit?.block_count ?? 0,
+      }
+      if (state.commander?.remaining_gap) state.commander.remaining_gap = undefined
+      if (state.last_error) state.recovered_error = state.last_error
+      state.last_error = null
+      this.store.writeState(state)
+      return undefined
+    }
+
+    if (decision.decision === 'BLOCK_CLOSE') {
+      const blocks = (heartbeat.final_audit?.block_count ?? 0) + 1
+      heartbeat.final_audit = {
+        verdict: 'BLOCK_CLOSE',
+        at: new Date(this.now()).toISOString(),
+        fingerprint: auditInputFingerprint,
+        reason: truncateSafe(decision.reason ?? 'Final Watchdog blocked closure.', 500),
+        block_count: blocks,
+      }
+      if (blocks >= MAX_FINAL_AUDIT_BLOCKS) {
+        enterNeedsUser(state, 'FINAL_AUDIT_BLOCKED_REPEATEDLY: ' + (heartbeat.final_audit.reason ?? ''))
+        this.store.writeState(state)
+        return this.result(state, false, state.last_error ?? undefined)
+      }
+      applyFinalAuditBlocked(state, heartbeat.final_audit.reason ?? 'Final Watchdog blocked closure.')
+      this.markProgress(state)
+      this.store.writeState(state)
+      return undefined
+    }
+
+    heartbeat.final_audit = {
+      verdict: decision.decision,
+      at: new Date(this.now()).toISOString(),
+      fingerprint: auditInputFingerprint,
+      ...(decision.reason ? { reason: truncateSafe(decision.reason, 500) } : {}),
+      block_count: heartbeat.final_audit?.block_count ?? 0,
+    }
+    enterNeedsUser(state, decision.decision + ': ' + (decision.reason ?? 'Final Watchdog requires intervention.'))
+    this.store.writeState(state)
+    return this.result(state, false, state.last_error ?? undefined)
+  }
+
+  private async runTerminalConfirm(
+    state: OrbitState,
+    signal?: AbortSignal,
+    heartbeatRotations = 0,
+  ): Promise<OrbitActionResult | undefined> {
+    const audit = this.ensureHeartbeatState(state).final_audit
+    if (audit?.verdict !== 'APPROVE_CLOSE' || !audit.fingerprint) {
+      state.phase = 'FINAL_VERIFY'
+      state.status = 'running'
+      state.last_error = 'ORBIT_TERMINAL_CONFIRM_WITHOUT_FINAL_AUDIT'
+      this.store.writeState(state)
+      return undefined
+    }
+
+    const commanderTools = [
+      ...this.config.commanderReadOnlyTools.filter((name) => (READ_ONLY_ROLE_TOOLS as readonly string[]).includes(name)),
+      ORBIT_COMMANDER_DECISION_TOOL,
+      ORBIT_RUN_COMPLETE_TOOL,
+    ]
+    const toolFilter = this.toolAllow(commanderTools, 'commander TERMINAL_CONFIRM')
+    const resumeOf = this.resumeRoleId(state, 'commander')
+    const start = (childId?: string) => this.host.startRole({
+      role: 'commander',
+      label: 'orbit-commander',
+      prompt: COMMANDER_TERMINAL_CONFIRM_PROMPT(state.goal, audit.reason),
+      route: state.routes.commander,
+      workspace: join(this.store.stateDir, '..'),
+      toolFilter,
+      persistent: true,
+      terminalConfirm: true,
+      ...(childId ? { resumeOf: childId } : {}),
+      ...(signal ? { signal } : {}),
+    })
+
+    let handle: RoleHandle | undefined
+    try {
+      try {
+        handle = await start(resumeOf)
+      } catch (error) {
+        if (!resumeOf) throw error
+        this.rotateRoleSession(
+          state,
+          'commander',
+          'TERMINAL_CONFIRM_RESUME_FAILED:' + truncateSafe(error instanceof Error ? error.message : String(error), 120),
+        )
+        this.store.writeState(state)
+        handle = await start()
+      }
+
+      if (handle.childId) {
+        this.bindRoleSession(state, 'commander', handle.childId)
+        this.store.writeState(state)
+      }
+
+      const raced = await this.waitWithHeartbeat(
+        state,
+        'commander',
+        handle.result,
+        COMMANDER_SOFT_DEADLINE_MS,
+        signal,
+        handle,
+      )
+
+      if (raced.kind === 'rotate_commander') {
+        await this.cancelHandle(handle, 'HEARTBEAT_ROTATE_COMMANDER')
+        this.rotateRoleSession(
+          state,
+          'commander',
+          'HEARTBEAT_ROTATE_COMMANDER:' + truncateSafe(raced.reason, 120),
+        )
+        this.store.writeState(state)
+        if (heartbeatRotations < 1) return this.runTerminalConfirm(state, signal, heartbeatRotations + 1)
+        return this.result(state, false, 'HEARTBEAT_COMMANDER_ROTATION_EXHAUSTED')
+      }
+
+      if (raced.kind === 'needs_user' || raced.kind === 'runtime_bug') {
+        await this.cancelHandle(handle, raced.kind === 'needs_user' ? 'HEARTBEAT_NEEDS_USER' : 'HEARTBEAT_RUNTIME_BUG')
+        enterNeedsUser(state, raced.reason)
+        this.store.writeState(state)
+        return this.result(state, false, raced.reason)
+      }
+
+      if (raced.kind !== 'work') {
+        const reason = raced.kind === 'aborted' ? 'ORBIT_ABORTED' : 'TERMINAL_CONFIRM_TIMEOUT'
+        await this.cancelHandle(handle, reason)
+        this.rotateRoleSession(state, 'commander', reason)
+        state.last_error = reason
+        this.store.writeState(state)
+        return this.result(state, false, reason)
+      }
+
+      this.recordRoleTurn(state, 'commander', raced.value.tokenUsage)
+      if (raced.value.interrupted || raced.value.structured === undefined) {
+        const reason = truncateSafe(raced.value.reason ?? 'TERMINAL_CONFIRM_STRUCTURED_OUTPUT_MISSING', 500)
+        this.rotateRoleSession(state, 'commander', reason)
+        state.last_error = reason
+        this.store.writeState(state)
+        return this.result(state, false, reason)
+      }
+
+      const submission = raced.value.structured as TerminalCompletionSubmission
+      if (submission.signal !== 'COMPLETE' && submission.signal !== 'NOT_COMPLETE') {
+        state.last_error = 'ORBIT_TERMINAL_CONFIRM_INVALID'
+        this.store.writeState(state)
+        return this.result(state, false, state.last_error)
+      }
+
+      applyTerminalConfirmation(state, submission.signal, this.now(), submission.reason)
+      if (submission.signal === 'NOT_COMPLETE') {
+        this.markProgress(state)
+        this.store.writeState(state)
+        return undefined
+      }
+
+      const issue = completionGateIssue(state, audit.fingerprint, this.completionFingerprint(state))
+      if (issue) {
+        state.last_error = issue
+        state.terminal_confirmation = undefined
+        if (issue === 'ORBIT_COMPLETION_GATE_AUDIT_STALE') {
+          state.phase = 'FINAL_VERIFY'
+          state.status = 'running'
+          this.store.writeState(state)
+          return undefined
+        }
+        enterNeedsUser(state, issue)
+        this.store.writeState(state)
+        return this.result(state, false, issue)
+      }
+
+      applyFinalSuccess(state, state.commander?.summary)
+      this.markProgress(state)
+      this.store.writeState(state)
+      return this.result(state, true, undefined, state.commander?.final_output)
+    } catch (error) {
+      const reason = truncateSafe(error instanceof Error ? error.message : String(error), 500)
+      state.last_error = reason
+      this.store.writeState(state)
+      return this.result(state, false, reason)
+    } finally {
+      if (handle) await this.disposeHandle(handle)
+    }
+  }
+
   // ── decision application ───────────────────────────────────────────────────
 
   private async applyCommanderOutcome(
@@ -1085,22 +1861,33 @@ export class OrbitSupervisor {
     }
     if (outcome.kind === 'needs_user') return this.setNeedsUser(state, outcome.reason)
     const decision = outcome.decision
+    if (state.heartbeat_watchdog?.strategy_review_requested) state.heartbeat_watchdog.strategy_review_requested = false
     if (decision.executor_session === 'RESET') this.rotateRoleSession(state, 'executor', 'COMMANDER_REQUEST')
 
     if (decision.decision === 'NEEDS_USER') {
       applyCommanderNeedsUser(state, decision.reason ?? 'COMMANDER_NEEDS_USER')
+      this.markProgress(state)
       this.store.writeState(state)
       return this.result(state, false)
     }
 
     if (decision.decision === 'SUCCESS') {
-      applyFinalSuccess(state, decision.summary)
+      if (this.config.finalAuditEnabled !== true) {
+        applyFinalSuccess(state, decision.summary)
+        if (outcome.output.trim()) state.commander = { ...state.commander, final_output: outcome.output.trim().slice(0, 8000) }
+        this.markProgress(state)
+        this.store.writeState(state)
+        return this.result(state, true, undefined, outcome.output)
+      }
+      applyFinalCandidate(state, decision.summary, outcome.output)
+      this.markProgress(state)
       this.store.writeState(state)
-      return this.result(state, true, undefined, outcome.output)
+      return undefined
     }
 
     if (decision.decision === 'PASS_CURRENT_STEP') {
       applyStepPass(state, step, decision.summary)
+      this.markProgress(state)
       this.store.writeState(state)
       return undefined
     }
@@ -1114,6 +1901,7 @@ export class OrbitSupervisor {
       if (append === 'invalid') {
         return this.setNeedsUser(state, 'COMMANDER_EVALUATION_OUTPUT_INVALID: APPEND 需要 next_steps 或 next_step_goal')
       }
+      this.markProgress(state)
       this.store.writeState(state)
       if (append === 'budget_exhausted') return this.result(state, false)
       return undefined
@@ -1125,6 +1913,7 @@ export class OrbitSupervisor {
 
   private setNeedsUser(state: OrbitState, reason: string): OrbitActionResult {
     enterNeedsUser(state, truncateSafe(reason, 500))
+    this.markProgress(state)
     this.store.writeState(state)
     return this.result(state, false)
   }
@@ -1170,6 +1959,7 @@ export class OrbitSupervisor {
       capabilities: decision.next_step_capabilities,
       executionMode: correctionMode,
     })
+    this.markProgress(state)
     this.store.writeState(state)
     return undefined
   }
@@ -1441,12 +2231,18 @@ export class OrbitSupervisor {
       moa_policy: state.moa_policy,
       moa_step: state.moa_step,
       role_sessions: state.role_sessions,
+      progress: state.progress,
+      heartbeat_watchdog: state.heartbeat_watchdog,
+      terminal_confirmation: state.terminal_confirmation,
+      recovered_error: state.recovered_error,
       changed_files: state.changed_files,
       test_summary: state.test_summary,
       driver_ownership: state.driver_ownership,
       state_revision: state.state_revision,
     }
-    const displayText = state.phase === 'SUCCESS' ? finalOutput?.trim() || state.commander?.summary?.trim() : undefined
+    const displayText = state.phase === 'SUCCESS'
+      ? finalOutput?.trim() || state.commander?.final_output?.trim() || state.commander?.summary?.trim()
+      : undefined
     return {
       ok,
       action: 'run',

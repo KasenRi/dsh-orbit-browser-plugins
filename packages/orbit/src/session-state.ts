@@ -51,6 +51,12 @@ export interface OrbitRuntimeState {
     readonly attempt: number
     readonly executionMode: 'SINGLE' | 'MOA'
   }
+  readonly heartbeat?: {
+    readonly sequence: number
+    readonly lastDecision?: string
+    readonly nextAt?: string
+    readonly finalAuditVerdict?: string
+  }
   readonly moa?: {
     readonly phase: NonNullable<OrbitState['moa_step']>['phase']
     readonly candidates: readonly OrbitRuntimeCandidateState[]
@@ -164,7 +170,7 @@ function orbitRuntimeSchema(): { parse(value: unknown): OrbitRuntimeState | null
       if (!runId || !phase || !status || !updatedAt || used === undefined || max === undefined) {
         throw new Error('orbitRuntime projection value is incomplete')
       }
-      const allowedPhases = new Set(['PLAN', 'EXECUTE', 'EVALUATE', 'SUCCESS', 'NEEDS_USER', 'BUDGET_EXHAUSTED', 'STOPPED'])
+      const allowedPhases = new Set(['PLAN', 'EXECUTE', 'EVALUATE', 'FINAL_VERIFY', 'TERMINAL_CONFIRM', 'SUCCESS', 'NEEDS_USER', 'BUDGET_EXHAUSTED', 'STOPPED'])
       const allowedStatuses = new Set(['running', 'success', 'stopped', 'needs_user', 'budget_exhausted'])
       if (!allowedPhases.has(phase) || !allowedStatuses.has(status)) throw new Error('orbitRuntime projection value has invalid phase/status')
 
@@ -172,6 +178,15 @@ function orbitRuntimeSchema(): { parse(value: unknown): OrbitRuntimeState | null
       const currentId = typeof currentRaw?.['id'] === 'string' ? currentRaw['id'] : undefined
       const currentAttempt = finiteNumber(currentRaw?.['attempt'])
       const currentMode = currentRaw?.['executionMode'] === 'MOA' ? 'MOA' : currentRaw?.['executionMode'] === 'SINGLE' ? 'SINGLE' : undefined
+
+      const heartbeatRaw = record['heartbeat'] as Record<string, unknown> | undefined
+      const heartbeatSequence = finiteNumber(heartbeatRaw?.['sequence'])
+      const heartbeat = heartbeatSequence === undefined ? undefined : {
+        sequence: heartbeatSequence,
+        ...(typeof heartbeatRaw?.['lastDecision'] === 'string' ? { lastDecision: heartbeatRaw['lastDecision'] } : {}),
+        ...(typeof heartbeatRaw?.['nextAt'] === 'string' ? { nextAt: heartbeatRaw['nextAt'] } : {}),
+        ...(typeof heartbeatRaw?.['finalAuditVerdict'] === 'string' ? { finalAuditVerdict: heartbeatRaw['finalAuditVerdict'] } : {}),
+      }
 
       const moaRaw = record['moa'] as Record<string, unknown> | undefined
       let moa: OrbitRuntimeState['moa'] | undefined
@@ -206,6 +221,7 @@ function orbitRuntimeSchema(): { parse(value: unknown): OrbitRuntimeState | null
         status: status as OrbitState['status'],
         loop: { used, max },
         ...(currentId && currentAttempt !== undefined && currentMode ? { currentStep: { id: currentId, attempt: currentAttempt, executionMode: currentMode } } : {}),
+        ...(heartbeat ? { heartbeat } : {}),
         ...(moa ? { moa } : {}),
         updatedAt,
       }
@@ -227,6 +243,14 @@ export function orbitRuntimeFromState(state: OrbitState): OrbitRuntimeState {
         id: state.current_step.id,
         attempt: state.current_step.attempt,
         executionMode: step.execution_mode === 'MOA' ? 'MOA' : 'SINGLE',
+      },
+    } : {}),
+    ...(state.heartbeat_watchdog ? {
+      heartbeat: {
+        sequence: state.heartbeat_watchdog.sequence,
+        ...(state.heartbeat_watchdog.last_decision ? { lastDecision: state.heartbeat_watchdog.last_decision } : {}),
+        ...(state.heartbeat_watchdog.next_at ? { nextAt: state.heartbeat_watchdog.next_at } : {}),
+        ...(state.heartbeat_watchdog.final_audit?.verdict ? { finalAuditVerdict: state.heartbeat_watchdog.final_audit.verdict } : {}),
       },
     } : {}),
     ...(moa ? {

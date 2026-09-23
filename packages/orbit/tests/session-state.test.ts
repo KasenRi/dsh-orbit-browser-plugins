@@ -79,6 +79,7 @@ test('the projections register strict toggle and runtime wire shapes', () => {
     status: 'running',
     loop: { used: 1, max: 5 },
     currentStep: { id: 'P1', attempt: 1, executionMode: 'MOA' },
+    heartbeat: { sequence: 3, lastDecision: 'HEALTHY', nextAt: '2026-09-20T00:02:00.000Z', finalAuditVerdict: 'APPROVE_CLOSE' },
     moa: {
       phase: 'JUDGE',
       candidates: [{ index: 1, provider: 'p', model: 'm', ok: true, files: 2, usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.01 } }],
@@ -95,7 +96,7 @@ test('the projections register strict toggle and runtime wire shapes', () => {
 
 test('runtime snapshot is bounded and excludes candidate/Judge text', () => {
   const snapshot = orbitRuntimeFromState({
-    schema_version: 4,
+    schema_version: 5,
     active_run_id: 'run-1',
     run_id: 'run-1',
     phase: 'EXECUTE',
@@ -128,6 +129,18 @@ test('runtime snapshot is bounded and excludes candidate/Judge text', () => {
     user_hard_constraints: [],
     github_allowed: false,
     interruption_retries: 0,
+    heartbeat_watchdog: {
+      enabled: true,
+      sequence: 3,
+      interval_ms: 120_000,
+      healthy_interval_ms: 180_000,
+      suspect_interval_ms: 60_000,
+      healthy_streak: 1,
+      anomaly_streak: 0,
+      last_decision: 'HEALTHY',
+      next_at: '2026-09-20T00:02:00.000Z',
+      final_audit: { verdict: 'APPROVE_CLOSE', fingerprint: 'hidden-fingerprint' },
+    },
     current_step: { id: 'P0', attempt: 1 },
     moa_step: {
       step_id: 'P0',
@@ -143,6 +156,10 @@ test('runtime snapshot is bounded and excludes candidate/Judge text', () => {
     },
   } as never)
   assert.equal(snapshot.currentStep?.executionMode, 'MOA')
+  assert.equal(snapshot.heartbeat?.sequence, 3)
+  assert.equal(snapshot.heartbeat?.lastDecision, 'HEALTHY')
+  assert.equal(snapshot.heartbeat?.finalAuditVerdict, 'APPROVE_CLOSE')
+  assert.equal(JSON.stringify(snapshot).includes('hidden-fingerprint'), false)
   assert.equal(snapshot.moa?.candidates[0]?.files, 1)
   assert.equal(JSON.stringify(snapshot).includes('DO NOT PROJECT'), false)
   assert.equal(JSON.stringify(snapshot).includes('secret goal'), false)
