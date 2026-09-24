@@ -19,6 +19,8 @@ v0.6.5 修复真实 Web Profile Live Apply 发现的 Session 持久化兼容问�
 
 v0.6.6 把 Orbit Run 从“项目唯一”升级为 **Session-scoped Runs**。每个 DSH Session 都有独立的 `.cx/sessions/<session-key>/state.json`、Run ID、persistent Commander / Executor 和 NEEDS_USER 状态；一个会话的活动 Run 不再阻止另一个会话在同一项目启动 Orbit。旧 `.cx/state.json` 会由其 `owner_session_id` 所属 Session 在下一次写入时自动迁移。多个 Session 共用同一个物理 checkout 时，可写 Executor turn 会按 workspace 串行，保留 mutation safety。
 
+v0.6.7 补齐显式 `resume` 的 Session 透传：`NEEDS_USER` 恢复重新进入 `run()` 时继续使用同一个 `owner_session_id`，避免工具调用路径依赖隐式 initiator 上下文。
+
 ## 核心能力
 
 - **Commander**：负责计划、步骤审核、最终审核和策略调整；一个 Run 内默认持续使用同一个 Commander Session。

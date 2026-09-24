@@ -97,6 +97,10 @@ v0.6.6 修复了此前“同一项目只有一个 `.cx/state.json`，导致一�
 - 多个 Session 可以同时规划、审核和推进；如果它们共享同一个物理 checkout，可写 Executor turn 会按 workspace 串行，避免同一时刻交叉写文件。
 - Orbit 与 Goal / Workflow / Ralph / 独立 `/moa` 的顶层 mutation fence 仍然按整个 workspace 生效。
 
+### v0.6.7 Session resume hotfix
+
+v0.6.7 补齐显式 `resume` 路径的 Session 传递：当调用方已经给出当前 DSH Session，`NEEDS_USER` 恢复重新进入 `run()` 时会继续显式携带同一个 `owner_session_id`，不依赖隐式 initiator 上下文。Session-scoped Runs、旧状态迁移和 workspace mutation lease 语义均保持不变。
+
 ## v0.6.x：Orbit 接入 MoA 多候选执行
 
 从 v0.6.0 开始，Orbit 可以把少量高不确定性步骤交给 **MoA 多候选模式**。

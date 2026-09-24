@@ -183,7 +183,7 @@ export class OrbitService extends Service {
     const supervisor = this.supervisorFor(dir, ownerSessionId)
     if (input.run_id && input.run_id !== state.run_id) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: Run id 不匹配。' }
     if (state.phase === 'NEEDS_USER') {
-      if (state.owner_session_id !== undefined) return this.run(input, dir, signal)
+      if (state.owner_session_id !== undefined) return this.run(input, dir, signal, ownerSessionId)
       // Explicit resume is the only ownerless compatibility path; it never
       // adopts the caller or stores its message as a user reply.
       state.phase = state.plan.steps.length === 0 ? 'PLAN' : 'EXECUTE'
