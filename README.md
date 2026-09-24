@@ -23,7 +23,7 @@ Orbit 的目标不是做一个“无限自动继续”的 Loop，而是给 DSH �
 - 每个步骤完成后重新交给 Commander 审核；
 - 发现问题时进入有界修正，而不是直接宣告成功；
 - 发生超时、卡死或中断时，让 **Smart Watchdog（监控模型）**参与恢复；
-- 将运行状态持久化到项目的 `.cx/state.json`，支持中断后继续；
+- 将每个 DSH Session 的运行状态独立持久化到 `.cx/sessions/<session-key>/state.json`，支持中断后继续；
 - 在最终成功前再次执行 Final Evaluation，而不是只相信 Executor 的自述。
 
 核心流程：
@@ -63,7 +63,7 @@ SUCCESS
 - Executor 权限集合发生变化时会自动轮换，避免为了复用上下文而扩大权限；
 - Commander 可以在结构化决策里请求 `executor_session: RESET`，但真正的关闭/创建仍由 Supervisor 执行；
 - Watchdog、MoA Candidate、MoA Judge 继续保持一次性隔离调用；
-- 角色 Session ID、generation、turns、resets 与 Token usage 会写入 `.cx/state.json` 的 `role_sessions`，用于恢复和诊断。
+- 角色 Session ID、generation、turns、resets 与 Token usage 会写入当前 Run 的 durable state 中，用于恢复和诊断。
 
 因此默认路径会从“每个阶段一个新 Agent”变成“一个 Run 主要只有一个 Commander + 一个 Executor”，减少重复项目探索和重复上下文建立，同时保留权限隔离和确定性轮换。
 
@@ -79,7 +79,23 @@ v0.6.4 把 Watchdog 从“出错后才介入”扩展为 **事件触发 + 周期
 
 ## v0.6.5：Session Persistence Hotfix
 
-真实 Web Profile Live Apply 暴露了一个 DSH 兼容性边界：当前 DSH 的 `Session.append()` 还没有给外部插件开放 envelope-level `ignorable: true` 写入接口，而持久化 reader 会拒绝未知且非 ignorable 的自定义 Session event。v0.6.5 因此停止在当前 Harness 上持久化未被核心词汇识别的 `orbit/runtime` event，避免 Session 在冷读取/重启后变成不可恢复日志。Orbit 的权威运行状态仍然是 `<project>/.cx/state.json`；只有未来 Harness 原生识别 `orbit/runtime` 时才会恢复该 Session runtime projection。
+真实 Web Profile Live Apply 暴露了一个 DSH 兼容性边界：当前 DSH 的 `Session.append()` 还没有给外部插件开放 envelope-level `ignorable: true` 写入接口，而持久化 reader 会拒绝未知且非 ignorable 的自定义 Session event。v0.6.5 因此停止在当前 Harness 上持久化未被核心词汇识别的 `orbit/runtime` event，避免 Session 在冷读取/重启后变成不可恢复日志。Orbit 的权威运行状态仍然保存在项目 `.cx` durable state 中；v0.6.6 起新 Run 使用 Session-scoped 路径。只有未来 Harness 原生识别 `orbit/runtime` 时才会恢复该 Session runtime projection。
+
+## v0.6.6：Session-scoped Runs
+
+v0.6.6 修复了此前“同一项目只有一个 `.cx/state.json`，导致一个聊天会话的活动 Run 阻塞所有其他会话”的问题。现在每个 DSH Session 都拥有独立的 Orbit Run、状态文件和 persistent Commander / Executor：
+
+```text
+同一项目
+├─ Session A → .cx/sessions/<A>/state.json → 独立 Orbit Run
+├─ Session B → .cx/sessions/<B>/state.json → 独立 Orbit Run
+└─ Session C → .cx/sessions/<C>/state.json → 独立 Orbit Run
+```
+
+- Session A 的 `NEEDS_USER`、active Run 或 stop/status 不再锁住 Session B。
+- v0.6.5 及更早版本的 `.cx/state.json` 如果带有 `owner_session_id`，会在所属 Session 下一次写入时自动迁移到新的 Session 路径。
+- 多个 Session 可以同时规划、审核和推进；如果它们共享同一个物理 checkout，可写 Executor turn 会按 workspace 串行，避免同一时刻交叉写文件。
+- Orbit 与 Goal / Workflow / Ralph / 独立 `/moa` 的顶层 mutation fence 仍然按整个 workspace 生效。
 
 ## v0.6.x：Orbit 接入 MoA 多候选执行
 
@@ -208,7 +224,7 @@ DeepSeek Harness
 ├─ Native infrastructure: agents / subagents / tools / sessions
 │
 ├─ @kasenri/dsh-orbit
-│    ├─ OrbitService (durable state in <project>/.cx/state.json)
+│    ├─ OrbitService (per-Session durable state in <project>/.cx/sessions/...)
 │    ├─ Deterministic Supervisor
 │    ├─ Commander / Executor / Smart Watchdog
 │    ├─ Optional MoA Adapter → Candidate fan-out / Judge / controlled promotion
@@ -313,9 +329,9 @@ agent_browser { "args": ["snapshot", "-i"] }
 
 See [packages/orbit/README.md](packages/orbit/README.md#migrating-from-dsh-cx).
 In short: `dsh-cx` → `dsh-orbit`, `cx_controller` → `orbit_controller`,
-CX mode → Orbit mode, `ctx.cx` → `ctx.orbit`. `.cx/state.json` remains
-unchanged, legacy `cx模式` remains supported, and existing durable runs do not
-need migration.
+CX mode → Orbit mode, `ctx.cx` → `ctx.orbit`. Legacy `.cx/state.json` remains
+readable and owner-scoped states migrate automatically to `.cx/sessions/...`;
+legacy `cx模式` remains supported.
 
 ## Development
 

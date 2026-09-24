@@ -503,7 +503,7 @@ export class OrbitSupervisor {
         ok: false,
         action: 'run',
         run_id: state.run_id,
-        message: 'ORBIT_ACTIVE_RUN_EXISTS: 当前项目已有活动中的 Orbit Run，请先继续或停止该 Run。',
+        message: 'ORBIT_ACTIVE_RUN_EXISTS: 当前会话已有活动中的 Orbit Run，请先继续或停止该 Run。',
       }
     }
     return this.run(state, signal)
@@ -1364,7 +1364,9 @@ export class OrbitSupervisor {
       if (state.moa_step.phase === 'PROMOTING') {
         const winner = state.moa_step.winning_candidate
         if (!winner) throw new Error('ORBIT_MOA_WINNER_MISSING')
-        const receipt = await this.moa.promote({ workspace, runId: state.run_id, stepId: step.id, winningCandidate: winner })
+        const receipt = await this.host.withWorkspaceMutationLease(workspace, signal, () =>
+          this.moa.promote({ workspace, runId: state.run_id, stepId: step.id, winningCandidate: winner }),
+        )
         state.moa_step = { ...state.moa_step, phase: 'PROMOTED', promotion_receipt: receipt }
         this.markProgress(state)
         this.store.writeState(state)

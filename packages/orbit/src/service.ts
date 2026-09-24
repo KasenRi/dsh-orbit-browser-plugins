@@ -10,7 +10,7 @@ import { createRunCompleteTool } from './completion-tool.ts'
 import { ORBIT_COMMANDER_DECISION_TOOL, ORBIT_RUN_COMPLETE_TOOL } from './host.ts'
 import { OrbitMoaAdapter } from './moa-adapter.ts'
 import { OrbitStateStore } from './state-store.ts'
-import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome } from './supervisor.ts'
+import { OrbitSupervisor, type OrbitRunInput, type GuardBlockOutcome, type OrbitSupervisorConfig } from './supervisor.ts'
 import type { OrbitActionResult, OrbitMoaPolicy, OrbitRoutes, GuardCode } from './types.ts'
 import type { OrbitConfiguredRoutes } from './routes.ts'
 import { orbitRuntimeFromState } from './session-state.ts'
@@ -85,18 +85,32 @@ export class OrbitService extends Service {
     // envelope-level `ignorable: true` marker required by out-of-tree event
     // types. Persisting an unknown `orbit/runtime` event would make the
     // Session unreadable after a cold observer/restart. Publish only when the
-    // running harness itself recognizes the event vocabulary; `.cx/state.json`
-    // remains Orbit's durable source of truth on older harnesses.
+    // running harness itself recognizes the event vocabulary; Orbit's `.cx`
+    // durable state remains the source of truth (session-scoped since v0.6.6).
     if (!KNOWN_SESSION_EVENT_TYPES.has('orbit/runtime')) return
     session.append('orbit/runtime', orbitRuntimeFromState(state))
   }
 
-  supervisorFor(projectDir: string): OrbitSupervisor {
-    return new OrbitSupervisor(new OrbitStateStore(projectDir, (state) => this.publishRuntime(state)), this.host, {
+  private currentOwnerSessionId(): string | undefined {
+    return this.config.resolveOwnerSessionId?.()
+  }
+
+  private stateStore(projectDir: string, ownerSessionId = this.currentOwnerSessionId(), publish = false): OrbitStateStore {
+    return new OrbitStateStore(projectDir, publish ? (state) => this.publishRuntime(state) : undefined, ownerSessionId)
+  }
+
+  private executionKey(projectDir: string, ownerSessionId: string | undefined): string {
+    return `${projectDir}\u0000${ownerSessionId ?? '<ownerless>'}`
+  }
+
+  private supervisorConfig(ownerSessionId: string | undefined, ownerlessLegacy = false): OrbitSupervisorConfig {
+    return {
       defaultRoutes: this.config.routes,
       ...(this.config.resolveRoutes ? { resolveRoutes: this.config.resolveRoutes } : {}),
       ...(this.config.resolveMoaPolicy ? { resolveMoaPolicy: this.config.resolveMoaPolicy } : {}),
-      ...(this.config.resolveOwnerSessionId ? { resolveOwnerSessionId: this.config.resolveOwnerSessionId } : {}),
+      ...(!ownerlessLegacy && (ownerSessionId !== undefined || this.config.resolveOwnerSessionId)
+        ? { resolveOwnerSessionId: () => ownerSessionId ?? this.config.resolveOwnerSessionId?.() }
+        : {}),
       browserTools: this.config.browserTools,
       commanderReadOnlyTools: this.config.commanderReadOnlyTools,
       watchdogTools: this.config.watchdogTools,
@@ -107,46 +121,66 @@ export class OrbitService extends Service {
       ...(this.config.heartbeatHealthyIntervalMs ? { heartbeatHealthyIntervalMs: this.config.heartbeatHealthyIntervalMs } : {}),
       ...(this.config.heartbeatSuspectIntervalMs ? { heartbeatSuspectIntervalMs: this.config.heartbeatSuspectIntervalMs } : {}),
       ...(this.config.finalAuditEnabled !== undefined ? { finalAuditEnabled: this.config.finalAuditEnabled } : {}),
-    })
+    }
+  }
+
+  supervisorFor(projectDir: string, ownerSessionId = this.currentOwnerSessionId()): OrbitSupervisor {
+    return new OrbitSupervisor(this.stateStore(projectDir, ownerSessionId, true), this.host, this.supervisorConfig(ownerSessionId))
+  }
+
+  private legacySupervisorFor(projectDir: string): OrbitSupervisor {
+    return new OrbitSupervisor(new OrbitStateStore(projectDir, (state) => this.publishRuntime(state)), this.host, this.supervisorConfig(undefined, true))
+  }
+
+  private ownerlessLegacyState(projectDir: string): import('./types.ts').OrbitState | null {
+    const state = new OrbitStateStore(projectDir).readState()
+    return state?.owner_session_id === undefined ? state : null
   }
 
   private resolveProjectDir(projectDir?: string): string {
     return resolve(projectDir ?? this.config.projectDir ?? process.cwd())
   }
 
-  run(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal): Promise<OrbitActionResult> {
+  run(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal, explicitOwnerSessionId?: string): Promise<OrbitActionResult> {
     const dir = this.resolveProjectDir(projectDir)
-    return this.execute(dir, signal, (activeSignal) => this.supervisorFor(dir).bootstrap(input, activeSignal))
+    const ownerSessionId = explicitOwnerSessionId ?? this.currentOwnerSessionId()
+    return this.execute(dir, ownerSessionId, signal, (activeSignal) => this.supervisorFor(dir, ownerSessionId).bootstrap(input, activeSignal))
   }
 
-  private async execute(dir: string, signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<OrbitActionResult>): Promise<OrbitActionResult> {
-    if (this.executions.has(dir)) return { ok: false, action: 'run', message: 'ORBIT_MUTATION_DRIVER_CONFLICT: 此 workspace 已有 Orbit 执行中的调用。' }
+  private async execute(dir: string, ownerSessionId: string | undefined, signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<OrbitActionResult>): Promise<OrbitActionResult> {
+    const key = this.executionKey(dir, ownerSessionId)
+    if (this.executions.has(key)) return { ok: false, action: 'run', message: 'ORBIT_MUTATION_DRIVER_CONFLICT: 当前 Session 已有 Orbit 执行中的调用。' }
     const controller = new AbortController()
     const abort = (): void => controller.abort()
     if (signal?.aborted) controller.abort()
     signal?.addEventListener('abort', abort, { once: true })
     const result = Promise.resolve().then(() => operation(controller.signal))
-    this.executions.set(dir, { controller, result })
+    this.executions.set(key, { controller, result })
     try {
       const settled = await result
       if (settled.phase === 'SUCCESS' || settled.phase === 'STOPPED' || settled.phase === 'BUDGET_EXHAUSTED' || settled.message === 'ORBIT_ABORTED') {
-        await this.host.revokeWorkspace(dir)
+        if (ownerSessionId !== undefined) await this.host.revokeOwner(dir, ownerSessionId)
+        else await this.host.revokeWorkspace(dir)
       }
       return settled
     } catch (error) {
-      await this.host.revokeWorkspace(dir)
+      if (ownerSessionId !== undefined) await this.host.revokeOwner(dir, ownerSessionId)
+      else await this.host.revokeWorkspace(dir)
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
-      this.executions.delete(dir)
+      this.executions.delete(key)
     }
   }
 
-  async resume(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal): Promise<OrbitActionResult> {
+  async resume(input: OrbitRunInput, projectDir?: string, signal?: AbortSignal, explicitOwnerSessionId?: string): Promise<OrbitActionResult> {
     const dir = this.resolveProjectDir(projectDir)
-    const state = new OrbitStateStore(dir).readState()
-    if (!state) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: 没有可继续的持久化 Run。' }
-    const supervisor = this.supervisorFor(dir)
+    const ownerSessionId = explicitOwnerSessionId ?? this.currentOwnerSessionId()
+    const store = this.stateStore(dir, ownerSessionId)
+    let state = store.readState()
+    if (!state && ownerSessionId !== undefined) state = store.adoptOwnerlessLegacyState()
+    if (!state) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: 当前 Session 没有可继续的持久化 Run。' }
+    const supervisor = this.supervisorFor(dir, ownerSessionId)
     if (input.run_id && input.run_id !== state.run_id) return { ok: false, action: 'resume', message: 'ORBIT_RUN_NOT_FOUND: Run id 不匹配。' }
     if (state.phase === 'NEEDS_USER') {
       if (state.owner_session_id !== undefined) return this.run(input, dir, signal)
@@ -155,31 +189,42 @@ export class OrbitService extends Service {
       state.phase = state.plan.steps.length === 0 ? 'PLAN' : 'EXECUTE'
       state.status = 'running'
     }
-    return this.execute(dir, signal, (activeSignal) => supervisor.run(state, activeSignal))
+    return this.execute(dir, ownerSessionId, signal, (activeSignal) => supervisor.run(state, activeSignal))
   }
 
-  async stop(runId?: string, projectDir?: string): Promise<OrbitActionResult> {
+  async stop(runId?: string, projectDir?: string, explicitOwnerSessionId?: string): Promise<OrbitActionResult> {
     const dir = this.resolveProjectDir(projectDir)
-    const state = new OrbitStateStore(dir).readState()
-    if (runId && state?.run_id !== runId) return { ok: false, action: 'stop', message: 'ORBIT_RUN_NOT_FOUND: Run id 不匹配。' }
-    const active = this.executions.get(dir)
+    const ownerSessionId = explicitOwnerSessionId ?? this.currentOwnerSessionId()
+    const state = this.stateStore(dir, ownerSessionId).readState()
+    if (!state && this.ownerlessLegacyState(dir) !== null) {
+      const legacy = this.ownerlessLegacyState(dir)
+      if (runId && legacy?.run_id !== runId) return { ok: false, action: 'stop', message: 'ORBIT_RUN_NOT_FOUND: Run id 不匹配。' }
+      return this.legacySupervisorFor(dir).stop('stop', runId)
+    }
+    if (runId && state?.run_id !== runId) return { ok: false, action: 'stop', message: 'ORBIT_RUN_NOT_FOUND: 当前 Session 的 Run id 不匹配。' }
+    const active = this.executions.get(this.executionKey(dir, ownerSessionId))
     active?.controller.abort()
     if (active) await active.result.catch(() => undefined)
-    await this.host.revokeWorkspace(dir)
-    return this.supervisorFor(dir).stop('stop', runId)
+    if (ownerSessionId !== undefined) await this.host.revokeOwner(dir, ownerSessionId)
+    else await this.host.revokeWorkspace(dir)
+    return this.supervisorFor(dir, ownerSessionId).stop('stop', runId)
   }
 
-  status(projectDir?: string): Promise<OrbitActionResult> {
-    return this.supervisorFor(this.resolveProjectDir(projectDir)).status()
+  status(projectDir?: string, explicitOwnerSessionId?: string): Promise<OrbitActionResult> {
+    const dir = this.resolveProjectDir(projectDir)
+    const ownerSessionId = explicitOwnerSessionId ?? this.currentOwnerSessionId()
+    if (this.stateStore(dir, ownerSessionId).readState() === null && this.ownerlessLegacyState(dir) !== null) {
+      return this.legacySupervisorFor(dir).status()
+    }
+    return this.supervisorFor(dir, ownerSessionId).status()
   }
 
-  recordGuardBlock(code: GuardCode, reason: string, projectDir?: string): Promise<GuardBlockOutcome> {
-    return this.supervisorFor(this.resolveProjectDir(projectDir)).recordGuardBlock(code, reason)
+  recordGuardBlock(code: GuardCode, reason: string, projectDir?: string, ownerSessionId?: string): Promise<GuardBlockOutcome> {
+    return this.supervisorFor(this.resolveProjectDir(projectDir), ownerSessionId ?? this.currentOwnerSessionId()).recordGuardBlock(code, reason)
   }
 
   hasActiveRun(projectDir?: string): boolean {
-    const state = new OrbitStateStore(this.resolveProjectDir(projectDir)).readState()
-    return state !== null && state.driver_ownership !== 'CLOSED'
+    return OrbitStateStore.hasAnyActiveRun(this.resolveProjectDir(projectDir))
   }
 
   isMutationAuthorized(agent: unknown, tool: string, projectDir?: string): boolean {
@@ -190,8 +235,12 @@ export class OrbitService extends Service {
     return this.config.browserTools
   }
 
-  githubAllowed(projectDir?: string): boolean {
-    const state = new OrbitStateStore(this.resolveProjectDir(projectDir)).readState()
+  ownerSessionIdForAgent(agent: unknown): string | undefined {
+    return this.host.ownerSessionIdForAgent(agent)
+  }
+
+  githubAllowed(projectDir?: string, ownerSessionId?: string): boolean {
+    const state = this.stateStore(this.resolveProjectDir(projectDir), ownerSessionId ?? this.currentOwnerSessionId()).readState()
     return state?.github_allowed === true
   }
 

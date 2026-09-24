@@ -36,6 +36,69 @@ test('atomic write increments revision and leaves no lock or temp files', () => 
   rmSync(dir, { recursive: true, force: true })
 })
 
+test('session-scoped state keeps independent active runs in one project', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-session-store-'))
+  const configA: OrbitSupervisorConfig = { ...config, resolveOwnerSessionId: () => 'session-a' }
+  const configB: OrbitSupervisorConfig = { ...config, resolveOwnerSessionId: () => 'session-b' }
+  const storeA = new OrbitStateStore(dir, undefined, 'session-a')
+  const storeB = new OrbitStateStore(dir, undefined, 'session-b')
+  const stateA = new OrbitSupervisor(storeA, new FakeHost(), configA).createState({ goal: 'goal-a', approved_loop_count: 3 })
+  const stateB = new OrbitSupervisor(storeB, new FakeHost(), configB).createState({ goal: 'goal-b', approved_loop_count: 3 })
+  storeA.writeState(stateA)
+  storeB.writeState(stateB)
+  assert.notEqual(storeA.statePath, storeB.statePath)
+  assert.equal(storeA.readState()?.goal, 'goal-a')
+  assert.equal(storeB.readState()?.goal, 'goal-b')
+  assert.equal(storeA.readState()?.owner_session_id, 'session-a')
+  assert.equal(storeB.readState()?.owner_session_id, 'session-b')
+  assert.equal(OrbitStateStore.hasAnyActiveRun(dir), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('v0.6.5 root state migrates to the owning Session path on the next write', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-session-migrate-'))
+  const configA: OrbitSupervisorConfig = { ...config, resolveOwnerSessionId: () => 'session-a' }
+  const legacyStore = new OrbitStateStore(dir)
+  const legacy = new OrbitSupervisor(legacyStore, new FakeHost(), configA).createState({ goal: 'legacy-owned', approved_loop_count: 3 })
+  legacyStore.writeState(legacy)
+  assert.ok(existsSync(legacyStore.statePath))
+
+  const scoped = new OrbitStateStore(dir, undefined, 'session-a')
+  assert.equal(scoped.readState()?.goal, 'legacy-owned', 'owning Session must see the old root state')
+  scoped.writeState(scoped.readState()!)
+  assert.ok(existsSync(scoped.statePath))
+  assert.ok(!existsSync(legacyStore.statePath), 'legacy root state is removed after successful scoped migration')
+  assert.equal(scoped.readState()?.owner_session_id, 'session-a')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('explicit compatibility adoption moves an ownerless legacy root state into the current Session', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-ownerless-adopt-'))
+  const legacyStore = new OrbitStateStore(dir)
+  const legacy = new OrbitSupervisor(legacyStore, new FakeHost(), config).createState({ goal: 'ownerless', approved_loop_count: 3 })
+  legacyStore.writeState(legacy)
+  assert.equal(legacyStore.readState()?.owner_session_id, undefined)
+
+  const scoped = new OrbitStateStore(dir, undefined, 'session-a')
+  const adopted = scoped.adoptOwnerlessLegacyState()
+  assert.equal(adopted?.owner_session_id, 'session-a')
+  assert.equal(scoped.readState()?.goal, 'ownerless')
+  assert.ok(existsSync(scoped.statePath))
+  assert.ok(!existsSync(legacyStore.statePath))
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('a different Session ignores another Session legacy root state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-orbit-session-foreign-'))
+  const configA: OrbitSupervisorConfig = { ...config, resolveOwnerSessionId: () => 'session-a' }
+  const legacyStore = new OrbitStateStore(dir)
+  legacyStore.writeState(new OrbitSupervisor(legacyStore, new FakeHost(), configA).createState({ goal: 'owned-by-a', approved_loop_count: 3 }))
+  const storeB = new OrbitStateStore(dir, undefined, 'session-b')
+  assert.equal(storeB.readState(), null)
+  assert.equal(OrbitStateStore.hasAnyActiveRun(dir), true, 'global mutation fence still sees the foreign active run')
+  rmSync(dir, { recursive: true, force: true })
+})
+
 test('driver ownership derives from phase and status', () => {
   assert.equal(driverOwnershipFor('SUCCESS', 'success'), 'CLOSED')
   assert.equal(driverOwnershipFor('STOPPED', 'stopped'), 'CLOSED')

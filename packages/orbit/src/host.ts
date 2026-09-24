@@ -111,6 +111,8 @@ export interface OrbitHost {
   validateRoutes(routes: Readonly<Record<string, OrbitRoute>>, signal?: AbortSignal): Promise<string[]>
   /** Whether this exact Agent is the currently authorized Orbit Executor. */
   isMutationAuthorized(agent: unknown, cwd: string, tool: string): boolean
+  /** Serialize direct Supervisor mutations (for example MoA promotion) with writable Executor turns. */
+  withWorkspaceMutationLease<T>(cwd: string, signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T>
   otherMutationDrivers(cwd: string): Promise<string[]>
   changedFiles(cwd: string): string[]
 }

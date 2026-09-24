@@ -38,6 +38,7 @@ export function createOrbitPreExecuteHandler(service: OrbitService, options: Orb
   ): Promise<PreExecuteDecision> {
     const cwd = exec.agent?.session?.header?.cwd ?? process.cwd()
     const active = service.hasActiveRun(cwd)
+    const ownerSessionId = service.ownerSessionIdForAgent(exec.agent)
     const args = (exec.arguments ?? {}) as Record<string, unknown>
     const mutating = mutationTools(service.browserToolNames()).has(exec.name)
 
@@ -79,9 +80,9 @@ export function createOrbitPreExecuteHandler(service: OrbitService, options: Orb
 
     if (exec.name === 'bash') {
       const command = typeof args['command'] === 'string' ? args['command'] : ''
-      const decision = guardBashCommand(command, { github_allowed: service.githubAllowed(cwd) })
+      const decision = guardBashCommand(command, { github_allowed: service.githubAllowed(cwd, ownerSessionId) })
       if (!decision.allowed) {
-        const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd)
+        const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd, ownerSessionId)
         return { kind: 'deny', reason: `${guardReason(decision)} ${outcome.instruction}` }
       }
       return next()
@@ -91,7 +92,7 @@ export function createOrbitPreExecuteHandler(service: OrbitService, options: Orb
       const target = args['path'] ?? args['file_path'] ?? args['filePath']
       const decision = guardToolPath(exec.name, target, { cwd })
       if (!decision.allowed) {
-        const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd)
+        const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd, ownerSessionId)
         return { kind: 'deny', reason: `${guardReason(decision)} ${outcome.instruction}` }
       }
       return next()
@@ -104,7 +105,7 @@ export function createOrbitPreExecuteHandler(service: OrbitService, options: Orb
       if (typeof outputPath === 'string' && outputPath.length > 0) {
         const decision = guardToolPath('write', outputPath, { cwd })
         if (!decision.allowed) {
-          const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd)
+          const outcome = await service.recordGuardBlock(decision.code, decision.reason, cwd, ownerSessionId)
           return { kind: 'deny', reason: `${guardReason(decision)} ${outcome.instruction}` }
         }
       }

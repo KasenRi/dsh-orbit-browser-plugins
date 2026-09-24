@@ -6,7 +6,7 @@
  * settlement, the executor's final text, real workspace changes, and agent
  * telemetry. Nothing is inferred, nothing is re-run, and no extra model call
  * is made. Bundles are sanitized and bounded before they reach a prompt, and
- * they are never persisted into `.cx/state.json` as a whole.
+ * they are never persisted into Orbit durable state as a whole.
  */
 
 import type { OrbitTelemetry, OrbitStepResult, OrbitState } from './types.ts'

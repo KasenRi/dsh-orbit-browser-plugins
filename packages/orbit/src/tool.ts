@@ -11,7 +11,7 @@ export const LEGACY_CX_TOOL_NAME = 'cx_controller'
 
 const TOOL_DESCRIPTION =
   '驱动当前项目的 Orbit 工程编排。Orbit 由确定性的 Supervisor 控制 Commander、Executor 和 Smart Watchdog，' +
-  '并将状态保存到 .cx/state.json。使用 action "run" 启动或继续，"resume" 继续持久化运行，"status" 查看状态，' +
+  '并按 DSH Session 隔离保存持久化状态（.cx/sessions/.../state.json；旧 .cx/state.json 兼容）。使用 action "run" 启动或继续，"resume" 继续持久化运行，"status" 查看当前 Session 状态，' +
   '"stop" 关闭运行，"doctor" 检查环境。只有 Orbit 可以写入 .cx 持久状态。'
 
 const LEGACY_TOOL_DESCRIPTION = `Legacy compatibility alias（兼容旧接口），请优先使用 ${ORBIT_TOOL_NAME}。${TOOL_DESCRIPTION}`
@@ -27,7 +27,7 @@ interface ToolArgs {
 }
 
 interface AgentLike {
-  session?: { header?: { cwd?: string } }
+  session?: { id?: unknown; header?: { cwd?: string } }
   ctx?: { orbit?: OrbitService; cx?: OrbitService }
 }
 
@@ -83,6 +83,7 @@ export function createOrbitTool(ctx: Context, options: OrbitToolOptions = {}) {
       if (!service) throw new Error('orbit service is unavailable; dsh-orbit is not loaded.')
       const agent = exec.agent as AgentLike | undefined
       const cwd = agent?.session?.header?.cwd ?? process.cwd()
+      const ownerSessionId = agent?.session?.id === undefined ? undefined : String(agent.session.id)
       const input = {
         ...(args.goal !== undefined ? { goal: args.goal } : {}),
         ...(args.preset !== undefined ? { preset: args.preset } : {}),
@@ -91,11 +92,11 @@ export function createOrbitTool(ctx: Context, options: OrbitToolOptions = {}) {
         ...(args.user_hard_constraints !== undefined ? { user_hard_constraints: args.user_hard_constraints } : {}),
         ...(args.github_allowed !== undefined ? { github_allowed: args.github_allowed } : {}),
       }
-      if (args.action === 'status') return (await service.status(cwd)) as unknown as JsonValue
-      if (args.action === 'stop') return (await service.stop(args.run_id, cwd)) as unknown as JsonValue
+      if (args.action === 'status') return (await service.status(cwd, ownerSessionId)) as unknown as JsonValue
+      if (args.action === 'stop') return (await service.stop(args.run_id, cwd, ownerSessionId)) as unknown as JsonValue
       if (args.action === 'doctor') return (await service.doctor(cwd)) as unknown as JsonValue
-      if (args.action === 'resume') return (await service.resume(input, cwd, exec.signal)) as unknown as JsonValue
-      return (await service.run(input, cwd, exec.signal)) as unknown as JsonValue
+      if (args.action === 'resume') return (await service.resume(input, cwd, exec.signal, ownerSessionId)) as unknown as JsonValue
+      return (await service.run(input, cwd, exec.signal, ownerSessionId)) as unknown as JsonValue
     },
   })
 }

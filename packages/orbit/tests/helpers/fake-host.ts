@@ -155,6 +155,10 @@ export class FakeHost implements OrbitHost {
     return true
   }
 
+  async withWorkspaceMutationLease<T>(_cwd: string, _signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+    return operation()
+  }
+
   async otherMutationDrivers(): Promise<string[]> {
     return this.drivers
   }

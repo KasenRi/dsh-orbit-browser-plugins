@@ -108,6 +108,9 @@ class CapabilityHost implements OrbitHost {
   }
   async validateRoutes(): Promise<string[]> { return [] }
   isMutationAuthorized(): boolean { return true }
+  async withWorkspaceMutationLease<T>(_cwd: string, _signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+    return operation()
+  }
   async otherMutationDrivers(): Promise<string[]> {
     return []
   }

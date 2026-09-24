@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -154,6 +154,15 @@ test('legacy compatibility: old .cx/state.json resumes under Orbit', { timeout: 
     assert.equal(status.ok, true)
     assert.equal(status.phase, 'SUCCESS')
     assert.equal(status.data?.['goal'], 'legacy goal')
+
+    const resumed = await root.agents.withInitiator(parent.agent, () =>
+      root.orbit.resume({ run_id: 'legacy-run' }, projectDir, new AbortController().signal),
+    )
+    assert.equal(resumed.ok, true)
+    const scoped = new OrbitStateStore(projectDir, undefined, String(parent.agent.session.id))
+    assert.equal(scoped.readState()?.run_id, 'legacy-run')
+    assert.equal(scoped.readState()?.owner_session_id, String(parent.agent.session.id))
+    assert.equal(existsSync(join(projectDir, '.cx', 'state.json')), false, 'explicit resume migrates the ownerless legacy state')
 
     const toolResult = await root.tools.execute({
       callId: ToolCallId('legacy-status'),

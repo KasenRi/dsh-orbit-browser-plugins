@@ -6,7 +6,7 @@
  * event type, durable with the Session). The state is a session projection
  * unit folding those records, so it is per-Session by construction, survives
  * reloads with the log, and reaches the browser through the normal projection
- * wire — no separate store, no Orbit settings entry, no `.cx/state.json`.
+ * wire — no separate toggle store, no Orbit settings entry, and no Orbit run-state file.
  *
  * This is UI/runtime preference state for one chat, never the durable
  * execution state of an Orbit run.

@@ -21,6 +21,7 @@ import * as SpawnPlugin from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as OrbitPlugin from '../../src/index.ts'
 import { DshOrbitHost } from '../../src/dsh-host.ts'
 import { ORBIT_COMMANDER_DECISION_TOOL, ORBIT_RUN_COMPLETE_TOOL } from '../../src/host.ts'
+import { OrbitStateStore } from '../../src/state-store.ts'
 import { resolveExecutable } from '../../../browser/src/cli.ts'
 import { findChromium } from '../../../../tests/helpers/chromium.ts'
 
@@ -318,7 +319,7 @@ test('real host E2E: full Orbit plan/execute/evaluate/success, parent not a comp
       0,
       'direct service/tool-style calls never project the hard-activation final result',
     )
-    const state = JSON.parse(readFileSync(join(project.dir, '.cx', 'state.json'), 'utf8')) as {
+    const state = readRunState(project.dir, String(parent.agent.session.id)) as {
       phase: string
       driver_ownership: string
       role_sessions?: { commander?: { child_id?: string; turns?: number }; executor?: { child_id?: string; turns?: number } }
@@ -502,7 +503,7 @@ test('real host optional MoA integration: three candidates -> Judge -> Orbit pro
     assert.equal(result.phase, 'SUCCESS', result.message)
     assert.equal(readFileSync(join(project.dir, 'result.txt'), 'utf8').trim(), 'candidate-b')
 
-    const state = JSON.parse(readFileSync(join(project.dir, '.cx', 'state.json'), 'utf8')) as {
+    const state = readRunState(project.dir, String(parent.agent.session.id)) as {
       moa_step?: {
         phase?: string
         winning_candidate?: number
@@ -521,11 +522,15 @@ test('real host optional MoA integration: three candidates -> Judge -> Orbit pro
     assert.equal(adapter.executorCalls, 1, 'the winner must still pass through the normal Executor verification')
 
     const runtimeEvents = parent.agent.session.snapshotEvents().filter((event) => event.type === 'orbit/runtime')
-    const moaRuntime = runtimeEvents.map((event) => event.data as { moa?: { phase?: string; winningCandidate?: number } })
-      .filter((entry) => entry.moa)
-      .at(-1)
-    assert.equal(moaRuntime?.moa?.phase, 'PROMOTED')
-    assert.equal(moaRuntime?.moa?.winningCandidate, 2)
+    if (KNOWN_SESSION_EVENT_TYPES.has('orbit/runtime')) {
+      const moaRuntime = runtimeEvents.map((event) => event.data as { moa?: { phase?: string; winningCandidate?: number } })
+        .filter((entry) => entry.moa)
+        .at(-1)
+      assert.equal(moaRuntime?.moa?.phase, 'PROMOTED')
+      assert.equal(moaRuntime?.moa?.winningCandidate, 2)
+    } else {
+      assert.equal(runtimeEvents.length, 0, 'unknown orbit/runtime events must not be persisted on older DSH')
+    }
   } finally {
     await parent.dispose()
     await root.fiber.dispose()
@@ -805,14 +810,12 @@ test('real host agent loop: a normal user turn runs on the same real Context', {
   }
 })
 
-function readRunState(dir: string): Record<string, unknown> | undefined {
-  const path = join(dir, '.cx', 'state.json')
-  if (!existsSync(path)) return undefined
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
-  } catch {
-    return undefined
-  }
+function readRunState(dir: string, ownerSessionId?: string): Record<string, unknown> | undefined {
+  if (ownerSessionId !== undefined) return new OrbitStateStore(dir, undefined, ownerSessionId).readState() as unknown as Record<string, unknown> | undefined
+  const paths = OrbitStateStore.statePaths(dir)
+  if (paths.length === 0) return undefined
+  const state = OrbitStateStore.readStatePath(paths[0]!)
+  return state as unknown as Record<string, unknown> | undefined
 }
 
 test('real session toggle: /orbit-toggle is durable and promotes ordinary messages', { timeout: 120_000 }, async () => {
@@ -1172,7 +1175,7 @@ test('real host: the Executor route follows the durable Session modelSelection w
   }
 })
 
-test('real host: a different Session never resumes another Session NEEDS_USER run', { timeout: 120_000 }, async () => {
+test('real host: two Sessions own independent Orbit runs in the same project', { timeout: 120_000 }, async () => {
   const adapter = new ScriptedAdapter({
     stepEvaluates: [
       '{"decision":"NEEDS_USER","reason":"请提供端口号"}',
@@ -1183,39 +1186,36 @@ test('real host: a different Session never resumes another Session NEEDS_USER ru
   const project = tempProject()
   const sessionA = await makeParent(root, project.dir, 'e2e-session-a')
   const sessionB = await makeParent(root, project.dir, 'e2e-session-b')
-  const executorRuns = () => adapter.requests.filter((entry) => entry.prompt.startsWith('你是 Orbit 执行员')).length
   try {
     // Session A starts a run that waits for user input.
     assert.ok(await root.commands.execute(sessionA.agent, '/orbit-toggle on', [], new AbortController().signal))
     sessionA.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'deploy service' }], source: { kind: 'user' } }))
     await sessionA.agent.whenIdle()
-    const paused = readRunState(project.dir)
+    const ownerA = String(sessionA.agent.session.id)
+    const ownerB = String(sessionB.agent.session.id)
+    const paused = readRunState(project.dir, ownerA)
     assert.equal(paused?.phase, 'NEEDS_USER')
-    assert.equal(paused?.owner_session_id, String(sessionA.agent.session.id), 'the run records its owning Session')
-    const before = executorRuns()
+    assert.equal(paused?.owner_session_id, ownerA)
 
-    // Session B sends a brand-new task: it must never be consumed as A's reply.
+    // Session B starts a completely separate run in the same project.
     assert.ok(await root.commands.execute(sessionB.agent, '/orbit-toggle on', [], new AbortController().signal))
     sessionB.agent.followup(createUserMessage({ content: [{ type: 'text', text: '帮我检查另一个项目' }], source: { kind: 'user' } }))
     await sessionB.agent.whenIdle()
 
-    const blocked = readRunState(project.dir)
-    assert.equal(blocked?.run_id, paused?.run_id, 'the old run id must not change')
-    assert.equal(blocked?.goal, 'deploy service', 'the old goal must not change')
-    assert.equal(blocked?.phase, 'NEEDS_USER')
-    assert.equal(blocked?.pending_user_reply ?? null, null, "Session B's message never enters pending_user_reply")
-    assert.equal(executorRuns(), before, 'no Executor may auto-start for a foreign Session')
+    const stillPaused = readRunState(project.dir, ownerA)
+    const runB = readRunState(project.dir, ownerB)
+    assert.equal(stillPaused?.run_id, paused?.run_id, 'Session A state must remain untouched')
+    assert.equal(stillPaused?.phase, 'NEEDS_USER')
+    assert.equal(stillPaused?.pending_user_reply ?? null, null)
+    assert.equal(runB?.goal, '帮我检查另一个项目')
+    assert.equal(runB?.owner_session_id, ownerB)
+    assert.equal(runB?.phase, 'SUCCESS')
+    assert.notEqual(runB?.run_id, paused?.run_id)
 
-    const notices = userMessagesOf(sessionB.agent).filter((message) => (message.source as { form?: string }).form === 'notice')
-    assert.ok(
-      notices.some((message) => textOf(message as SessionMessageLike).includes('ORBIT_NEEDS_USER_OTHER_SESSION')),
-      'Session B must see the owner notice',
-    )
-
-    // The owning Session still resumes the same run.
+    // Session A can still resume its original run afterwards.
     sessionA.agent.followup(createUserMessage({ content: [{ type: 'text', text: '8080' }], source: { kind: 'user' } }))
     await sessionA.agent.whenIdle()
-    const done = readRunState(project.dir)
+    const done = readRunState(project.dir, ownerA)
     assert.equal(done?.run_id, paused?.run_id)
     assert.equal(done?.goal, 'deploy service')
     assert.equal(done?.pending_user_reply, '8080')

@@ -8,6 +8,7 @@ import type { GuardCode } from '../src/types.ts'
 function stubService(active: boolean, onBlock: (code: GuardCode) => void): OrbitService {
   return {
     hasActiveRun: () => active,
+    ownerSessionIdForAgent: () => 'session-test',
     githubAllowed: () => false,
     browserToolNames: () => ['agent_browser'],
     isMutationAuthorized: () => true,

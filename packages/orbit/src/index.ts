@@ -222,7 +222,7 @@ export function apply(ctx: Context, config: OrbitConfigShape): void {
       try {
         // The initiator scope makes the run's children belong to this Agent;
         // the parent model is never asked to decide or to run the task.
-        result = await ctx.agents.withInitiator(agent, () => service.run({ goal }, cwd, signal))
+        result = await ctx.agents.withInitiator(agent, () => service.run({ goal }, cwd, signal, String(agent.session.id)))
       } catch (error) {
         appendOrbitNotice(agent.session, `Orbit 启动失败：${error instanceof Error ? error.message : String(error)}`)
         return

@@ -67,7 +67,9 @@ export class DshOrbitHost implements OrbitHost {
   private readonly ownedChildren = new Set<string>()
   private readonly interruptedChildren = new Set<string>()
   private readonly childParents = new Map<string, Agent>()
-  private readonly childGrants = new Map<string, { role: OrbitRole; workspace: string; tools: ReadonlySet<string> }>()
+  private readonly childGrants = new Map<string, { role: OrbitRole; workspace: string; ownerSessionId: string; tools: ReadonlySet<string> }>()
+  /** Serialize mutation-capable Executor turns that share one physical checkout. */
+  private readonly workspaceTurnTails = new Map<string, Promise<void>>()
   private readonly commanderDecisions = new Map<string, CommanderDecisionSubmission>()
   private readonly terminalConfirmations = new Map<string, TerminalCompletionSubmission>()
   private readonly terminalExpected = new Set<string>()
@@ -99,11 +101,80 @@ export class DshOrbitHost implements OrbitHost {
       model: request.route.model,
       reasoningEffort: request.route.reasoningEffort as never,
     }
-
-    if (request.persistent === true && (request.role === 'executor' || request.role === 'commander')) {
-      return this.startPersistentRole(parent, request, prompt, agentOptions)
+    const workspace = resolve(request.workspace ?? parent.session.header.cwd ?? process.cwd())
+    const needsWorkspaceLease = request.role === 'executor' && (request.capabilities ?? []).some((capability) => ['filesystem', 'shell', 'browser'].includes(capability))
+    const releaseLease = needsWorkspaceLease ? await this.acquireWorkspaceTurn(workspace, request.signal) : undefined
+    try {
+      const handle = request.persistent === true && (request.role === 'executor' || request.role === 'commander')
+        ? await this.startPersistentRole(parent, request, prompt, agentOptions)
+        : await this.startOneShot(parent, request, prompt, agentOptions)
+      if (!releaseLease) return handle
+      let released = false
+      const release = (): void => {
+        if (released) return
+        released = true
+        releaseLease()
+      }
+      return {
+        ...handle,
+        result: handle.result.finally(release),
+        ...(handle.cancel ? { cancel: async (reason: string) => { try { await handle.cancel?.(reason) } finally { release() } } } : {}),
+        ...(handle.dispose ? { dispose: async () => { try { await handle.dispose?.() } finally { release() } } } : {}),
+      }
+    } catch (error) {
+      releaseLease?.()
+      throw error
     }
-    return this.startOneShot(parent, request, prompt, agentOptions)
+  }
+
+  async withWorkspaceMutationLease<T>(cwd: string, signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+    const release = await this.acquireWorkspaceTurn(resolve(cwd), signal)
+    try {
+      return await operation()
+    } finally {
+      release()
+    }
+  }
+
+  private async acquireWorkspaceTurn(workspace: string, signal?: AbortSignal): Promise<() => void> {
+    const previous = this.workspaceTurnTails.get(workspace) ?? Promise.resolve()
+    let releaseGate: (() => void) | undefined
+    const gate = new Promise<void>((resolveGate) => { releaseGate = resolveGate })
+    const tail = previous.then(() => gate)
+    this.workspaceTurnTails.set(workspace, tail)
+    const cleanupTail = (): void => {
+      void tail.finally(() => {
+        if (this.workspaceTurnTails.get(workspace) === tail) this.workspaceTurnTails.delete(workspace)
+      })
+    }
+    if (signal?.aborted) {
+      releaseGate?.()
+      releaseGate = undefined
+      cleanupTail()
+      throw new Error('ORBIT_ABORTED')
+    }
+    let onAbort: (() => void) | undefined
+    const aborted = signal === undefined
+      ? undefined
+      : new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(new Error('ORBIT_ABORTED'))
+          signal.addEventListener('abort', onAbort, { once: true })
+        })
+    try {
+      await (aborted ? Promise.race([previous, aborted]) : previous)
+    } catch (error) {
+      releaseGate?.()
+      releaseGate = undefined
+      cleanupTail()
+      throw error
+    } finally {
+      if (onAbort) signal?.removeEventListener('abort', onAbort)
+    }
+    return () => {
+      releaseGate?.()
+      releaseGate = undefined
+      cleanupTail()
+    }
   }
 
   async runModel(request: ModelRunRequest): Promise<ModelRunResult> {
@@ -291,6 +362,7 @@ export class DshOrbitHost implements OrbitHost {
     this.childGrants.set(childId, {
       role: request.role,
       workspace: resolve(request.workspace ?? parent.session.header.cwd ?? process.cwd()),
+      ownerSessionId: String(parent.session.id),
       tools: new Set(request.toolFilter?.allow ?? []),
     })
     if (request.role === 'commander') {
@@ -573,6 +645,25 @@ export class DshOrbitHost implements OrbitHost {
     return grant?.role === 'executor' && grant.workspace === resolve(cwd) && grant.tools.has(tool)
       && !this.interruptedChildren.has(id) && this.ctx.agents.get(SessionId(id)) === agent
       && parent !== undefined && this.ctx.agents.isOwnedBy(SessionId(id), parent)
+  }
+
+  ownerSessionIdForAgent(agent: unknown): string | undefined {
+    const id = String((agent as { id?: unknown } | undefined)?.id ?? '')
+    const grant = this.childGrants.get(id)
+    if (grant) return grant.ownerSessionId
+    const sessionId = (agent as { session?: { id?: unknown } } | undefined)?.session?.id
+    return sessionId === undefined ? undefined : String(sessionId)
+  }
+
+  async revokeOwner(cwd: string, ownerSessionId: string): Promise<void> {
+    const ids = [...this.childGrants]
+      .filter(([, grant]) => grant.workspace === resolve(cwd) && grant.ownerSessionId === ownerSessionId)
+      .map(([id]) => id)
+    for (const id of ids) {
+      const parent = this.childParents.get(id)
+      await this.interruptPersistentChild(id, 'ORBIT_SESSION_RELEASED')
+      if (parent) await this.drainPersistentChild(parent, id)
+    }
   }
 
   async revokeWorkspace(cwd: string): Promise<void> {
